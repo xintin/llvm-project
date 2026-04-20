@@ -158,7 +158,7 @@ struct ElfInfo {
 struct Trampoline {
   uint64_t original_offset;
   uint32_t original_size;
-  llvm::SmallVector<uint8_t, 16> bytes;
+  llvm::SmallVector<uint8_t> bytes;
 };
 
 // ── NOP sled ─────────────────────────────────────────────────────────────────
@@ -173,7 +173,7 @@ struct NopSled {
 
 struct RewriteRule {
   std::string replace_mnemonic;
-  llvm::SmallVector<uint8_t, 16> replace_bytes;
+  llvm::SmallVector<uint8_t> replace_bytes;
 };
 
 // ── Named constants ──────────────────────────────────────────────────────────
@@ -215,6 +215,9 @@ static constexpr size_t kAmdgpuNoteOwnerLen = 6;
 
 // ELF note alignment
 static constexpr uint32_t kNoteAlign = 4;
+
+// Sentinel mnemonic for failed instruction decodes
+static constexpr const char *kUnknownMnemonic = "<unknown>";
 
 // ── DWARF types ──────────────────────────────────────────────────────────────
 
@@ -346,7 +349,7 @@ struct PatchContext {
                                  uint8_t out_bytes[4],
                                  uint32_t s_branch_opcode);
 void EncodeSNop(uint8_t out_bytes[4], uint32_t s_nop_opcode);
-std::string ExtractCPU(const std::string &isa_name);
+std::string ExtractCPU(llvm::StringRef isa_name);
 [[nodiscard]] bool ParseElfInfo(const uint8_t *elf, size_t elf_size,
                                 ElfInfo &info);
 std::string FindKernelAtOffset(const ElfInfo &elf_info, uint64_t text_offset);
@@ -356,16 +359,16 @@ std::string FindKernelAtOffset(const ElfInfo &elf_info, uint64_t text_offset);
                                     uint32_t s_nop_opcode);
 void UpdateKernelDescriptor(uint8_t *elf_data, size_t elf_size,
                             const ElfInfo &elf_info,
-                            const std::string &kernel_name, int32_t extra_vgprs,
+                            llvm::StringRef kernel_name, int32_t extra_vgprs,
                             int32_t extra_sgprs);
 NopSled *FindNearestSled(std::vector<NopSled> &sleds, uint64_t offset,
                          uint64_t needed);
 MallocBuffer GrowElfWithTrampolines(const uint8_t *elf, size_t elf_size,
                                     const ElfInfo &elf_info,
                                     const std::vector<Trampoline> &trampolines);
-bool PatchElfIsa(uint8_t *elf, size_t elf_size, const std::string &target_cpu);
+bool PatchElfIsa(uint8_t *elf, size_t elf_size, llvm::StringRef target_cpu);
 int GetKernelVgprCount(const uint8_t *elf_data, size_t elf_size,
-                       const ElfInfo &elf_info, const std::string &kernel_name);
+                       const ElfInfo &elf_info, llvm::StringRef kernel_name);
 [[nodiscard]] bool EmitReplacementCode(PatchContext &ctx, uint64_t inst_offset,
                                        uint32_t inst_size,
                                        const std::vector<uint8_t> &replacement);
@@ -389,14 +392,14 @@ void PatchDebugFrame(uint8_t *elf, size_t elf_size, uint64_t text_addr,
                      uint64_t text_size_before, uint64_t tramp_total);
 
 // llvm
-LLVMState InitLLVMImpl(const std::string &isa_name,
+LLVMState InitLLVMImpl(llvm::StringRef isa_name,
                        const llvm::Target *cached_target = nullptr);
-LLVMState InitLLVMCached(const std::string &isa_name);
+LLVMState InitLLVMCached(llvm::StringRef isa_name);
 [[nodiscard]] bool DecodeTextSection(const uint8_t *text, uint64_t text_size,
                                      const LLVMState &llvm_state,
                                      std::vector<InternalDecodedInst> &decoded);
-llvm::SmallVector<uint8_t, 16> AssembleSingleInst(const std::string &asm_str,
-                                                  const LLVMState &llvm_state);
+llvm::SmallVector<uint8_t> AssembleSingleInst(llvm::StringRef asm_str,
+                                              const LLVMState &llvm_state);
 [[nodiscard]] bool ApplyMnemonicSwap(const RewriteRule &rule,
                                      InternalDecodedInst &inst, uint8_t *text,
                                      const LLVMState &llvm_state);
@@ -417,7 +420,7 @@ bool CheckVgprOverlap(const llvm::MCInst &wmma_inst,
                       const llvm::MCInst &valu_inst,
                       const llvm::MCInstrInfo &MCII,
                       const llvm::MCRegisterInfo &MRI);
-WmmaNopReq ClassifyWmmaNops(const std::string &mnemonic);
+WmmaNopReq ClassifyWmmaNops(llvm::StringRef mnemonic);
 
 // liveness
 RegDefUse GetInstRegDefUse(const llvm::MCInst &inst,

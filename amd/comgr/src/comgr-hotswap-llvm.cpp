@@ -32,7 +32,7 @@ static void InitLLVMTargets() {
   LLVMInitializeAMDGPUDisassembler();
 }
 
-LLVMState InitLLVMImpl(const std::string &isa_name,
+LLVMState InitLLVMImpl(llvm::StringRef isa_name,
                        const llvm::Target *cached_target) {
   std::call_once(g_llvm_init_flag, InitLLVMTargets);
 
@@ -91,7 +91,7 @@ LLVMState InitLLVMImpl(const std::string &isa_name,
   return state;
 }
 
-LLVMState InitLLVMCached(const std::string &isa_name) {
+LLVMState InitLLVMCached(llvm::StringRef isa_name) {
   std::call_once(g_llvm_init_flag, InitLLVMTargets);
 
   const llvm::Target *tgt;
@@ -111,12 +111,12 @@ LLVMState InitLLVMCached(const std::string &isa_name) {
 
 // ── Instruction helpers ──────────────────────────────────────────────────────
 
-static std::string ExtractMnemonic(const std::string &printed) {
+static std::string ExtractMnemonic(llvm::StringRef printed) {
   size_t s = printed.find_first_not_of(" \t");
-  if (s == std::string::npos)
+  if (s == llvm::StringRef::npos)
     return "";
   size_t e = printed.find_first_of(" \t", s);
-  return printed.substr(s, e - s);
+  return printed.substr(s, e - s).str();
 }
 
 static std::string PrintInstStr(const llvm::MCInst &inst,
@@ -147,7 +147,7 @@ DecodeTextSection(const uint8_t *text, uint64_t text_size,
 
     if (status == llvm::MCDisassembler::Fail) {
       di.size = kMinInstSize;
-      di.mnemonic = "<unknown>";
+      di.mnemonic = kUnknownMnemonic;
       pos += kMinInstSize;
     } else {
       di.size = static_cast<uint32_t>(inst_size);
@@ -164,11 +164,12 @@ DecodeTextSection(const uint8_t *text, uint64_t text_size,
 
 // ── AssembleSingleInst ───────────────────────────────────────────────────────
 
-llvm::SmallVector<uint8_t, 16> AssembleSingleInst(const std::string &asm_str,
-                                                  const LLVMState &llvm_state) {
+llvm::SmallVector<uint8_t> AssembleSingleInst(llvm::StringRef asm_str,
+                                              const LLVMState &llvm_state) {
   llvm_state.Ctx->reset();
 
-  std::string full_asm = ".text\n" + asm_str;
+  std::string full_asm = ".text\n";
+  full_asm += asm_str;
   llvm::StringRef asm_ref(full_asm);
   auto buf = llvm::MemoryBuffer::getMemBuffer(asm_ref, "", false);
   llvm::SourceMgr src_mgr;
@@ -224,9 +225,9 @@ llvm::SmallVector<uint8_t, 16> AssembleSingleInst(const std::string &asm_str,
   if (asm_elf.text_size == 0)
     return {};
 
-  return llvm::SmallVector<uint8_t, 16>(elf_bytes + asm_elf.text_offset,
-                                        elf_bytes + asm_elf.text_offset +
-                                            asm_elf.text_size);
+  return llvm::SmallVector<uint8_t>(elf_bytes + asm_elf.text_offset,
+                                    elf_bytes + asm_elf.text_offset +
+                                        asm_elf.text_size);
 }
 
 // ── ApplyMnemonicSwap ────────────────────────────────────────────────────────

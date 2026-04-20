@@ -250,7 +250,7 @@ static uint32_t ApplyGfx1250B0toA0Rules(
 
   for (size_t idx = 0; idx < decoded.size(); ++idx) {
     auto &di = decoded[idx];
-    if (di.mnemonic == "<unknown>")
+    if (di.mnemonic == kUnknownMnemonic)
       continue;
 
     uint32_t p = 0;
@@ -284,14 +284,11 @@ static uint32_t ApplyGfx1250B0toA0Rules(
     const auto &stats = kv.second;
     if (kname.empty())
       continue;
-    std::string kname_str = kname.str();
-    int vgprs_before =
-        GetKernelVgprCount(elf_data, elf_size, elf_info, kname_str);
+    int vgprs_before = GetKernelVgprCount(elf_data, elf_size, elf_info, kname);
     if (stats.extra_vgprs > 0)
-      UpdateKernelDescriptor(elf_data, elf_size, elf_info, kname_str,
+      UpdateKernelDescriptor(elf_data, elf_size, elf_info, kname,
                              stats.extra_vgprs, 0);
-    int vgprs_after =
-        GetKernelVgprCount(elf_data, elf_size, elf_info, kname_str);
+    int vgprs_after = GetKernelVgprCount(elf_data, elf_size, elf_info, kname);
     HotswapLog(HotswapLogLevel::Info)
         << "hotswap: liveness: kernel " << kname
         << ": vgprs_before=" << vgprs_before << ", vgprs_after=" << vgprs_after
