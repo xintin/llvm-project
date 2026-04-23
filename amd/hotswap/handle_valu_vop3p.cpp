@@ -605,13 +605,14 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
             "under ModuloReplicationProjection.  The staged "
             "`strict.wwm`-scoped lowering has an open multi-WMMA "
             "residual on Triton's `matmul_fp16` (BLOCK=32, dynamic "
-            "LDS) — mode-5 B-only-varying input produces wrong "
-            "numerics with a characteristic `got = ref ± 16` per-"
-            "sub-tile offset after the ttmp7 and amdgpu-lds-size "
-            "fixes (see matrix-translation.md §12.4); refusing "
-            "loudly until that's pinned.  Workaround: compile the "
-            "source kernel with `__launch_bounds__(targetWaveSize)` "
-            "or larger to take the verified WaveNative path.");
+            "LDS) — mode-5 B-only-varying input yields the "
+            "specific `got = 2*(j mod 16) + 16` pattern, indicating "
+            "BOTH sub-tile WMMAs receive the SAME B fragment "
+            "shifted by 8 cols from the expected pair (see matrix-"
+            "translation.md §12.4 for the bisection).  Refusing "
+            "loudly until pinned.  Workaround: compile source with "
+            "`__launch_bounds__(targetWaveSize)` or larger to take "
+            "the verified WaveNative path.");
         return hr;
       }
       result_val = emitWMMAtoMFMA(ctx, a, b, c, wmmaInputType);
