@@ -43,6 +43,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 
+#include "rewrite_permlane16_swap_selfpreserve.hpp"
 #include "rewrite_permlane16_xor3_partner.hpp"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/IR/Dominators.h"
@@ -72,7 +73,8 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &compilationTargetISA,
                       bool enableWritelaneRewrite,
                       bool enableWaveNative,
-                      bool enablePermLane16Xor3PartnerRewrite) {
+                      bool enablePermLane16Xor3PartnerRewrite,
+                      bool enablePermLane16SwapSelfPreserveRewrite) {
   RaiseResult result;
 
   // NOTE. The `HSA_SALMON_WAVE_NATIVE=1` process-environment override
@@ -886,6 +888,42 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
     SmallVector<AllocaInst *, 512> allocas;
     regs.collectAllocas(allocas);
     PromoteMemToReg(allocas, DT, &AC);
+  }
+
+  // ==== Phase 6.035: Triton cross-16 bitonic-merge self-preserve rewrite ====
+  //
+  // Rewrites `v_permlane16_swap_b32`'s second output from
+  // `partner_seed` to `seed` (asymmetric self-preserving
+  // semantic) at every site where Triton's `v_dual_mov v_a, v_c ::
+  // v_dual_mov v_b, v_c` initialiser makes both bpermute data
+  // args trace to the same root SSA value.  See
+  // `rewrite_permlane16_swap_selfpreserve.hpp` for the
+  // shape-independent justification (single rewrite covers the
+  // xor3-fused, split-xor, and max-based compositions Triton's
+  // `tl.sort` / `tl.topk` emit at the cross-16 merge stage).
+  //
+  // Runs BEFORE the xor3-partner rewrite (Phase 6.04) — this
+  // pass operates at the bpermute level and subsumes the
+  // xor3-partner pattern: when this pass fires the subsequent
+  // xor3-partner pattern either no longer matches (IR shape
+  // changed) or still matches but substitutes the already-correct
+  // `partner_seed` for itself (no-op).  Keeping both passes
+  // enabled gives belt-and-suspenders coverage during the
+  // TRANSITIONAL period; either alone is insufficient.
+  //
+  // Gated by `enablePermLane16SwapSelfPreserveRewrite` (default
+  // on; raise_cli opt-out: `--disable-permlane16-swap-
+  // selfpreserve`).
+  if (enablePermLane16SwapSelfPreserveRewrite) {
+    Permlane16SwapSelfPreserveRewriteReport report =
+        rewritePermLane16SwapSelfPreserve(*F);
+    if (report.matchedSites > 0) {
+      LLVM_DEBUG({
+        dbgs() << "permlane16-swap-selfpreserve: rewrote "
+               << report.matchedSites << " site(s) in '" << kernelName
+               << "'\n";
+      });
+    }
   }
 
   // ==== Phase 6.04: Triton cross-16 bitonic-merge xor3-partner rewrite ====

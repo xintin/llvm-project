@@ -143,6 +143,25 @@ emitPermLaneSwapEmulation(RaiseContext &ctx, const DecodedInst &di,
   // Emitted OUTSIDE `emitUnderExec` so all hardware lanes
   // participate in the bpermute's LDS round-trip; `writeReg32`
   // below wraps the stores for EXEC masking on the target side.
+  //
+  // NB: TWO TRANSITIONAL rewrite passes post-process this
+  // emission when the ENTERING state of the swap's VGPR operands
+  // is the same SSA value (the Triton gfx1250 `tl.sort` /
+  // `tl.topk` cross-16 bitonic-merge idiom).  `rewrite_permlane
+  // 16_swap_selfpreserve.cpp` RAUWs `newSrc0Out` with the shared
+  // seed SSA (producing an asymmetric self-preserving emulation
+  // for that site), and `rewrite_permlane16_xor3_partner.cpp`
+  // substitutes the fused xor3 composition with the partner
+  // bpermute's result.  If you change the SHAPE of this emission
+  // (rename the SSA values, reorder the bpermute pair, add a
+  // third call, change the address-computation pattern) you
+  // MUST update the fingerprint in those two passes — both rely
+  // on (a) two adjacent bpermute calls sharing an SSA-identical
+  // first operand and (b) emission at the TOP of the handler
+  // body (no intervening stores) to keep the paired match
+  // narrow.  See the passes' block comments for the
+  // (a)/(b) hypothesis split and the two conditions under which
+  // they will become dead code and can be removed.
   Function *bperm = Intrinsic::getOrInsertDeclaration(
       &ctx.M, Intrinsic::amdgcn_ds_bpermute);
   Value *newVdst = ctx.B.CreateCall(bperm, {bpermIdx, src0In},

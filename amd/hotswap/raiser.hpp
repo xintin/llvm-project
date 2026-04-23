@@ -137,6 +137,19 @@ struct RaiseResult {
 // without the bridge) pass `enablePermLane16Xor3PartnerRewrite
 // = false` explicitly — raise_cli exposes this as
 // `--disable-permlane16-xor3-partner`.
+//
+// `enablePermLane16SwapSelfPreserveRewrite` toggles the
+// `rewrite_permlane16_swap_selfpreserve` pass that rewrites the
+// second output of `emitPermLaneSwapEmulation` from
+// `partner_seed` to `seed` (the self-preserving asymmetric
+// semantic) when BOTH bpermute data arguments trace (via SPE
+// active-arm phi walks) to the same root SSA value.  See the
+// pass header for the shape-independent justification (covers
+// Triton's tl.sort xor3, tl.sort split-xor, and tl.topk max
+// idioms in one rewrite).  TRANSITIONAL on the same two
+// conditions (a)(b) as the xor3-partner sibling above;
+// default **on**, raise_cli opt-out:
+// `--disable-permlane16-swap-selfpreserve`.
 RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &sourceISA,
                       const std::string &kernelName,
@@ -145,7 +158,8 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &compilationTargetISA = "",
                       bool enableWritelaneRewrite = true,
                       bool enableWaveNative = true,
-                      bool enablePermLane16Xor3PartnerRewrite = true);
+                      bool enablePermLane16Xor3PartnerRewrite = true,
+                      bool enablePermLane16SwapSelfPreserveRewrite = true);
 
 } // namespace transpiler
 

@@ -203,6 +203,18 @@ int usage() {
       "  which this pass will become dead code and can be removed).\n"
       "  `--disable-` audits the pre-rewrite shape.  Later-wins on\n"
       "  the command line.\n"
+      "--enable-permlane16-swap-selfpreserve /\n"
+      "  --disable-permlane16-swap-selfpreserve:\n"
+      "  controls the TRANSITIONAL rewrite pass that rewrites\n"
+      "  v_permlane16_swap_b32's second output from `partner_seed`\n"
+      "  to `seed` (asymmetric self-preserving semantic) whenever\n"
+      "  both bpermute data args trace to the same root SSA value.\n"
+      "  Covers Triton's tl.sort / tl.topk xor3, split-xor, and\n"
+      "  max-based cross-16 compositions in a single rewrite at\n"
+      "  the primitive emission level — subsumes --enable-permlane16-\n"
+      "  xor3-partner for those sites (both passes enabled is\n"
+      "  belt-and-suspenders).  Default on; `--disable-` audits\n"
+      "  the pre-rewrite shape.  Later-wins on the command line.\n"
       "ISA is inferred from the filename when --isa is not given.\n");
   return 2;
 }
@@ -224,6 +236,12 @@ int main(int argc, char **argv) {
   // Default on (see top-of-file comment for the TRANSITIONAL rationale
   // + the two conditions under which the rewrite becomes dead code).
   bool enablePermLane16Xor3PartnerRewrite = true;
+  // Default on; subsumes the xor3-partner rewrite at the bpermute
+  // emission level and extends coverage to split-xor and max-based
+  // idioms.  See `rewrite_permlane16_swap_selfpreserve.hpp` for the
+  // shape-independent justification and the same two TRANSITIONAL
+  // removal conditions as the xor3-partner sibling.
+  bool enablePermLane16SwapSelfPreserveRewrite = true;
   std::string emitIrKernel;
   std::string writeHsacoPath;
   std::string writeHsacoKernel;
@@ -280,6 +298,14 @@ int main(int argc, char **argv) {
       // comment for the full (a)/(b) hypothesis split and the
       // conditions under which the rewrite can be removed).
       enablePermLane16Xor3PartnerRewrite = false;
+    } else if (a == "--enable-permlane16-swap-selfpreserve") {
+      enablePermLane16SwapSelfPreserveRewrite = true;
+    } else if (a == "--disable-permlane16-swap-selfpreserve") {
+      // Later-wins on the command line, symmetric with the
+      // sibling xor3-partner flag.  `--disable-` pins the
+      // symmetric-output (gfx950-documented) cross-wire shape
+      // for audit / pre-rewrite characterisation.
+      enablePermLane16SwapSelfPreserveRewrite = false;
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "raise_cli: unknown flag: %s\n", a.c_str());
       return usage();
@@ -365,7 +391,8 @@ int main(int argc, char **argv) {
                                         kernelOffset, targetIsa,
                                         enableWritelaneRewrite,
                                         enableWaveNative,
-                                        enablePermLane16Xor3PartnerRewrite);
+                                        enablePermLane16Xor3PartnerRewrite,
+                                        enablePermLane16SwapSelfPreserveRewrite);
     if (!raised.success) {
       // Contract: raiseToIR only populates RaiseResult::irText on the
       // success path (the last write before setting `success = true`),
@@ -428,7 +455,8 @@ int main(int argc, char **argv) {
     auto pipe = transpiler::runPipeline(coData, isa, effectiveTargetIsa,
                                         target, enableWritelaneRewrite,
                                         enableWaveNative,
-                                        enablePermLane16Xor3PartnerRewrite);
+                                        enablePermLane16Xor3PartnerRewrite,
+                                        enablePermLane16SwapSelfPreserveRewrite);
     if (!pipe.success) {
       std::fprintf(stderr,
                    "raise_cli: pipeline failed for kernel '%s' (lifted=%d/%d, "
@@ -488,7 +516,8 @@ int main(int argc, char **argv) {
                                           /*kernelOffset=*/0, targetIsa,
                                           enableWritelaneRewrite,
                                           enableWaveNative,
-                                          enablePermLane16Xor3PartnerRewrite);
+                                          enablePermLane16Xor3PartnerRewrite,
+                                          enablePermLane16SwapSelfPreserveRewrite);
       shm->done = true;
       shm->success = raised.success;
       shm->lifted = raised.liftedCount;

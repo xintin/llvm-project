@@ -76,7 +76,8 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
                            const std::string &kernelName,
                            bool enableWritelaneRewrite = true,
                            bool enableWaveNative = true,
-                           bool enablePermLane16Xor3PartnerRewrite = true);
+                           bool enablePermLane16Xor3PartnerRewrite = true,
+                           bool enablePermLane16SwapSelfPreserveRewrite = true);
 
 /// Raise and lower ALL kernels in a code object, producing a single merged
 /// HSACO containing every kernel.  Returns success only if every kernel was
@@ -87,7 +88,8 @@ PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
                                      const std::string &targetISA,
                                      bool enableWritelaneRewrite = true,
                                      bool enableWaveNative = true,
-                                     bool enablePermLane16Xor3PartnerRewrite = true);
+                                     bool enablePermLane16Xor3PartnerRewrite = true,
+                                     bool enablePermLane16SwapSelfPreserveRewrite = true);
 
 /// Process-global "strict mode" toggle, controlled by the
 /// `HSA_SALMON_STRICT` environment variable. When set to a non-empty
