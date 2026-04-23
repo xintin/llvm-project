@@ -54,21 +54,84 @@ ArrayRef<SemOpAttrSpec> getHandlerSOP2Attrs() {
   return kAttrs;
 }
 
+// Look up the per-lane wave-width i1 shadow for source operand `i`, if it
+// lives in an SGPR covered by the V_CMP → SGPR shadow cache in
+// `RaiseContext::lastSgprWaveMaskI1`.  Returns null when the operand
+// isn't a shadowed SGPR (immediate, non-shadowed SGPR, VGPR, EXEC, etc.).
+//
+// Context: cross-widening (wave32 source → wave64 target) loses the
+// upper 32 bits of a V_CMP-produced wave-mask when the mask is
+// funneled through a 32-bit source-width SGPR.  The shadow cache
+// preserves the full wave-width i1 from the V_CMP writer so a
+// subsequent V_CNDMASK consumer can reconstruct the correct per-lane
+// bit.  Scalar binary ops (`s_xor_b32`, `s_and_b32`, `s_or_b32`)
+// on two shadowed SGPRs can PROPAGATE the shadow by computing the
+// per-lane i1 of the result directly from the two input i1s — closes
+// the gap that was present for the Triton gfx1250 tl.sort pattern
+// `v_cmp_X s2; v_cmp_Y s3; s_xor_b32 s2, s2, s3; v_cndmask ... s2`,
+// where the scalar XOR formerly invalidated the shadow and forced the
+// consumer onto the lossy narrow-mask fallback.
+static llvm::Value *tryGetSrcWaveMaskI1(RaiseContext &ctx, OpResolver &op,
+                                         unsigned i) {
+  if (!op.isSrcReg(i))
+    return nullptr;
+  ParsedReg pr = op.srcReg(i);
+  if (pr.kind != ParsedReg::SGPR)
+    return nullptr;
+  return ctx.lookupSgprWaveMaskI1(pr.baseIdx);
+}
+
+// Record a derived wave-mask i1 on `dstReg` iff `dstReg` is an SGPR.
+// No-op otherwise.  The caller must pass an i1 that's per-lane
+// correct for the wave-width EXEC (not the source-width scalar).
+static void recordDerivedWaveMaskI1(RaiseContext &ctx, ParsedReg dstReg,
+                                     llvm::Value *i1) {
+  if (!i1 || dstReg.kind != ParsedReg::SGPR)
+    return;
+  // `isPair=false` because S_{AND,OR,XOR,ANDN2,ORN2}_B32 all operate
+  // on a single 32-bit SGPR dst.  The B64 variants (pair dst) are NOT
+  // instrumented here: wave64 source kernels don't hit the cross-
+  // widening ballot-truncation pattern the shadow cache addresses.
+  ctx.recordSgprWaveMaskI1(dstReg.baseIdx, i1, /*isPair=*/false);
+}
+
 HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
                          OpResolver &op) {
   HandlerResult hr;
   SemOp sop = di.semOp;
 
-  // 32-bit binary ops — auto SCC via sccResult
+  // 32-bit binary ops — auto SCC via sccResult.
+  //
+  // Shadow propagation: when BOTH sources are SGPRs whose most-recent
+  // V_CMP writer in this BB is cached in
+  // `RaiseContext::lastSgprWaveMaskI1`, compute the per-lane i1 of
+  // the result and re-record the shadow after the scalar write has
+  // invalidated the cache via `onSgprWritten`.  Prevents the
+  // cross-widening narrow-mask-fallback bug that canary_tl_sort_fp32_n4
+  // hit on the Triton gfx1250 tl.sort BLOCK_N=4 idiom (commit
+  // `compare_correctness: tl.sort N=4 probe` landed the regression
+  // probe).
   if (sop == SemOp::S_AND_B32) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     hr.sccResult = ctx.B.CreateAnd(op.src(0), op.src(1), "and");
     ctx.regs.writeReg32(ctx.B, op.dst(), hr.sccResult);
+    if (s0_i1 && s1_i1) {
+      Value *andI1 = ctx.B.CreateAnd(s0_i1, s1_i1, "wave_mask_and");
+      recordDerivedWaveMaskI1(ctx, op.dst(), andI1);
+    }
     hr.handled = true;
     return hr;
   }
   if (sop == SemOp::S_OR_B32) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     hr.sccResult = ctx.B.CreateOr(op.src(0), op.src(1), "or");
     ctx.regs.writeReg32(ctx.B, op.dst(), hr.sccResult);
+    if (s0_i1 && s1_i1) {
+      Value *orI1 = ctx.B.CreateOr(s0_i1, s1_i1, "wave_mask_or");
+      recordDerivedWaveMaskI1(ctx, op.dst(), orI1);
+    }
     hr.handled = true;
     return hr;
   }
@@ -304,8 +367,14 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
   if (sop == SemOp::S_XOR_B32) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     hr.sccResult = ctx.B.CreateXor(op.src(0), op.src(1), "xor");
     ctx.regs.writeReg32(ctx.B, op.dst(), hr.sccResult);
+    if (s0_i1 && s1_i1) {
+      Value *xorI1 = ctx.B.CreateXor(s0_i1, s1_i1, "wave_mask_xor");
+      recordDerivedWaveMaskI1(ctx, op.dst(), xorI1);
+    }
     hr.handled = true;
     return hr;
   }
