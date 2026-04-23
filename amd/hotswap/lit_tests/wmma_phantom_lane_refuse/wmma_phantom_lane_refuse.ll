@@ -1,70 +1,39 @@
-; RUN: %not %raise_cli %wmma_phantom_lane_refuse_co \
+; RUN: %raise_cli %wmma_phantom_lane_refuse_co \
 ; RUN:     --isa=gfx1250 --target-isa=gfx942 \
 ; RUN:     --emit-ir=wmma_phantom_lane_refuse_kernel 2>&1 \
 ; RUN:   | %FileCheck %s
 ;
-; Regression fence for the WMMA → MFMA refusal gate added in
-; `handle_valu_vop3p.cpp`.  The fixture's launch_bounds(32) drive
-; `raiser.cpp`'s phantom-lane fallback to MODREP (covered by the
-; sibling `phantom_lane_modrep_fallback/` fixture), and the kernel's
-; `__builtin_amdgcn_wmma_f32_16x16x4_f32` call then forces the K=4
-; f32 case of `handle_valu_vop3p.cpp` to reach the
-; `emitWMMAtoMFMA_F32_16x16x4` call site on a gfx942 target.  With
-; the `providesFullWaveExecInvariant` gate in place, the handler
-; refuses before that call is emitted.
+; Phantom-lane regime `v_wmma_f32_16x16x4_f32` (K=4 f32) lowering.
+; Fixture name kept from the pre-2026-04-23 era when this opcode in
+; MODREP refused unconditionally; the gate is now surgical (refuses
+; only the multi-WMMA-per-K-iter regime marked by
+; `v_permlane16_swap_b32` — see `handle_valu_vop3p.cpp`'s K=4 f32
+; arm and matrix-translation.md §12.4.4).  This kernel has a SINGLE
+; WMMA and no permlane16_swap, so it takes the MODREP
+; `emitWMMAtoMFMA_F32_16x16x4` path and lifts correctly.
 ;
-; If the gate regressed (e.g. a future refactor dropped the check),
-; `raise_cli` would either succeed (producing a silently-miscompiled
-; HSACO that `compare_correctness`'s `matmul_fp16_16x16` caught
-; empirically — all shapes WRONG numerics) or fall into the
-; following `hasMFMA` decomposition with the wrong projection.  The
-; `%not` wrapper + FileCheck anchors below catch the regression in
-; either direction: `%not` demands non-zero exit, and the CHECKs
-; demand the specific attribution chain.
+; Regression fence: if the surgical gate regressed to an
+; unconditional refusal, this test's RUN line would exit non-zero
+; and fail.  If the gate regressed to permit multi-WMMA kernels,
+; the sibling `matmul_fp16` compare_correctness recipe would
+; surface silently-wrong numerics and the companion
+; `wmma_phantom_lane_refuse_multiwmma` fixture (TODO: add if
+; needed) would catch it.
+;
+; CHECK anchors pin the expected IR shape:
+;   (1) the phantom-lane → MODREP fallback log (unchanged from the
+;       pre-surgical era — still fires because `__launch_bounds__(32)`);
+;   (2) the MFMA K=4 f32 intrinsic emission (proves the lowering
+;       reached `emitWMMAtoMFMA_F32_16x16x4`);
+;   (3) the `strict.wwm` wrap that `wmma_lowering.cpp` inserts on
+;       the MFMA output under MODREP so `SIWholeQuadMode` emits the
+;       EXEC=-1 save/restore around the MFMA collective.
 
-; Two pieces of diagnostic state the fixture pins, in the order
-; `raise_cli` emits them at handler-time refusal:
-;
-;   (1) The phantom-lane → MODREP fallback log from `raiser.cpp`
-;       (proves the fallback fired, i.e. the WMMA gate below
-;       fired under MODREP — not WaveNative).
-;   (2) The `raise_cli` outer-tool failure line that carries the
-;       opcode attribution, the invariant name, the intrinsic
-;       reference, and the phantom-lane pointer.
-;
-; Both are on the same `stderr`; the `%not` prefix on the RUN line
-; demands raise_cli exits non-zero (the handler-time refusal
-; path).  Handler-time refusals do NOT emit the
-; `transpiler: pre-translation abort:` banner that
-; c5-predicate-chain and other Phase-6 classifier refusals use;
-; that banner is only emitted by classifier refusals (see
-; `raiser.cpp`'s Phase-6 output block).  The chain below is the
-; attribution shape for handler-time `unsupportedShape` refusals.
-
-; (1) Fallback log — same emission point as
-;     `phantom_lane_modrep_fallback.ll`'s CHECK block, expected
-;     here because we're in the same phantom-lane regime.
 ; CHECK: phantom-lane regime
 ; CHECK-SAME: max_flat_workgroup_size=32
 ; CHECK-SAME: target wavefront width=64
 ; CHECK-SAME: falling back to ModuloReplicationProjection
 
-; (2) Outer-tool failure line: `raise_cli` writes a single
-;     consolidated diagnostic that names the kernel, the opcode,
-;     the DecodedInst class (VOP3P), and the attribution chain.
-;     The `CHECK-SAME` ordering below matches the actual string
-;     assembly in `handle_valu_vop3p.cpp`'s `RaiseFailure::
-;     unsupportedShape` call site so a future reword that
-;     drops any of the attribution anchors is caught.
-;
-;     The current refusal text names the staged strict.wwm-
-;     scoped MODREP lowering and the unpinned residual
-;     divergence on matmul_fp16_16x16, with a pointer at the
-;     `__launch_bounds__(targetWaveSize)` workaround that takes
-;     the WaveNative path.  Those anchors pin the diagnostic so
-;     a regression can't quietly drop any of them.
-; CHECK: raise_cli: kernel 'wmma_phantom_lane_refuse_kernel' failed to raise:
-; CHECK-SAME: v_wmma_f32_16x16x4_f32
-; CHECK-SAME: VOP3P
-; CHECK-SAME: ModuloReplicationProjection
-; CHECK-SAME: K=32/K=64 arm
+; CHECK: define amdgpu_kernel void @wmma_phantom_lane_refuse_kernel
+; CHECK: call <4 x float> @llvm.amdgcn.mfma.f32.16x16x4f32(float {{.*}}, float {{.*}}, <4 x float> {{.*}}, i32 0, i32 0, i32 0)
+; CHECK: call <4 x float> @llvm.amdgcn.strict.wwm.v4f32(<4 x float>

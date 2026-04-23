@@ -360,6 +360,21 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   // the remaining case: explicit-operand EXEC writers (e.g.
   // `s_mov_b32 exec_lo, s2`) where "writes EXEC" depends on the
   // runtime operand value rather than the MCInstrDesc alone.
+  // Pre-scan for `v_permlane16_swap_b32` presence — consumed by the
+  // WMMA→MFMA refusal gate in `handle_valu_vop3p.cpp` as a
+  // multi-WMMA-fragment-shuffle marker.  See the doc comment on
+  // `RaiseContext::kernelHasPermlane16Swap` in raise_context.hpp
+  // and matrix-translation.md §12.4.4 for the layout-asymmetry
+  // characterisation that motivates this surgical gate rather than
+  // a blanket WMMA refusal under MODREP.
+  bool kernelHasPermlane16Swap = false;
+  for (const DecodedInst &di : insts) {
+    if (di.semOp == SemOp::V_PERMLANE16_SWAP_B32) {
+      kernelHasPermlane16Swap = true;
+      break;
+    }
+  }
+
   for (const DecodedInst &di : insts) {
     if (!instructionWritesEXEC(di, mc))
       continue;
@@ -640,6 +655,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
+  ctx.kernelHasPermlane16Swap = kernelHasPermlane16Swap;
 
   // Wire the reg-file's EXEC-write invalidation hook to ctx's lane_active
   // memo. This catches every EXEC mutation — ctx.storeExec, the various

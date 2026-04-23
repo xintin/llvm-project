@@ -567,22 +567,19 @@ Value *emitWMMAtoMFMA(RaiseContext &ctx, Value *a, Value *b, Value *c,
   // refusal arms in `handle_valu_vop3p.cpp` return before reaching this
   // helper when `!providesFullWaveExecInvariant()`, i.e. under any non-
   // WaveNative projection.  The `numSrcWaves == 1` branch below is
-  // therefore unreachable in production today.  It is kept in-tree
-  // because (a) the staged MODREP path is verified correct for minimal
-  // repros (`lit_tests/wmma_phantom_lane_f16_chain/`) and is the right
-  // code to re-enable once the matmul_fp16_16x16 residual is pinned,
-  // and (b) removing it would require re-deriving the pass-1-skip
-  // logic later.  `report_fatal_error` (NOT `assert`) is used here
-  // because an `NDEBUG` / release build still needs to trap a refusal-
-  // gate regression that reaches this code path — silently running
-  // the un-vetted MODREP branch would re-open the wrong-numerics
-  // residual that the gate is specifically guarding against.
-  if (numSrcWaves != 2)
-    report_fatal_error(
-        "emitWMMAtoMFMA: numSourceWavesPerTarget() != 2; the "
-        "MODREP arm is staged-but-gated-off — see "
-        "matrix-translation.md §12 and the refusal in "
-        "`handle_valu_vop3p.cpp`.");
+  // Both `numSrcWaves == 1` (MODREP, single-source-wave per target
+  // wave, the phantom-lane regime for kernels with
+  // max_flat_workgroup_size < targetWaveSize) and `numSrcWaves == 2`
+  // (WaveNative, wave32→wave64 cross-widen) fall through to the
+  // two-branch pass logic below.  A broader `numSrcWaves != 2`
+  // refusal guard lived here through 2026-04-23 to keep the MODREP
+  // arm behind the `handle_valu_vop3p.cpp` refusal gate; it was
+  // removed once the gate was narrowed to the multi-WMMA-per-K-iter
+  // regime only (matmul_fp16 still refuses; matmul_fp16_16x16 and
+  // other single-WMMA kernels now reach this path correctly).  See
+  // matrix-translation.md §12.4.4 for the layout characterisation
+  // and handle_valu_vop3p.cpp's K=32/K=64 diagnostic for the
+  // surgical refusal criterion.
 
   Value *result0[8];
   runGroupPass(B, M, ctx, /*groupBase=*/0, laneId, aDwords, bDwords, cDwords,
@@ -779,14 +776,11 @@ Value *emitWMMAtoMFMA_F32_16x16x4(RaiseContext &ctx, Value *a, Value *b,
         "numSourceWavesPerTarget() must be 1 (MODREP phantom-lane) or 2 "
         "(WaveNative cross-widen) — a new projection class must declare "
         "which applies.");
-  // See `emitWMMAtoMFMA` above for the identical staging-guard rationale
-  // (release-build-safe `report_fatal_error` instead of `assert`).
-  if (numSrcWaves != 2)
-    report_fatal_error(
-        "reached emitWMMAtoMFMA_F32_16x16x4 under a projection that "
-        "returns numSourceWavesPerTarget() != 2; the MODREP arm is "
-        "staged-but-gated-off in `handle_valu_vop3p.cpp` (see the K=4 "
-        "f32 arm's diagnostic for the investigation handoff).");
+  // Mirrors `emitWMMAtoMFMA` above: both MODREP (numSrcWaves==1) and
+  // WaveNative (numSrcWaves==2) fall through to the two-branch pass
+  // logic below; the old staging refusal was lifted once the
+  // dispatcher's refusal gate was narrowed to the multi-WMMA-per-
+  // K-iter pattern (see `handle_valu_vop3p.cpp`).
 
   Value *result0[8];
   runGroupPassF32K4(B, M, ctx, /*groupBase=*/0, laneId, aDwords, bDwords,

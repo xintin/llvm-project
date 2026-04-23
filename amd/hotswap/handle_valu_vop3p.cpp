@@ -403,15 +403,22 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
       // residual is pinned and the fix lands; the infrastructure
       // in `wave_projection.hpp` (`numSourceWavesPerTarget`,
       // `wrapAsWWMValue`) is LANDED additively.
-      if (!ctx.projection.providesFullWaveExecInvariant()) {
+      // K=4 f32 arm: conservatively refuse under MODREP with the
+      // multi-WMMA surrogate check (permlane16_swap presence).
+      // K=4 doesn't appear in any currently-graduating corpus
+      // kernel, so there's no empirical pressure to widen this arm
+      // past the K=32/K=64 analysis.
+      if (!ctx.projection.providesFullWaveExecInvariant() &&
+          ctx.kernelHasPermlane16Swap) {
         hr.failure = RaiseFailure::unsupportedShape(
             di, "VOP3P",
             "v_wmma_f32_16x16x4_f32 cross-target (WMMA → MFMA) "
-            "under ModuloReplicationProjection — see the "
-            "K=32/K=64 arm's diagnostic for the full rationale.  "
-            "Compile with `__launch_bounds__(targetWaveSize)` or "
-            "larger to take the verified WaveNative projection "
-            "path.");
+            "under ModuloReplicationProjection in a multi-WMMA-"
+            "per-K-iter kernel — see the K=32/K=64 arm's diagnostic "
+            "for the full root cause and the matrix-translation.md "
+            "§12.4.4 characterisation.  Compile with "
+            "`__launch_bounds__(targetWaveSize)` or larger to take "
+            "the verified WaveNative projection path.");
         return hr;
       }
       result_val = emitWMMAtoMFMA_F32_16x16x4(ctx, a, b, c);
@@ -598,27 +605,48 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
       // infrastructure (numSourceWavesPerTarget, wrapAsWWMValue)
       // additively; flip this gate once the matmul_fp16_16x16
       // divergence is explained.
-      if (!ctx.projection.providesFullWaveExecInvariant()) {
+      // Surgical refusal: the `redistributeInput` layout pinned in
+      // matrix-translation.md §12.4.4 is correct for the single-
+      // WMMA-per-K-iter regime (verified end-to-end by
+      // `matmul_fp16_16x16` → 5/5 `match` in compare_correctness),
+      // but WRONG for the multi-WMMA-per-K-iter regime that
+      // straddles operand halves (`matmul_fp16` → 1024/1024
+      // `WRONG`).  The hallmark of the multi-WMMA regime is the
+      // `v_permlane16_swap_b32` fragment-layout bridge Triton emits
+      // before the WMMA call; `kernelHasPermlane16Swap` was set by
+      // the raiser's pre-scan over the decoded instruction stream.
+      // Single-WMMA kernels (no permlane16_swap) correctly take the
+      // MODREP + strict.wwm path below; multi-WMMA kernels refuse
+      // with the precise root-cause citation so users / CI see the
+      // known-broken shape without silent wrong numerics.
+      if (!ctx.projection.providesFullWaveExecInvariant() &&
+          ctx.kernelHasPermlane16Swap) {
         hr.failure = RaiseFailure::unsupportedShape(
             di, "VOP3P",
             "v_wmma_*_16x16x{32,64}_* cross-target (WMMA → MFMA) "
-            "under ModuloReplicationProjection.  Root cause pinned "
-            "by Session-5 per-dword instrumentation (see matrix-"
-            "translation.md §12.4.4): the WMMA.A operand "
-            "(v186-193 in matmul_fp16) has a different per-lane "
-            "layout than WMMA.B — lanes 0-15 and lanes 16-31 hold "
-            "the SAME K subset at each GPR position but different "
-            "COLS (col-split), whereas WMMA.B has the standard "
-            "K-split between lane halves.  The current `redistributeInput` "
-            "applies K-split redistribution symmetrically, which "
-            "works for WMMA.B but SILENTLY reads duplicated K "
-            "subset for WMMA.A — surfaces as `got = ref + 16` on "
-            "mode-5 (B col-varying) and `got = 19.5 vs ref = 15.5` "
-            "on mode-8 (B K-varying).  Fixing requires the gfx1250 "
-            "WMMA.A ISA layout (mapping of lane/dw/half → "
-            "(row_hw, K_hw)) which is not yet in our decode.  "
-            "Workaround: compile source with `__launch_bounds__(targetWaveSize)` "
-            "or larger to take the verified WaveNative path.");
+            "under ModuloReplicationProjection in a multi-WMMA-"
+            "per-K-iter kernel (detected by v_permlane16_swap_b32 "
+            "presence).  Root cause pinned by Session-5 per-dword "
+            "instrumentation (matrix-translation.md §12.4.4): "
+            "multi-WMMA Triton kernels (32×32×32 tl.dot, e.g. "
+            "matmul_fp16) split the full K=32 across TWO 8-VGPR "
+            "register ranges (v186-193 and v194-201) with the "
+            "v_permlane16_swap_b32 acting as the cross-half "
+            "fragment-layout bridge.  The WMMA intrinsic consumes "
+            "only one range as its A operand, but gfx1250 hardware "
+            "assembles the full 16×32 from BOTH ranges via a "
+            "matrix-layout convention we have not yet decoded from "
+            "the ISA spec.  Our MFMA redistributeInput assumes the "
+            "K-split lane-half layout (correct for WMMA.B in both "
+            "regimes, and for WMMA.A in the single-WMMA regime) "
+            "and silently reads duplicated K subset when applied to "
+            "WMMA.A in the multi-WMMA regime — surfaces as `got = "
+            "ref + 16` on mode-5 and `got = 19.5 vs ref = 15.5` on "
+            "mode-8.  Single-WMMA kernels (matmul_fp16_16x16) are "
+            "UNAFFECTED and the lowering runs for them.  Workaround "
+            "for multi-WMMA: compile source with "
+            "`__launch_bounds__(targetWaveSize)` or larger to take "
+            "the verified WaveNative path.");
         return hr;
       }
       result_val = emitWMMAtoMFMA(ctx, a, b, c, wmmaInputType);
