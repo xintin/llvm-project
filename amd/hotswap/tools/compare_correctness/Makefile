@@ -108,6 +108,7 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   canary_tl_sort_fp32_n16_xor1 \
                   canary_tl_sort_fp32_n16_row_offset \
                   canary_tl_sort_fp32_n16_altrow \
+                  canary_tl_sort_fp32_n4 \
                   canary_tl_sort_fp32_deterministic
 
 # Both KERNELS and TRITON_KERNELS feed the same %.gfx942.co / %.gfx1250.co
