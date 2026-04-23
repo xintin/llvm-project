@@ -237,6 +237,16 @@ static Value *selectByLaneGroup(IRBuilder<> &B, Value *laneGroup,
 /// Redistribute A or B input from gfx12 WMMA layout (8 VGPRs, Wave32)
 /// to gfx942 MFMA layout (2 VGPRs × 2 passes, Wave64).
 ///
+/// NOTE: the per-lane K-distribution documented below is EMPIRICALLY
+/// CORRECT for the WMMA.B operand (v170-177 in matmul_fp16) as pinned
+/// by mode-7 / mode-9 instrumentation (see `hotswap/docs/matrix-
+/// translation.md §12.4.4 Session-5 per-dword characterization`).  The
+/// WMMA.A operand on gfx1250 has a DIFFERENT per-lane layout — lanes
+/// 0-15 and lanes 16-31 hold the SAME K subset at the same GPR
+/// position but different cols — which this redistribution does NOT
+/// handle correctly (see matrix-translation.md §12.4.4 and the refusal
+/// gate in `handle_valu_vop3p.cpp`).
+///
 /// The gfx12 WMMA k-distribution interleaves between the two lane halves:
 ///   Lanes 0-15:  GPR pairs {0,1}→k 0-3, {2,3}→k 8-11, {4,5}→k 16-19, {6,7}→k 24-27
 ///   Lanes 16-31: GPR pairs {0,1}→k 4-7, {2,3}→k 12-15, {4,5}→k 20-23, {6,7}→k 28-31

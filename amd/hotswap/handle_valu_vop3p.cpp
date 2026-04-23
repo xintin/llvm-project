@@ -602,17 +602,23 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
         hr.failure = RaiseFailure::unsupportedShape(
             di, "VOP3P",
             "v_wmma_*_16x16x{32,64}_* cross-target (WMMA → MFMA) "
-            "under ModuloReplicationProjection.  The staged "
-            "`strict.wwm`-scoped lowering has an open multi-WMMA "
-            "residual on Triton's `matmul_fp16` (BLOCK=32, dynamic "
-            "LDS) — mode-5 B-only-varying input yields the "
-            "specific `got = 2*(j mod 16) + 16` pattern, indicating "
-            "BOTH sub-tile WMMAs receive the SAME B fragment "
-            "shifted by 8 cols from the expected pair (see matrix-"
-            "translation.md §12.4 for the bisection).  Refusing "
-            "loudly until pinned.  Workaround: compile source with "
-            "`__launch_bounds__(targetWaveSize)` or larger to take "
-            "the verified WaveNative path.");
+            "under ModuloReplicationProjection.  Root cause pinned "
+            "by Session-5 per-dword instrumentation (see matrix-"
+            "translation.md §12.4.4): the WMMA.A operand "
+            "(v186-193 in matmul_fp16) has a different per-lane "
+            "layout than WMMA.B — lanes 0-15 and lanes 16-31 hold "
+            "the SAME K subset at each GPR position but different "
+            "COLS (col-split), whereas WMMA.B has the standard "
+            "K-split between lane halves.  The current `redistributeInput` "
+            "applies K-split redistribution symmetrically, which "
+            "works for WMMA.B but SILENTLY reads duplicated K "
+            "subset for WMMA.A — surfaces as `got = ref + 16` on "
+            "mode-5 (B col-varying) and `got = 19.5 vs ref = 15.5` "
+            "on mode-8 (B K-varying).  Fixing requires the gfx1250 "
+            "WMMA.A ISA layout (mapping of lane/dw/half → "
+            "(row_hw, K_hw)) which is not yet in our decode.  "
+            "Workaround: compile source with `__launch_bounds__(targetWaveSize)` "
+            "or larger to take the verified WaveNative path.");
         return hr;
       }
       result_val = emitWMMAtoMFMA(ctx, a, b, c, wmmaInputType);
