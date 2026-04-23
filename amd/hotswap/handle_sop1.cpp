@@ -167,10 +167,47 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // S_*_SAVEEXEC_B32 family — save old EXEC into dst SGPR and
+  // update EXEC via the family-specific combine.  The dst SGPR is
+  // source-width (32-bit on wave32 source) so the i64 oldExec is
+  // truncated when it lands in the alloca — lossy under wave-native
+  // cross-widening where the two halves of i64 EXEC can differ.
+  //
+  // Shadow propagation: we have the full-width `oldExec` in hand.
+  // After `writeRegExecWidth` calls the reg-file's `onSgprWritten`
+  // callback (which INVALIDATES the shadow for the dst SGPR),
+  // re-record the shadow with the per-lane i1 extracted from
+  // `oldExec` via the projection's `extractLaneBitFromWaveMask`.
+  // Subsequent consumers (V_CNDMASK using this SGPR, or a
+  // downstream S_XOR_B32 that ANDs the saved mask with the new
+  // EXEC to compute the "else-branch" mask) see the correct
+  // per-lane i1 instead of the narrow-mask fallback.
+  //
+  // Covers the Triton gfx1250 tl.sort at small BLOCK_N idiom
+  // `s_and_saveexec_b32 sN, vcc; s_xor_b32 sN, exec_lo, sN` —
+  // SAVEEXEC records `oldExec`'s i1 on sN, the sibling S_XOR_B32
+  // handler extracts the current EXEC's i1 and XORs with the
+  // shadowed sN i1, producing the wave-correct "lanes that became
+  // inactive" mask for the V_CNDMASK consumer.
+  //
+  // Structurally safe: if the dst isn't an SGPR (e.g., dst == EXEC
+  // itself — non-saveexec form?  there isn't one for these
+  // opcodes) the helper is a no-op.  The recorded i1 is a fresh
+  // SSA value so `I2` (SSA-monotonic within a BB) holds.
+  auto recordOldExecShadowOnDst = [&](Value *oldExec) {
+    ParsedReg dst = op.dst();
+    if (dst.kind != ParsedReg::SGPR)
+      return;
+    llvm::Value *oldExecI1 =
+        ctx.projection.extractLaneBitFromWaveMask(ctx.B, oldExec);
+    ctx.recordSgprWaveMaskI1(dst.baseIdx, oldExecI1, /*isPair=*/false);
+  };
+
   if (sop == SemOp::S_AND_SAVEEXEC_B32) {
     Value *oldExec = ctx.regs.loadExec(ctx.B);
     Value *src = op.srcExecWidth(0);
     ctx.regs.writeRegExecWidth(ctx.B, op.dst(), oldExec);
+    recordOldExecShadowOnDst(oldExec);
     Value *newExec = ctx.B.CreateAnd(oldExec, src, "new_exec");
     ctx.regs.storeExec(ctx.B, newExec);
     hr.sccResult = newExec;
@@ -181,6 +218,7 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
     Value *oldExec = ctx.regs.loadExec(ctx.B);
     Value *src = op.srcExecWidth(0);
     ctx.regs.writeRegExecWidth(ctx.B, op.dst(), oldExec);
+    recordOldExecShadowOnDst(oldExec);
     Value *newExec = ctx.B.CreateOr(oldExec, src, "new_exec");
     ctx.regs.storeExec(ctx.B, newExec);
     hr.sccResult = newExec;
@@ -191,6 +229,7 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
     Value *oldExec = ctx.regs.loadExec(ctx.B);
     Value *src = op.srcExecWidth(0);
     ctx.regs.writeRegExecWidth(ctx.B, op.dst(), oldExec);
+    recordOldExecShadowOnDst(oldExec);
     Value *newExec = ctx.B.CreateXor(oldExec, src, "new_exec");
     ctx.regs.storeExec(ctx.B, newExec);
     hr.sccResult = newExec;
@@ -201,6 +240,7 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
     Value *oldExec = ctx.regs.loadExec(ctx.B);
     Value *src = op.srcExecWidth(0);
     ctx.regs.writeRegExecWidth(ctx.B, op.dst(), oldExec);
+    recordOldExecShadowOnDst(oldExec);
     Value *newExec = ctx.B.CreateAnd(oldExec, ctx.B.CreateNot(src), "new_exec");
     ctx.regs.storeExec(ctx.B, newExec);
     hr.sccResult = newExec;
@@ -211,6 +251,7 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
     Value *oldExec = ctx.regs.loadExec(ctx.B);
     Value *src = op.srcExecWidth(0);
     ctx.regs.writeRegExecWidth(ctx.B, op.dst(), oldExec);
+    recordOldExecShadowOnDst(oldExec);
     Value *newExec = ctx.B.CreateOr(oldExec, ctx.B.CreateNot(src), "new_exec");
     ctx.regs.storeExec(ctx.B, newExec);
     hr.sccResult = newExec;

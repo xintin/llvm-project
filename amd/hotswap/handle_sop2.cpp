@@ -54,45 +54,109 @@ ArrayRef<SemOpAttrSpec> getHandlerSOP2Attrs() {
   return kAttrs;
 }
 
-// Look up the per-lane wave-width i1 shadow for source operand `i`, if it
-// lives in an SGPR covered by the V_CMP → SGPR shadow cache in
-// `RaiseContext::lastSgprWaveMaskI1`.  Returns null when the operand
-// isn't a shadowed SGPR (immediate, non-shadowed SGPR, VGPR, EXEC, etc.).
+// Look up the per-lane wave-width i1 for source operand `i`, covering
+// three cases that each carry full wave-width information that would
+// otherwise be lost when funneled through the source-width SGPR path:
+//
+//   1. SGPR shadowed by the V_CMP → SGPR shadow cache in
+//      `RaiseContext::lastSgprWaveMaskI1` (matmul128x128-class fix).
+//   2. VCC — the V_CMP → VCC path stores a per-lane i1 directly in
+//      the VCC alloca, so we can load it per-lane without the
+//      ballot-then-truncate round-trip.
+//   3. EXEC — the EXEC alloca carries the full wave-width mask at
+//      `execStorageTy()` (i64 on wave64 target).  Per-lane i1 comes
+//      from `extractLaneBitFromWaveMask` on the loaded EXEC.
+//
+// Returns null for immediate / VGPR sources and for non-shadowed
+// SGPRs.  Callers that handle all three wave-width-carrying kinds
+// get correct per-lane results under cross-widening; callers that
+// only look at the SGPR shadow get the narrower matmul-fix
+// coverage.
 //
 // Context: cross-widening (wave32 source → wave64 target) loses the
 // upper 32 bits of a V_CMP-produced wave-mask when the mask is
-// funneled through a 32-bit source-width SGPR.  The shadow cache
-// preserves the full wave-width i1 from the V_CMP writer so a
-// subsequent V_CNDMASK consumer can reconstruct the correct per-lane
-// bit.  Scalar binary ops (`s_xor_b32`, `s_and_b32`, `s_or_b32`)
-// on two shadowed SGPRs can PROPAGATE the shadow by computing the
-// per-lane i1 of the result directly from the two input i1s — closes
-// the gap that was present for the Triton gfx1250 tl.sort pattern
-// `v_cmp_X s2; v_cmp_Y s3; s_xor_b32 s2, s2, s3; v_cndmask ... s2`,
-// where the scalar XOR formerly invalidated the shadow and forced the
-// consumer onto the lossy narrow-mask fallback.
+// funneled through a 32-bit source-width SGPR.  Scalar binary ops
+// (`s_xor_b32`, `s_and_b32`, `s_or_b32`) on two wave-width-carrying
+// sources can PROPAGATE full wave-width information by computing
+// the per-lane i1 of the result directly from the two input i1s.
+// This closes three idiom classes from Triton's gfx1250 output:
+//
+//   * `v_cmp_X s2; v_cmp_Y s3; s_xor_b32 s2, s2, s3; v_cndmask … s2`
+//     (both sources shadowed SGPR — core matmul-fix shape).
+//   * `v_cmp_X vcc; s_and_saveexec_b32 s2, vcc; s_xor_b32 s2,
+//     exec_lo, s2; v_cndmask … s2` (right source = saved old_exec
+//     in SGPR, left source = current exec_lo after saveexec — the
+//     "else-branch mask" idiom Triton's tl.sort at small BLOCK_N
+//     emits between its bitonic stages).
+//   * `s_and_b32 s2, s2, vcc_lo` / `s_or_b32 s2, s2, vcc_lo` where
+//     one source is VCC.
 static llvm::Value *tryGetSrcWaveMaskI1(RaiseContext &ctx, OpResolver &op,
                                          unsigned i) {
   if (!op.isSrcReg(i))
     return nullptr;
   ParsedReg pr = op.srcReg(i);
-  if (pr.kind != ParsedReg::SGPR)
+  switch (pr.kind) {
+  case ParsedReg::SGPR:
+    return ctx.lookupSgprWaveMaskI1(pr.baseIdx);
+  case ParsedReg::VCC:
+    // VCC alloca stores the per-lane i1 directly; load it to get
+    // the correct wave-width i1 without the ballot-truncate-
+    // replicate round-trip.
+    return ctx.regs.loadVCC(ctx.B);
+  case ParsedReg::EXEC: {
+    // EXEC storage is always the wave-width mask; extract the
+    // per-lane bit via the projection's helper so the width /
+    // replication policy matches what the sibling reader
+    // (`extractLaneBitFromWaveMask` in the V_CNDMASK consumer
+    // path) would produce.
+    llvm::Value *execVal = ctx.regs.loadExec(ctx.B);
+    return ctx.projection.extractLaneBitFromWaveMask(ctx.B, execVal);
+  }
+  default:
     return nullptr;
-  return ctx.lookupSgprWaveMaskI1(pr.baseIdx);
+  }
 }
 
-// Record a derived wave-mask i1 on `dstReg` iff `dstReg` is an SGPR.
-// No-op otherwise.  The caller must pass an i1 that's per-lane
-// correct for the wave-width EXEC (not the source-width scalar).
+// Record a derived wave-mask i1 on `dstReg`.  Handles the two
+// destination kinds that carry wave-width information:
+//
+//   * SGPR — record in the V_CMP shadow cache so the next
+//     V_CNDMASK or scalar-op consumer in this BB picks up the
+//     full-width i1 instead of the narrow-mask fallback.
+//   * VCC — OVERWRITE the VCC alloca's i1 with the wave-width
+//     result.  The handler's earlier `writeReg32(VCC, i32_xor)`
+//     derived an i1 from the lossy i32 via
+//     `extractLaneBitFromWaveMask(trunc-replicate-extract)`;
+//     we replace that with the structurally-correct per-lane i1
+//     so downstream V_CNDMASK consumers that read VCC directly
+//     (via the VCC alloca's load) get the right bit.
+//
+// Other destination kinds (VGPR, EXEC, M0, TTMP, immediate) are
+// no-ops — they either don't participate in the cross-widening
+// ballot truncation this propagation addresses, or the earlier
+// `writeReg32` already did the right thing.
 static void recordDerivedWaveMaskI1(RaiseContext &ctx, ParsedReg dstReg,
                                      llvm::Value *i1) {
-  if (!i1 || dstReg.kind != ParsedReg::SGPR)
+  if (!i1)
     return;
-  // `isPair=false` because S_{AND,OR,XOR,ANDN2,ORN2}_B32 all operate
-  // on a single 32-bit SGPR dst.  The B64 variants (pair dst) are NOT
-  // instrumented here: wave64 source kernels don't hit the cross-
-  // widening ballot-truncation pattern the shadow cache addresses.
-  ctx.recordSgprWaveMaskI1(dstReg.baseIdx, i1, /*isPair=*/false);
+  switch (dstReg.kind) {
+  case ParsedReg::SGPR:
+    // `isPair=false`: S_{AND,OR,XOR}_B32 all operate on a single
+    // 32-bit SGPR dst.  B64 variants aren't instrumented here
+    // (wave64-source shapes don't hit the cross-widening
+    // ballot-truncation pattern the shadow cache addresses).
+    ctx.recordSgprWaveMaskI1(dstReg.baseIdx, i1, /*isPair=*/false);
+    return;
+  case ParsedReg::VCC:
+    // Overwrite VCC's stored i1 with the wave-width-correct value.
+    // The earlier `writeReg32(VCC, i32)` landed a lossy i1; this
+    // call replaces it.  Correctness invariant: SSA-monotonic
+    // within this BB (the next reader sees the new i1).
+    ctx.regs.storeVCC(ctx.B, i1);
+    return;
+  default:
+    return;
+  }
 }
 
 HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
