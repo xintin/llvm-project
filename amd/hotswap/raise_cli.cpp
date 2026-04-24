@@ -81,29 +81,12 @@
 // transient test hook during the graduation sweep and has been
 // removed so the opt-out path isn't silently bypassed.
 //
-// --enable-permlane16-xor3-partner / --disable-permlane16-xor3-partner.
-// Default **on**.  TRANSITIONAL bridge for the Triton gfx1250 cross-16
-// bitonic-merge idiom.  Substitutes `partner_seed` for the xor3 result
-// at the specific idiom fingerprint (two `@llvm.amdgcn.ds.bpermute`
-// calls with matching first operand plus an outer xor of their xor
-// with the shared seed — emitted by salmon only via
-// `emitPermLaneSwapEmulation` + `V_XOR3_B32` from
-// Triton's `v_permlane16_swap v_a, v_b; v_xor3_b32 v_a, v_a, v_b, v_c`
-// pattern with `v_a_in == v_b_in == v_c` init).  See
-// `rewrite_permlane16_xor3_partner.hpp` for the full (a)/(b)
-// hypothesis split between "gfx1250 silicon semantic diverges from
-// gfx950" and "Triton's gfx1250 codegen has a bug".  We can't
-// discriminate without gfx1250 hardware, so the rewrite produces
-// what the algorithm NEEDS (matching the gfx942-native Triton compile
-// of the same source) rather than what the literal bytes compute
-// under gfx950 semantics.
-//
-// Pass `--disable-permlane16-xor3-partner` to audit the pre-rewrite
-// shape (useful for characterising how many recipes would regress
-// without the bridge once we have hardware / docs to move the fix
-// to its correct layer — the emulation primitive under scenario (a),
-// or Triton's codegen under scenario (b)).  Later-wins between
-// `--enable-` and `--disable-` is by command-line order.
+// (The earlier `--enable-permlane16-xor3-partner` /
+// `--enable-permlane16-swap-selfpreserve` flags were removed along
+// with their rewrite passes once the asymmetric
+// `v_permlane16_swap_b32` lift landed — see
+// `handle_valu_cross_lane.cpp::emitPermLaneSwapEmulation` and
+// matrix-translation.md §12.4.7.)
 
 #include "code_object_utils.hpp"
 #include "pipeline.hpp"
@@ -194,27 +177,6 @@ int usage() {
       "  class coverage (see wave-size-translation.md \u00a7\u00a72.2 / 5.6.1\n"
       "  and modrep-predicate-chain.md \u00a76 for the graduation\n"
       "  rationale). Later-wins on the command line.\n"
-      "--enable-permlane16-xor3-partner / --disable-permlane16-xor3-partner:\n"
-      "  controls the TRANSITIONAL rewrite pass that substitutes\n"
-      "  partner_seed for the Triton gfx1250 cross-16 bitonic-merge\n"
-      "  idiom's xor3 result (default on; see raiser.hpp `enablePerm\n"
-      "  Lane16Xor3PartnerRewrite` and rewrite_permlane16_xor3_partner.hpp\n"
-      "  for the (a)/(b) hypothesis split and the two conditions under\n"
-      "  which this pass will become dead code and can be removed).\n"
-      "  `--disable-` audits the pre-rewrite shape.  Later-wins on\n"
-      "  the command line.\n"
-      "--enable-permlane16-swap-selfpreserve /\n"
-      "  --disable-permlane16-swap-selfpreserve:\n"
-      "  controls the TRANSITIONAL rewrite pass that rewrites\n"
-      "  v_permlane16_swap_b32's second output from `partner_seed`\n"
-      "  to `seed` (asymmetric self-preserving semantic) whenever\n"
-      "  both bpermute data args trace to the same root SSA value.\n"
-      "  Covers Triton's tl.sort / tl.topk xor3, split-xor, and\n"
-      "  max-based cross-16 compositions in a single rewrite at\n"
-      "  the primitive emission level — subsumes --enable-permlane16-\n"
-      "  xor3-partner for those sites (both passes enabled is\n"
-      "  belt-and-suspenders).  Default on; `--disable-` audits\n"
-      "  the pre-rewrite shape.  Later-wins on the command line.\n"
       "ISA is inferred from the filename when --isa is not given.\n");
   return 2;
 }
@@ -233,16 +195,6 @@ int main(int argc, char **argv) {
   // REFUSE / UNCHANGED sibling contracts.
   bool enableWritelaneRewrite = true;
   bool enableWaveNative = true;
-  // Default OFF as of 2026-04-23: these two passes were a
-  // transitional bridge built atop the SYMMETRIC
-  // v_permlane16_swap_b32 lift.  With the asymmetric (MI400
-  // Shader Programming Guide § V_PERMLANE16_SWAP_B32 compliant)
-  // lift landed in `handle_valu_cross_lane.cpp`, both passes
-  // actively erase or RAUW correct IR and MUST stay off by
-  // default — callers that want to reproduce the pre-fix
-  // behaviour (audit / bisection) pass --enable-… explicitly.
-  bool enablePermLane16Xor3PartnerRewrite = false;
-  bool enablePermLane16SwapSelfPreserveRewrite = false;
   std::string emitIrKernel;
   std::string writeHsacoPath;
   std::string writeHsacoKernel;
@@ -289,21 +241,6 @@ int main(int argc, char **argv) {
       // "independent halves" throughput on pointwise kernels. See
       // this file's top-of-file comment.
       enableWaveNative = false;
-    } else if (a == "--enable-permlane16-xor3-partner") {
-      // Opt-in only: default-off after the 2026-04-23
-      // asymmetric v_permlane16_swap_b32 fix.  Retained for
-      // audit / bisection — the pass actively erases correct IR
-      // under the post-fix asymmetric lift.
-      enablePermLane16Xor3PartnerRewrite = true;
-    } else if (a == "--disable-permlane16-xor3-partner") {
-      enablePermLane16Xor3PartnerRewrite = false;
-    } else if (a == "--enable-permlane16-swap-selfpreserve") {
-      // Opt-in only: same story as the xor3-partner sibling.
-      // Retained for audit; default-off after the asymmetric
-      // lift fix.
-      enablePermLane16SwapSelfPreserveRewrite = true;
-    } else if (a == "--disable-permlane16-swap-selfpreserve") {
-      enablePermLane16SwapSelfPreserveRewrite = false;
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "raise_cli: unknown flag: %s\n", a.c_str());
       return usage();
@@ -388,9 +325,7 @@ int main(int argc, char **argv) {
     auto raised = transpiler::raiseToIR(text.bytes, isa, target, meta,
                                         kernelOffset, targetIsa,
                                         enableWritelaneRewrite,
-                                        enableWaveNative,
-                                        enablePermLane16Xor3PartnerRewrite,
-                                        enablePermLane16SwapSelfPreserveRewrite);
+                                        enableWaveNative);
     if (!raised.success) {
       // Contract: raiseToIR only populates RaiseResult::irText on the
       // success path (the last write before setting `success = true`),
@@ -452,9 +387,7 @@ int main(int argc, char **argv) {
     std::string effectiveTargetIsa = targetIsa.empty() ? isa : targetIsa;
     auto pipe = transpiler::runPipeline(coData, isa, effectiveTargetIsa,
                                         target, enableWritelaneRewrite,
-                                        enableWaveNative,
-                                        enablePermLane16Xor3PartnerRewrite,
-                                        enablePermLane16SwapSelfPreserveRewrite);
+                                        enableWaveNative);
     if (!pipe.success) {
       std::fprintf(stderr,
                    "raise_cli: pipeline failed for kernel '%s' (lifted=%d/%d, "
@@ -513,9 +446,7 @@ int main(int argc, char **argv) {
       auto raised = transpiler::raiseToIR(text.bytes, isa, kName, meta,
                                           /*kernelOffset=*/0, targetIsa,
                                           enableWritelaneRewrite,
-                                          enableWaveNative,
-                                          enablePermLane16Xor3PartnerRewrite,
-                                          enablePermLane16SwapSelfPreserveRewrite);
+                                          enableWaveNative);
       shm->done = true;
       shm->success = raised.success;
       shm->lifted = raised.liftedCount;

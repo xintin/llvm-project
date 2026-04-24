@@ -211,10 +211,10 @@ emitPermLaneSwapEmulation(RaiseContext &ctx, const DecodedInst &di,
     // translation.md for the Session-8 root-cause pin).  The
     // self-preserve idiom (`vdst_in == src0_in == seed`, Triton
     // `tl.sort` / `tl.topk`) masqueraded as working because the
-    // per-lane select collapses to `seed` for the preserved half
-    // anyway, so all of the transitional "papering-over"
-    // rewrites (`rewrite_permlane16_{xor3_partner,swap_self
-    // preserve}`) are dead under this emission.
+    // per-lane select collapses to `seed` for the preserved
+    // half anyway; the transitional `rewrite_permlane16_{xor3_
+    // partner,swap_selfpreserve}` passes that papered over that
+    // aliasing are deleted along with the symmetric emission.
     //
     // `isLaneLow` is computed via `lane AND partnerXorMask == 0`
     // rather than `lane < partnerXorMask` so the backend can

@@ -91,43 +91,6 @@ struct RaiseResult {
 // fixtures that pin MODREP-shape IR invariants) rely on. If a
 // future need for a global toggle arises, add a proper
 // `PipelineConfig` field.
-//
-// `enablePermLane16Xor3PartnerRewrite` toggles the
-// `rewrite_permlane16_xor3_partner` pass that substitutes
-// `partner_seed` for the xor3 result at Triton's gfx1250
-// cross-16 bitonic-merge idiom.
-//
-// Default **off** as of 2026-04-23: the pass was a transitional
-// bridge that compensated for the SYMMETRIC `v_permlane16_swap_
-// b32` lift that lived in `handle_valu_cross_lane.cpp` prior to
-// the matmul_fp16 fix.  With the lift corrected to match the
-// MI400 Shader Programming Guide's ASYMMETRIC semantic (§ V_
-// PERMLANE16_SWAP_B32), the xor3 composition downstream already
-// produces `partner_seed` through the standard arithmetic
-// (lanes 0..15 see `seed^partner^seed = partner`, lanes 16..31
-// see `partner^seed^seed = partner` symmetrically) without
-// needing the bpermute-level RAUW.  Default-on would actively
-// miscompile any kernel whose two bpermutes feed a matching
-// outer xor pattern — the rewrite erases correct IR.
-//
-// The pass is retained for audit / bisection only — callers
-// that want to reproduce the pre-fix (buggy) behaviour can
-// pass `true` explicitly, or raise_cli exposes
-// `--enable-permlane16-xor3-partner`.
-//
-// `enablePermLane16SwapSelfPreserveRewrite` toggles the
-// `rewrite_permlane16_swap_selfpreserve` pass that rewrites the
-// second output of `emitPermLaneSwapEmulation` from
-// `partner_seed` to `seed` when BOTH bpermute data arguments
-// trace (via SPE active-arm phi walks) to the same root SSA
-// value.  Same story as the xor3-partner sibling: transitional
-// compensation for the symmetric lift.  The correct asymmetric
-// lift already produces the self-preserving output for the
-// lanes that should preserve (lanes 16..31 keep `src0_in`,
-// lanes 0..15 keep `vdst_in`), so the rewrite's `RAUW →
-// seedRoot` is redundant on one half of the wave and wrong on
-// the other.  Default **off**; raise_cli opt-in:
-// `--enable-permlane16-swap-selfpreserve`.
 RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &sourceISA,
                       const std::string &kernelName,
@@ -135,9 +98,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       uint64_t kernelOffset = 0,
                       const std::string &compilationTargetISA = "",
                       bool enableWritelaneRewrite = true,
-                      bool enableWaveNative = true,
-                      bool enablePermLane16Xor3PartnerRewrite = false,
-                      bool enablePermLane16SwapSelfPreserveRewrite = false);
+                      bool enableWaveNative = true);
 
 } // namespace transpiler
 

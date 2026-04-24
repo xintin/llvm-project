@@ -43,8 +43,6 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 
-#include "rewrite_permlane16_swap_selfpreserve.hpp"
-#include "rewrite_permlane16_xor3_partner.hpp"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Support/Debug.h"
@@ -72,9 +70,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       uint64_t kernelOffset,
                       const std::string &compilationTargetISA,
                       bool enableWritelaneRewrite,
-                      bool enableWaveNative,
-                      bool enablePermLane16Xor3PartnerRewrite,
-                      bool enablePermLane16SwapSelfPreserveRewrite) {
+                      bool enableWaveNative) {
   RaiseResult result;
 
   // NOTE. The `HSA_SALMON_WAVE_NATIVE=1` process-environment override
@@ -362,21 +358,6 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   // the remaining case: explicit-operand EXEC writers (e.g.
   // `s_mov_b32 exec_lo, s2`) where "writes EXEC" depends on the
   // runtime operand value rather than the MCInstrDesc alone.
-  // Pre-scan for `v_permlane16_swap_b32` presence — consumed by the
-  // WMMA→MFMA refusal gate in `handle_valu_vop3p.cpp` as a
-  // multi-WMMA-fragment-shuffle marker.  See the doc comment on
-  // `RaiseContext::kernelHasPermlane16Swap` in raise_context.hpp
-  // and matrix-translation.md §12.4.4 for the layout-asymmetry
-  // characterisation that motivates this surgical gate rather than
-  // a blanket WMMA refusal under MODREP.
-  bool kernelHasPermlane16Swap = false;
-  for (const DecodedInst &di : insts) {
-    if (di.semOp == SemOp::V_PERMLANE16_SWAP_B32) {
-      kernelHasPermlane16Swap = true;
-      break;
-    }
-  }
-
   for (const DecodedInst &di : insts) {
     if (!instructionWritesEXEC(di, mc))
       continue;
@@ -657,7 +638,6 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
-  ctx.kernelHasPermlane16Swap = kernelHasPermlane16Swap;
 
   // Wire the reg-file's EXEC-write invalidation hook to ctx's lane_active
   // memo. This catches every EXEC mutation — ctx.storeExec, the various
@@ -890,76 +870,16 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
     PromoteMemToReg(allocas, DT, &AC);
   }
 
-  // ==== Phase 6.035: Triton cross-16 bitonic-merge self-preserve rewrite ====
-  //
-  // Rewrites `v_permlane16_swap_b32`'s second output from
-  // `partner_seed` to `seed` (asymmetric self-preserving
-  // semantic) at every site where Triton's `v_dual_mov v_a, v_c ::
-  // v_dual_mov v_b, v_c` initialiser makes both bpermute data
-  // args trace to the same root SSA value.  See
-  // `rewrite_permlane16_swap_selfpreserve.hpp` for the
-  // shape-independent justification (single rewrite covers the
-  // xor3-fused, split-xor, and max-based compositions Triton's
-  // `tl.sort` / `tl.topk` emit at the cross-16 merge stage).
-  //
-  // Runs BEFORE the xor3-partner rewrite (Phase 6.04) — this
-  // pass operates at the bpermute level and subsumes the
-  // xor3-partner pattern: when this pass fires the subsequent
-  // xor3-partner pattern either no longer matches (IR shape
-  // changed) or still matches but substitutes the already-correct
-  // `partner_seed` for itself (no-op).  Keeping both passes
-  // enabled gives belt-and-suspenders coverage during the
-  // TRANSITIONAL period; either alone is insufficient.
-  //
-  // Gated by `enablePermLane16SwapSelfPreserveRewrite` (default
-  // on; raise_cli opt-out: `--disable-permlane16-swap-
-  // selfpreserve`).
-  if (enablePermLane16SwapSelfPreserveRewrite) {
-    Permlane16SwapSelfPreserveRewriteReport report =
-        rewritePermLane16SwapSelfPreserve(*F);
-    if (report.matchedSites > 0) {
-      LLVM_DEBUG({
-        dbgs() << "permlane16-swap-selfpreserve: rewrote "
-               << report.matchedSites << " site(s) in '" << kernelName
-               << "'\n";
-      });
-    }
-  }
-
-  // ==== Phase 6.04: Triton cross-16 bitonic-merge xor3-partner rewrite ====
-  //
-  // Detects the gfx1250-only `permlane16_swap + v_xor3_b32` idiom
-  // Triton emits at the cross-16 stage of `tl.sort` / `tl.topk`'s
-  // bitonic merge.  See `rewrite_permlane16_xor3_partner.hpp` for
-  // the full pattern, the (a)/(b) hypothesis split that motivates
-  // the rewrite, and the GTest pinning evidence.
-  //
-  // Runs AFTER `PromoteMemToReg` (Phase 6) so the
-  // alloca-backed VGPR round-trips are folded out and the bpermute
-  // results flow directly into the xor inputs.  Runs BEFORE Phase
-  // 6.5 (writelane/readlane rewrite) and Phase 6.6 (predicate-chain
-  // classifier) so the rewrite's substitutions don't perturb the
-  // SSA shape those downstream passes inspect — both downstream
-  // passes only walk specific intrinsic call sites
-  // (`amdgcn.{writelane,readlane,workitem.id.x}`) that this
-  // rewrite never touches.
-  //
-  // Gated by `enablePermLane16Xor3PartnerRewrite` (default on;
-  // raise_cli opt-out: `--disable-permlane16-xor3-partner`).  See
-  // the flag's raiser.hpp block comment for the TRANSITIONAL
-  // status and the two conditions ((a) gfx1250 ISA docs / (b)
-  // Triton codegen change) that will let us delete this phase.
-  if (enablePermLane16Xor3PartnerRewrite) {
-    Permlane16Xor3PartnerRewriteReport report =
-        rewritePermLane16Xor3Partner(*F);
-    if (report.matchedSites > 0) {
-      LLVM_DEBUG({
-        dbgs() << "permlane16-xor3-partner: rewrote "
-               << report.matchedSites << " site(s) in '" << kernelName
-               << "'\n";
-      });
-    }
-  }
+  // (Former Phase 6.035 "permlane16-swap-selfpreserve" and Phase
+  // 6.04 "permlane16-xor3-partner" rewrites were deleted after
+  // the asymmetric `v_permlane16_swap_b32` lift landed — see
+  // `handle_valu_cross_lane.cpp::emitPermLaneSwapEmulation` and
+  // matrix-translation.md §12.4.7.  Both passes were transitional
+  // bridges that compensated for the symmetric lift's
+  // over-swap of the asymmetric-semantic's "unchanged" halves;
+  // with the lift corrected, their fingerprints either no
+  // longer match (xor3-partner) or actively corrupt the new
+  // select shape (selfpreserve).)
 
   // ==== Phase 6.5: Cross-widen writelane/readlane rewrite ====
   //

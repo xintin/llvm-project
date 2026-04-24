@@ -63,26 +63,6 @@ struct RaiseContext {
   // `S_SET_PC_I64` doc for the lowering shapes.
   const SetPcAnalysis *setpcAnalysis = nullptr;
 
-  // Whether this kernel's instruction stream contains at least one
-  // `v_permlane16_swap_b32` opcode.  Set once by the raiser's pre-scan
-  // (before the main IR-emission loop) and read by the WMMA→MFMA
-  // refusal gate in `handle_valu_vop3p.cpp` as a MULTI-WMMA
-  // fragment-shuffle marker: Triton emits this instruction only as
-  // part of the K-split register-layout bridge that a 32×32×32
-  // `tl.dot` (multi-WMMA per iter) uses to arrange A/B fragments
-  // across v186-v201 / v170-v185.  A single-WMMA `tl.dot` (e.g.
-  // `matmul_fp16_16x16` at 16×16×32) does NOT emit this opcode and
-  // keeps its full K in one 8-VGPR operand range — which
-  // `redistributeInput` handles correctly.  The gate uses the
-  // presence of this instruction as the surrogate for "this kernel
-  // is in the multi-WMMA regime where the current
-  // `redistributeInput` reads half-K from v186-193 when the full
-  // K straddles v186-201"; see matrix-translation.md §12.4.4 for
-  // the layout-asymmetry characterisation and
-  // `handle_valu_vop3p.cpp`'s refusal diagnostic for the user-
-  // visible message.
-  bool kernelHasPermlane16Swap = false;
-
   // gfx1250 s_set_vgpr_msb state: only the LOW 8 bits of the instruction's
   // 16-bit immediate carry runtime meaning.  They encode the MSB bit pair for
   // every operand slot of the next ALU instruction:
