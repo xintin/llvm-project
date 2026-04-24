@@ -652,15 +652,53 @@ Value *RaiseContext::readOpExecWidth(const DecodedInst &di, unsigned opIdx) {
   // replication path so an author's `s_mov_b32 exec_lo, 0xFFFF0000`
   // composes the same wave64 EXEC pattern as a save/restore of that
   // mask through an SGPR would.
+  //
+  // ISA-immediate-as-bit-pattern. `di.getImm` returns an `int64_t`
+  // container that holds the raw literal bits the MC decoder read
+  // out of the instruction's immediate field. Wave-mask idioms
+  // routinely set the high bit of the source-width word —
+  // `0xFFFF0000` (Triton's high-half upper-short mask, flagged in
+  // the example above), `0xFFFFFFFF` (`-1` = all-lanes), `0x80000000`
+  // (lane-31 bit), etc. An earlier `ConstantInt::getSigned(srcTy,
+  // di.getImm(opIdx))` misinterpreted the container as a SIGNED
+  // value and, on a wave32 source whose immediate reads as
+  // `uint32_t ≥ 0x80000000`, tripped APInt's signed-range assertion
+  // (`isIntN(BitWidth, val) && "Value is not an N-bit signed
+  // value"`) — because `(int64_t)0xFFFF0000 == +4294901760` is
+  // outside `[-2^31, 2^31 - 1]`.
+  //
+  // Principled fix: match `readOp32`'s bit-pattern contract (see
+  // line ~333 above) — treat the immediate as an unsigned bit
+  // pattern and pack it into the source-width integer via
+  // `ConstantInt::get(..., IsSigned=false)`. Masking to the source
+  // width before the call is a defensive invariant: on wave32
+  // sources, any MC-surfaced 64-bit literal is either the zero-
+  // extended i32 the hardware carries or a bug upstream; masking
+  // lets the invariant hold without relying on `ImplicitTrunc`
+  // (kept off so the call still asserts on a truly malformed
+  // literal rather than silently dropping bits). On wave64
+  // sources the mask is the identity.
+  //
+  // Callers ordered through `readOpExecWidth` today (post-topk
+  // SOP2 immediate-shadow propagation, landed in the
+  // `s_xor_b32 ..., -1` idiom) now reach this immediate path; the
+  // classifier-shielded path that previously never evaluated this
+  // codepath on wave32 sources with high-bit-set literals
+  // (GPT-OSS `_bitmatrix_metadata_compute_stage2`'s `s_and_b32
+  // sN, sM, 0xFFFF0000` sites) no longer traps here.
   Type *srcTy = isa.isWave32() ? i32Ty : i64Ty;
+  uint64_t srcMask =
+      isa.isWave32() ? 0xFFFFFFFFull : 0xFFFFFFFFFFFFFFFFull;
   if (di.isImm(opIdx)) {
-    Value *narrow = ConstantInt::getSigned(srcTy, di.getImm(opIdx));
+    uint64_t bits = static_cast<uint64_t>(di.getImm(opIdx)) & srcMask;
+    Value *narrow = ConstantInt::get(srcTy, bits, /*IsSigned=*/false);
     return widenToExec(narrow);
   }
   if (opIdx < di.numOps() && di.inst.getOperand(opIdx).isExpr()) {
     int64_t val = 0;
     di.inst.getOperand(opIdx).getExpr()->evaluateAsAbsolute(val);
-    Value *narrow = ConstantInt::getSigned(srcTy, val);
+    uint64_t bits = static_cast<uint64_t>(val) & srcMask;
+    Value *narrow = ConstantInt::get(srcTy, bits, /*IsSigned=*/false);
     return widenToExec(narrow);
   }
   errs() << "transpiler: readOpExecWidth unresolvable operand " << opIdx

@@ -591,6 +591,15 @@ config.fixtures = {
     # flow through the SMEM kernarg branch in handle_smem.cpp.
     "s_load_b96_kernarg":
         r"@LIT_FIXTURE_S_LOAD_B96_KERNARG_CO@",
+    # SMEM kernarg load following an `s_add_u32 ka, ka, #K ;
+    # s_addc_u32 ka+1, ka+1, 0` canonical 64-bit const-add. Pins the
+    # Phase 4.5 dataflow + KernargPtrDelta tracker in raiser.cpp and
+    # the `effectiveByteOffset = delta + imm` plumbing in
+    # handle_smem.cpp. Before the fix, the raiser disregarded the
+    # shift and silently pulled kernarg bytes from offset `imm`
+    # instead of `delta + imm` — issue #21's miscompile.
+    "smem_kernarg_const_delta":
+        r"@LIT_FIXTURE_SMEM_KERNARG_CONST_DELTA_CO@",
     # s_load_b32 with an SGPR offset carrying the `scale_offset`
     # (CPol::SCAL) modifier — pins the `mul i64 <offset>, 4` the
     # SMEM handler in `handle_smem.cpp` emits to honour hardware's
@@ -949,6 +958,17 @@ config.fixtures = {
     # through the immediate inversion step (no fallback extract chain).
     "s_xor_imm_mask_shadow":
         r"@LIT_FIXTURE_S_XOR_IMM_MASK_SHADOW_CO@",
+    # s_and_imm_high_bit_mask — regression fence for
+    # `readOpExecWidth`'s immediate-operand path on wave32 sources
+    # when the literal's high bit is set. Covers
+    # `s_and_b32 sN, sM, 0xFFFF0000` (Triton's high-half upper-short
+    # idiom, seen in `_bitmatrix_metadata_compute_stage2`).
+    # Sibling-but-distinct from `s_xor_imm_mask_shadow`: that uses
+    # literal `-1` which MC decodes as `int64_t(-1)` (inside signed
+    # i32 range); this exercises the `uint32_t >= 0x80000000` cross
+    # that tripped APInt's signed-range assertion before the fix.
+    "s_and_imm_high_bit_mask":
+        r"@LIT_FIXTURE_S_AND_IMM_HIGH_BIT_MASK_CO@",
     # v_cmp_cndmask_sgpr_class — class-compare companion to
     # `v_cmp_cndmask_sgpr`. Same direct-i1 shadow path contract
     # but the producer is `v_cmp_class_f32_e64` (FP IEEE-class
