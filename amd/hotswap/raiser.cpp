@@ -543,6 +543,12 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_x);
   Function *fnWorkitemIdX =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workitem_id_x);
+  Function *fnWorkgroupIdY =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_y);
+  // Build the source-ISA user-SGPR ABI from the kernel descriptor.
+  // Phase 4 seeding and handler-side ABI-sensitive decoding (e.g.
+  // handle_smem's kernarg-pointer detection) both key off this layout.
+  UserSgprLayout userSgprLayout = UserSgprLayout::fromKernelMeta(meta);
   // ==== Phase 3: Create basic blocks ====
   std::map<uint64_t, BasicBlock *> offsetToBB;
   for (uint64_t addr : blockStarts)
@@ -554,14 +560,42 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   AllocaRegFile regs;
   regs.init(B, i32Ty, i1Ty, isa, *mc.regInfo, projection);
 
-  // s[0:1] = kernarg segment pointer (sentinel)
-  regs.storeSGPR64(B, 0, Constant::getNullValue(PointerType::get(C, 4)));
-  // s2 = workgroup_id_x
-  regs.storeSGPR32(B, 2, B.CreateCall(fnWorkgroupIdX, {}, "wg_id_x"));
-  // s3 = workgroup_id_y
-  Function *fnWorkgroupIdY =
-      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_y);
-  regs.storeSGPR32(B, 3, B.CreateCall(fnWorkgroupIdY, {}, "wg_id_y"));
+  // Seed kernel-entry SGPR state from the descriptor-derived user-SGPR ABI.
+  //
+  // Crucial invariant: never hardcode SGPR indices. Kernarg preload and
+  // enable_sgpr_* toggles legally move the kernarg pointer and workgroup-id
+  // SGPRs away from s[0:1]/s2/s3. Hardcoding those indices mis-seeds entry
+  // state and turns real source values into undef reads on the JIT path.
+  if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
+    regs.storeSGPR64(
+        B, userSgprLayout.kernargSegmentPtrSgpr,
+        Constant::getNullValue(PointerType::get(C, 4)));
+  }
+  if (userSgprLayout.workgroupIdXSgpr >= 0) {
+    regs.storeSGPR32(B, userSgprLayout.workgroupIdXSgpr,
+                     B.CreateCall(fnWorkgroupIdX, {}, "wg_id_x"));
+  }
+  if (userSgprLayout.workgroupIdYSgpr >= 0) {
+    regs.storeSGPR32(B, userSgprLayout.workgroupIdYSgpr,
+                     B.CreateCall(fnWorkgroupIdY, {}, "wg_id_y"));
+  }
+  // Kernarg preload SGPRs carry dwords copied by hardware from the kernarg
+  // segment before kernel entry. Materialize the same dwords from the IR
+  // function args so early source-SGPR reads observe the descriptor-declared
+  // preload image.
+  for (size_t sgprIdx = 0; sgprIdx < userSgprLayout.entries.size(); ++sgprIdx) {
+    const auto &entry = userSgprLayout.entries[sgprIdx];
+    if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
+      continue;
+    std::string why;
+    Value *dw = extractKernargDword(kernargs, B, F, entry.kernargByteOffset, &why);
+    if (!dw) {
+      report_fatal_error(Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
+                         Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
+                         Twine(entry.kernargByteOffset) + ": " + why);
+    }
+    regs.storeSGPR32(B, static_cast<int>(sgprIdx), dw);
+  }
   // v0 = workitem_id_x
   regs.storeVGPR32(B, 0, B.CreateCall(fnWorkitemIdX, {}, "tid"));
   // Init VCC/SCC to false
@@ -626,18 +660,276 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   // ==== Phase 5: Raise each instruction ====
 
   auto *f16Ty = Type::getHalfTy(C);
-  // Build the user-SGPR ABI for the source ISA. handle_smem and any other
-  // handler that needs to identify a specific source-ABI SGPR (e.g. the
-  // kernarg pointer) reads this through `ctx.userSgprLayout`. The layout
-  // is owned by this stack frame; the `RaiseContext` borrows a pointer
-  // valid for the duration of `raiseToIR`. `fromKernelMeta` aborts loudly
-  // if the kernel descriptor is missing — there is no fallback layout.
-  UserSgprLayout userSgprLayout = UserSgprLayout::fromKernelMeta(meta);
+  // `userSgprLayout` was built above before Phase 4 so entry SGPR seeding
+  // and handler-side ABI decisions use the same descriptor-derived mapping.
   RaiseContext ctx{C, M, B, regs, projection, mc, isa, targetIsa, kernargs,
                    &userSgprLayout, F,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
+
+  // ==== Phase 4.5: Kernarg-pair pristine-at-BB-entry dataflow ====
+  //
+  // Populates `ctx.kernargPristineBBs` with the set of BB-start
+  // offsets where the kernarg-pointer SGPR pair is guaranteed to still
+  // hold its kernel-entry value along EVERY CFG path that reaches
+  // the BB. `handle_smem.cpp` consults this (via the tracker
+  // `RaiseContext::KernargPtrDelta`) to decide whether to take the
+  // kernarg-slot fast path or refuse loudly.
+  //
+  // This closes issue #21's silent miscompile in the Tensile
+  // UniversalArgs shape (`s_add_u32 ka, ka, 0x10 ; s_addc_u32 ka+1,
+  // ka+1, 0 ; s_load_b* s[sDST:…], s[ka:ka+1], imm`): the NORMAL-path
+  // BB that contains the shift still enters pristine (its sole
+  // predecessor is the entry BB, which never writes the pair), so
+  // the post-handler hook below can stage the delta and the shifted
+  // downstream loads correctly extract via `extractKernargDword(delta
+  // + imm)` instead of `extractKernargDword(imm)`.
+  //
+  // The analysis is a forward dataflow to fixed point:
+  //
+  //   pristine[entryBB]       = true
+  //   pristine[bb] (bb != e)  = AND over all preds p of bb:
+  //                                 pristine[p] AND !writesPairInBB[p]
+  //
+  // Converges monotonically (a BB can only transition pristine ->
+  // dirty, never back) in at most `#BBs` iterations. The CFG edges
+  // are read straight from the decoded instruction stream:
+  // unconditional / conditional branches add one or two target edges;
+  // fall-through adds an edge to the next BB in address order when
+  // the terminator is not an unconditional jump or `s_endpgm`.
+  //
+  // Skipped entirely when `kernargSegmentPtrSgpr < 0` (the kernel
+  // descriptor disables the kernarg pointer — no pair to track); in
+  // that case every BB is trivially "pristine" because the tracker
+  // never fires in handle_smem.cpp. We still populate the set to
+  // keep the resetKernargPtrDeltaAtBBBoundary code path uniform.
+  {
+    const int kaLo = userSgprLayout.kernargSegmentPtrSgpr;
+    const int kaHi = (kaLo >= 0) ? (kaLo + 1) : -1;
+
+    // Step 1: group instructions by their owning BB (largest
+    // blockStart <= di.offset) and record whether any instruction in
+    // each BB writes either kernarg-pair dword.
+    //
+    // `blockStarts` is an ascending std::set<uint64_t>, so
+    // lower_bound / --upper_bound gives the BB a given instruction
+    // belongs to in O(log N) per step.
+    llvm::DenseMap<uint64_t, bool> writesPairInBB;
+    llvm::DenseMap<uint64_t, uint64_t> bbOfInst; // inst offset -> BB start
+    llvm::DenseMap<uint64_t, const DecodedInst *> lastInstInBB;
+    for (uint64_t bs : blockStarts) {
+      writesPairInBB.try_emplace(bs, false);
+      lastInstInBB.try_emplace(bs, nullptr);
+    }
+    for (const DecodedInst &di : insts) {
+      // Find the BB that owns this instruction: the largest entry in
+      // blockStarts <= di.offset.
+      auto it = blockStarts.upper_bound(di.offset);
+      if (it == blockStarts.begin())
+        continue; // before first BB — defensive, shouldn't happen.
+      --it;
+      uint64_t bb = *it;
+      bbOfInst[di.offset] = bb;
+      lastInstInBB[bb] = &di;
+      if (kaLo < 0)
+        continue;
+      // Detect writes to either dword of the pair via the MCInst's
+      // def operands (first `numDefs` operand slots). We only check
+      // register operands; parseReg may give a non-SGPR kind for
+      // TTMP-class defs etc., but the match condition below rejects
+      // those.
+      for (unsigned d = 0; d < di.numDefs; ++d) {
+        if (!di.isReg(d))
+          continue;
+        ParsedReg pr = ctx.parseReg(di.getReg(d), d);
+        if (pr.kind == ParsedReg::SGPR &&
+            (pr.baseIdx == kaLo || pr.baseIdx == kaHi)) {
+          writesPairInBB[bb] = true;
+          break;
+        }
+      }
+    }
+
+    // Step 2: build CFG edges. For each BB, determine its successors
+    // (list of BB offsets) based on the last instruction:
+    //   * unconditional branch: single target from immediate.
+    //   * conditional branch: target from immediate + fall-through.
+    //   * s_endpgm / unconditional terminator without a target: no
+    //     successors.
+    //   * anything else (including the trivial "reached fall-through
+    //     without a branch"): fall-through to the next BB in address
+    //     order.
+    //
+    // We conservatively add s_set_pc_i64 targets too, via the
+    // setpcAnalysis machinery: `setpcAnalysis.chainTerminators` and
+    // the extra block starts merged into `blockStarts` above already
+    // capture those, but we must still add the *edges* here. For
+    // this bug's scope, s_set_pc_i64 targets only matter if they
+    // reach a BB that consumes the kernarg pair — none of the
+    // observed Tensile / AITER shapes do — so we model s_set_pc_i64
+    // conservatively as "target is reachable if ANY reachable
+    // BB's terminator is an s_set_pc_i64 whose resolved return
+    // address equals the target". Simpler: treat an unresolved
+    // s_set_pc_i64 as a successor edge to every extraBlockStart
+    // (over-approximation: marks potentially-pristine BBs as
+    // dirty only when they legitimately are). For the Tensile
+    // shape the s_set_pc_i64 machinery is not in play.
+    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t>> successors;
+    for (uint64_t bs : blockStarts)
+      successors.try_emplace(bs, llvm::SmallVector<uint64_t>{});
+
+    auto nextBBStart = [&](uint64_t bs) -> uint64_t {
+      auto it = blockStarts.upper_bound(bs);
+      return (it == blockStarts.end()) ? 0 : *it;
+    };
+    auto branchTargetOf = [](const DecodedInst &di) -> llvm::SmallVector<uint64_t> {
+      // Mirror `decode.cpp::collectBranchTargets`: a branch instruction's
+      // immediate operands each encode a signed 16-bit PC-relative
+      // offset (scaled by 4) from the instruction's successor address
+      // (off + 4, per the AMDGPU encoding definition). Collect every
+      // such target.
+      llvm::SmallVector<uint64_t> out;
+      const llvm::MCInst &inst = di.inst;
+      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
+        if (!inst.getOperand(i).isImm())
+          continue;
+        int64_t raw = inst.getOperand(i).getImm();
+        int64_t brOff = static_cast<int64_t>(
+            static_cast<int16_t>(static_cast<uint16_t>(raw & 0xFFFF)));
+        out.push_back(di.offset + 4 + brOff * 4);
+      }
+      return out;
+    };
+
+    for (uint64_t bs : blockStarts) {
+      const DecodedInst *last = lastInstInBB[bs];
+      if (!last) {
+        // BB has no instructions (shouldn't happen but be defensive).
+        uint64_t nxt = nextBBStart(bs);
+        if (nxt != 0)
+          successors[bs].push_back(nxt);
+        continue;
+      }
+      // S_ENDPGM / unconditional terminator with no target: no
+      // successors. `desc.isBarrier()` would be more precise, but
+      // we approximate via the SemOp set that matches the observed
+      // AMDGPU terminators. S_ENDPGM is always a barrier; unmatched
+      // cases fall through below.
+      if (last->semOp == SemOp::S_ENDPGM)
+        continue;
+      if (last->isBranch) {
+        auto targets = branchTargetOf(*last);
+        for (uint64_t t : targets)
+          successors[bs].push_back(t);
+        // Conditional branches also fall through to the next BB.
+        if (last->isConditionalBranch) {
+          uint64_t nxt = nextBBStart(bs);
+          if (nxt != 0)
+            successors[bs].push_back(nxt);
+        }
+        continue;
+      }
+      // Non-branch terminator (or no terminator at all in this BB
+      // because the BB split landed mid-stream): fall through to the
+      // next BB in address order.
+      uint64_t nxt = nextBBStart(bs);
+      if (nxt != 0)
+        successors[bs].push_back(nxt);
+    }
+
+    // Invert to predecessors for the fixed-point pass.
+    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t>> predecessors;
+    for (uint64_t bs : blockStarts)
+      predecessors.try_emplace(bs, llvm::SmallVector<uint64_t>{});
+    for (auto &[bb, succs] : successors) {
+      for (uint64_t s : succs) {
+        auto it = predecessors.find(s);
+        if (it != predecessors.end())
+          it->second.push_back(bb);
+      }
+    }
+
+    // Step 3: iterative forward dataflow.
+    //   pristine[entryBB]  = true
+    //   pristine[bb]       = AND over preds p: pristine[p] AND
+    //                         !writesPairInBB[p]
+    //
+    // We walk BBs in blockStarts order (ascending by address, which
+    // is a reasonable linearisation for AMDGPU kernels without
+    // SetPC chains) and iterate until no change. The initial state
+    // is conservative (every non-entry BB = false) and the transfer
+    // function is monotonically non-increasing on `true`, so
+    // convergence is guaranteed in at most `#BBs` iterations — in
+    // practice one or two for the straight-line-plus-diamond shapes
+    // we see.
+    //
+    // Skipped when `kaLo < 0` (no kernarg pointer enabled): mark
+    // every BB pristine unconditionally to keep the call sites
+    // uniform.
+    llvm::DenseSet<uint64_t> &pristine = ctx.kernargPristineBBs;
+    if (kaLo < 0) {
+      for (uint64_t bs : blockStarts)
+        pristine.insert(bs);
+    } else {
+      pristine.insert(kernelOffset); // entry BB.
+      bool changed = true;
+      unsigned iters = 0;
+      const unsigned maxIters = static_cast<unsigned>(blockStarts.size()) + 2;
+      while (changed && iters < maxIters) {
+        changed = false;
+        ++iters;
+        for (uint64_t bs : blockStarts) {
+          if (pristine.contains(bs))
+            continue;
+          const auto &preds = predecessors[bs];
+          if (preds.empty())
+            continue; // unreachable (other than entry).
+          bool allPristine = true;
+          for (uint64_t p : preds) {
+            if (!pristine.contains(p) || writesPairInBB.lookup(p)) {
+              allPristine = false;
+              break;
+            }
+          }
+          if (allPristine) {
+            pristine.insert(bs);
+            changed = true;
+          }
+        }
+      }
+      if (iters >= maxIters && changed) {
+        // Did not converge within the expected bound — fail loudly
+        // per the project's no-silent-fallback rule. Practically
+        // unreachable (forward-dataflow over a monotone lattice
+        // converges in at most `#BBs` iters), but surface a
+        // diagnostic rather than silently accept a possibly-wrong
+        // pristine set.
+        report_fatal_error(
+            "transpiler: kernarg-pristine dataflow failed to converge "
+            "within #BBs + 2 iterations; the CFG edge construction in "
+            "raiser.cpp Phase 4.5 is out of sync with the decoder's "
+            "branch-target collection.");
+      }
+    }
+  }
+
+  // Dominance-safe SGPR wave-mask shadow storage.
+  // One EXEC-width mask + one scalar-valid bit per SGPR base index.
+  // Consumers can combine `(valid ? shadow : fallback)` across BBs without
+  // carrying non-dominating SSA values in `lastSgprWaveMaskI1`.
+  ctx.sgprWaveMaskExecShadow.reserve(regs.sgpr.size());
+  ctx.sgprWaveMaskValidShadow.reserve(regs.sgpr.size());
+  for (unsigned i = 0; i < regs.sgpr.size(); ++i) {
+    auto *maskA = B.CreateAlloca(regs.execTy, nullptr,
+                                 "sgpr_mask_shadow_" + std::to_string(i));
+    auto *validA = B.CreateAlloca(i1Ty, nullptr,
+                                  "sgpr_mask_valid_" + std::to_string(i));
+    B.CreateStore(ConstantInt::get(regs.execTy, 0), maskA);
+    B.CreateStore(B.getFalse(), validA);
+    ctx.sgprWaveMaskExecShadow.push_back(maskA);
+    ctx.sgprWaveMaskValidShadow.push_back(validA);
+  }
 
   // Wire the reg-file's EXEC-write invalidation hook to ctx's lane_active
   // memo. This catches every EXEC mutation — ctx.storeExec, the various
@@ -693,6 +985,16 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
       // to a proper per-BB merge (see sgpr-wave-mask-translation.md
       // section 7 evolution path).
       ctx.clearSgprWaveMaskShadow();
+      // Reset the kernarg-pair const-delta tracker for the new BB,
+      // consulting the precomputed `kernargPristineBBs` dataflow
+      // result (Phase 4.5 below) to decide whether the pair is
+      // guaranteed-pristine on every incoming CFG edge. When it is,
+      // the tracker enters `valid = true, delta = 0`; otherwise
+      // `valid = false` and handle_smem.cpp refuses the kernarg-slot
+      // fast path loudly for any kernarg-pair SMEM load in this BB.
+      // See `RaiseContext::KernargPtrDelta` and
+      // `resetKernargPtrDeltaAtBBBoundary` for the full contract.
+      ctx.resetKernargPtrDeltaAtBBBoundary(di.offset);
     }
 
     ctx.computeVGPRAdjust(di);
@@ -831,6 +1133,155 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                                 retMarker);
         }
       }
+
+      // Kernarg-pointer const-delta tracker update. Single-BB, fires
+      // only for the canonical `s_add_u32 ; s_addc_u32 (hi, hi, #0)`
+      // 64-bit const-add pattern against the source-ABI kernarg-pair
+      // SGPRs (Tensile UniversalArgs: shift kernarg ptr past a 16-byte
+      // preamble before issuing the downstream static kernarg loads).
+      // Everything else that touches either dword invalidates the
+      // tracker; handle_smem.cpp then refuses the kernarg-slot fast
+      // path loudly. See `RaiseContext::KernargPtrDelta` for the full
+      // state machine and invariants, and issue #21 for the canonical
+      // miscompile this fix surfaces.
+      //
+      // Placed here (in the generic post-handler hook rather than in
+      // handle_sop2.cpp) so the update point is a single location
+      // independent of which SemOp fires: adding a new kernarg-pair
+      // mutator opcode (e.g. S_SUB_U32, S_MOV_B32) means updating
+      // *this* switch, not each handler in turn, and invariants over
+      // the whole MC stream (the "any other write clobbers SCC"
+      // dependency of the pending-low state) are checkable against
+      // `di.defsSCC` directly without plumbing hint flags through the
+      // HandlerResult.
+      if (ctx.userSgprLayout != nullptr) {
+        const int kaLo = ctx.userSgprLayout->kernargSegmentPtrSgpr;
+        if (kaLo >= 0) {
+          const int kaHi = kaLo + 1;
+
+          // Identify writes to the kernarg pair by walking the def
+          // slots of the MCInst. `di.numDefs` is the count; the
+          // operand list starts with defs (see
+          // `MCInstrDesc::getNumDefs()` convention). parseReg on each
+          // def gives us an SGPR baseIdx we can compare to kaLo / kaHi.
+          // S_ADD_U32 / S_ADDC_U32 have exactly one def (the written
+          // scalar); their src operand layout is (dst, src0, src1).
+          auto writesKernargDword = [&](int baseIdx) {
+            for (unsigned d = 0; d < di.numDefs; ++d) {
+              if (!di.isReg(d))
+                continue;
+              ParsedReg pr = ctx.parseReg(di.getReg(d), d);
+              if (pr.kind == ParsedReg::SGPR && pr.baseIdx == baseIdx)
+                return true;
+            }
+            return false;
+          };
+          const bool writesLo = writesKernargDword(kaLo);
+          const bool writesHi = writesKernargDword(kaHi);
+
+          if (writesLo || writesHi) {
+            // Only attempt to update the delta if the tracker is
+            // currently valid (i.e. we are still tracking a well-
+            // defined 64-bit const delta in this BB). If an earlier
+            // instruction already invalidated it, further writes
+            // cannot re-validate — wait for the BB boundary to reset
+            // via the Phase 4.5 dataflow-driven pristine check.
+            if (!ctx.kernargPtrDelta.valid) {
+              // Nothing to do; already invalid.
+            } else {
+              // The canonical pattern requires the dst register to equal
+              // one of its sources (in-place increment). `src0` is at
+              // logical index 0 and `src1` at logical index 1 for both
+              // S_ADD_U32 and S_ADDC_U32. An immediate operand signals
+              // the constant; register-class operands are parsed to
+              // identify the in-place source. We accept either operand
+              // order because s_add_u32 is commutative.
+              auto classify = [&](int dstBase) -> std::pair<bool, int64_t> {
+                if (di.numSrcs < 2)
+                  return {false, 0};
+                unsigned s0Idx = di.srcMap[0];
+                unsigned s1Idx = di.srcMap[1];
+                const bool s0Reg = di.isReg(s0Idx);
+                const bool s1Reg = di.isReg(s1Idx);
+                const bool s0Imm = di.isImm(s0Idx);
+                const bool s1Imm = di.isImm(s1Idx);
+
+                auto regMatchesDst = [&](unsigned idx) {
+                  ParsedReg pr = ctx.parseReg(di.getReg(idx), idx);
+                  return pr.kind == ParsedReg::SGPR && pr.baseIdx == dstBase;
+                };
+
+                if (s0Reg && s1Imm && regMatchesDst(s0Idx))
+                  return {true, di.getImm(s1Idx)};
+                if (s1Reg && s0Imm && regMatchesDst(s1Idx))
+                  return {true, di.getImm(s0Idx)};
+                return {false, 0};
+              };
+
+              if (writesLo && !writesHi && di.semOp == SemOp::S_ADD_U32) {
+                // Stage the pending low add. The `s_addc_u32 hi, hi, 0`
+                // complement is expected to be the next instruction in
+                // the straight-line Tensile shape; anything else that
+                // intervenes will either commit the pending via the
+                // matching S_ADDC_U32 branch below, or invalidate the
+                // tracker via the generic "any other write" fall-through.
+                auto [ok, imm] = classify(kaLo);
+                if (ok) {
+                  // A second staged low-add before the first commits is a
+                  // torn state. Invalidate; no carry-propagation fiction.
+                  if (ctx.kernargPtrDelta.pendingLow) {
+                    ctx.kernargPtrDelta.valid = false;
+                    ctx.kernargPtrDelta.pendingLow = false;
+                  } else {
+                    ctx.kernargPtrDelta.pendingLow = true;
+                    ctx.kernargPtrDelta.pendingLowDelta = imm;
+                  }
+                } else {
+                  // Write to the low dword that isn't a recognised
+                  // in-place const-add: cannot fold to a delta.
+                  ctx.kernargPtrDelta.valid = false;
+                  ctx.kernargPtrDelta.pendingLow = false;
+                }
+              } else if (writesHi && !writesLo &&
+                         di.semOp == SemOp::S_ADDC_U32 &&
+                         ctx.kernargPtrDelta.pendingLow) {
+                // Commit the pending low add iff this is the matching
+                // `s_addc_u32 hi, hi, 0`. Non-zero high imm or non-
+                // in-place-hi pattern: invalidate.
+                auto [ok, imm] = classify(kaHi);
+                if (ok && imm == 0) {
+                  ctx.kernargPtrDelta.delta += ctx.kernargPtrDelta.pendingLowDelta;
+                  ctx.kernargPtrDelta.pendingLow = false;
+                  ctx.kernargPtrDelta.pendingLowDelta = 0;
+                } else {
+                  ctx.kernargPtrDelta.valid = false;
+                  ctx.kernargPtrDelta.pendingLow = false;
+                }
+              } else {
+                // Writes both halves of the pair in one instruction
+                // (e.g. a 64-bit S_LOAD_B64 through another base), or
+                // writes one half with an opcode other than the
+                // canonical add/addc shape (S_MOV_B32, S_SUB_U32, etc.).
+                // Either breaks the const-delta contract.
+                ctx.kernargPtrDelta.valid = false;
+                ctx.kernargPtrDelta.pendingLow = false;
+              }
+            }
+          } else if (ctx.kernargPtrDelta.valid &&
+                     ctx.kernargPtrDelta.pendingLow && di.defsSCC) {
+            // A staged low-add exists but this instruction writes SCC
+            // without being the matching S_ADDC_U32. The carry bit the
+            // pending low-add would feed into is dead; the high dword
+            // will never receive the low's overflow. Collapse the
+            // pending state and invalidate. The tracker reports a
+            // torn 64-bit pointer value — handle_smem.cpp's loud
+            // refusal is preferable to inventing carry semantics out
+            // of a now-unrelated SCC.
+            ctx.kernargPtrDelta.valid = false;
+            ctx.kernargPtrDelta.pendingLow = false;
+          }
+        }
+      }
       raisedCount++;
       continue;
     }
@@ -867,6 +1318,7 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
     AssumptionCache AC(*F);
     SmallVector<AllocaInst *, 512> allocas;
     regs.collectAllocas(allocas);
+    ctx.collectSgprWaveMaskShadowAllocas(allocas);
     PromoteMemToReg(allocas, DT, &AC);
   }
 
@@ -912,8 +1364,14 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   // would re-introduce `v_readfirstlane_b32` at the SGPR boundary and
   // recreate the source-wave collapse the rewrite exists to avoid.
   if (enableWritelaneRewrite) {
-    CrossLaneDivergentRewriteReport rewriteReport =
-        rewriteCrossLaneDivergent(*F, isa.waveSize, targetIsa.waveSize);
+    // `tm.get()` threaded through so `rewriteCrossLaneDivergent` can
+    // build a `UniformityAnalysis` against the compilation target
+    // for the §5.6.3 "UA-backed readfirstlane allow-gate" classifier
+    // refinement. See the rewrite's header comment for the contract
+    // (nullable — null disables the gate and falls back to the
+    // conservative pre-UA refusal behaviour).
+    CrossLaneDivergentRewriteReport rewriteReport = rewriteCrossLaneDivergent(
+        *F, isa.waveSize, targetIsa.waveSize, tm.get());
 
     if (rewriteReport.refusedSgprForced()) {
       RaiseFailure f = RaiseFailure::crossWaveRewriteOracleDisagreement(

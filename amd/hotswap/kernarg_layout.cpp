@@ -75,34 +75,23 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
     return nullptr;
   }
 
-  // No named kernarg slot covers [byteOffset, byteOffset+4). Two cases:
+  // No named kernarg slot covers [byteOffset, byteOffset+4).
   //
-  // (a) The dword lies in *trailing alignment padding* within the
-  //     kernarg segment — i.e. it sits past the last named arg but
-  //     still within `kernargSegmentSize`. HSA leaves those bytes
-  //     uninitialised by contract, so the LLVM-correct representation
-  //     is `undef i32`. Tensile-style GEMM kernels routinely emit a
-  //     16-byte `s_load_b128` over the last 12 bytes of named args
-  //     plus 4 bytes of padding because the aligned vector load is
-  //     cheaper than a split 12+4 sequence; the trailing dword lands
-  //     in an SGPR the kernel never reads, and emitting `undef`
-  //     preserves that "any value is allowed" semantics without
-  //     fabricating a concrete zero. The runtime never observes the
-  //     value either way.
+  // If the dword still lies fully inside the declared kernarg segment,
+  // this is alignment padding (either between named args or trailing at
+  // the end of the segment). HSA leaves padding bytes unspecified, so the
+  // LLVM-correct representation is `undef i32` rather than inventing a
+  // concrete value.
   //
-  // (b) The dword would overrun the segment, or it straddles two
-  //     params with a hole / partial overlap that the layout cannot
-  //     describe. Both are real errors and we refuse loudly with a
-  //     diagnostic that names the offset, the segment size, and the
-  //     last named-arg end.
+  // Example that requires this behavior: gfx1250 kernarg-preload can pull
+  // contiguous dwords that pass through an ABI alignment hole between an
+  // i32 arg and a later aligned pointer arg. Those bytes are still in the
+  // segment and must be modeled as "any value".
+  //
+  // Off-segment reads remain hard errors.
   if (layout.kernargSegmentSize > 0 &&
-      byteOffset + 4 <= layout.kernargSegmentSize) {
-    int lastEnd = 0;
-    for (auto &p : layout.params)
-      lastEnd = std::max(lastEnd, p.byteOffset + p.byteSize);
-    if (byteOffset >= lastEnd)
-      return UndefValue::get(i32Ty);
-  }
+      byteOffset + 4 <= layout.kernargSegmentSize)
+    return UndefValue::get(i32Ty);
 
   if (whyNot) {
     int lastEnd = 0;
