@@ -827,11 +827,25 @@ static void doTestPermlane16Swap() {
   HIP_ASSERT(hipMemcpy(hSrc0.data(), dSrc0, N * sizeof(int),
                        hipMemcpyDeviceToHost));
 
+  // Asymmetric per-lane expectation — MI400 Shader Programming
+  // Guide § V_PERMLANE16_SWAP_B32 pragma.  Pre-Session-8 (2026-
+  // 04-23) the emulation emitted the symmetric cross-wire that
+  // these CHECKs were originally written against; the fix in
+  // `handle_valu_cross_lane.cpp::emitPermLaneSwapEmulation`
+  // makes this test exercise the correct per-destination-lane
+  // behaviour.  See hotswap/docs/matrix-translation.md §12.4.7.
+  //
+  //   isLow[L]         = (L & 16) == 0
+  //   new_vdst[L]      = isLow ? vdst_in[L]       : src0_in[L ^ 16]
+  //                    = isLow ? L                : 1000 + (L ^ 16)
+  //   new_src0_out[L]  = isLow ? vdst_in[L ^ 16]  : src0_in[L]
+  //                    = isLow ? (L ^ 16)         : 1000 + L
   int errors = 0;
   for (int L = 0; L < N; L++) {
     int partner = L ^ 16;
-    int expVdst = 1000 + partner;
-    int expSrc0 = partner;
+    bool isLow = (L & 16) == 0;
+    int expVdst = isLow ? L           : 1000 + partner;
+    int expSrc0 = isLow ? partner     : 1000 + L;
     if (hVdst[L] != expVdst || hSrc0[L] != expSrc0) {
       if (errors < 4)
         fprintf(stderr,
@@ -957,11 +971,15 @@ static void doTestPermlane16SwapWave32() {
   HIP_ASSERT(hipMemcpy(hSrc0.data(), dSrc0, N * sizeof(int),
                        hipMemcpyDeviceToHost));
 
+  // Asymmetric per-lane expectation — see the sibling
+  // `doTestPermlane16Swap` arm above for the full pragma-to-
+  // expectation derivation.
   int errors = 0;
   for (int L = 0; L < N; L++) {
     int partner = L ^ 16;
-    int expVdst = 1000 + partner;
-    int expSrc0 = partner;
+    bool isLow = (L & 16) == 0;
+    int expVdst = isLow ? L       : 1000 + partner;
+    int expSrc0 = isLow ? partner : 1000 + L;
     if (hVdst[L] != expVdst || hSrc0[L] != expSrc0) {
       if (errors < 4)
         fprintf(stderr,
@@ -978,10 +996,11 @@ static void doTestPermlane16SwapWave32() {
   EXPECT_EQ(errors, 0)
       << errors
       << " lane mismatches in permlane16_swap under wave32 → wave64 "
-         "(expected XOR-16 partner pattern).  If this fires, the root "
-         "of the tl.sort cross-16 merge bug is the emulation itself "
-         "— see the 2026-04-22 learnings.md entry on "
-         "`topk_forward_bf16` for context.";
+         "(asymmetric per-half semantic — see matrix-translation.md "
+         "§12.4.7).  Pre-Session-8 this test fired against the "
+         "symmetric emulation that corrupted `matmul_fp16`; if it "
+         "fires now the fix in `emitPermLaneSwapEmulation` has "
+         "regressed.";
 }
 
 // Triton-state xor3 probe — validates v3 post-xor3 under v3=v4=v2 init.
@@ -1140,16 +1159,26 @@ static void doTestPermlane16SwapWave32WaveNative() {
   HIP_ASSERT(hipMemcpy(hSrc0.data(), dSrc0, N * sizeof(int),
                        hipMemcpyDeviceToHost));
 
-  // Expected pattern:
+  // Expected pattern under the asymmetric semantic (see
+  // `doTestPermlane16Swap` above for the derivation):
+  //
   //   wave_base    = L & ~0x1F                 // 0, 32, 64, 96
-  //   within_wave  = L & 0x1F                  // 0..31
+  //   within_wave  = L & 0x1F                  // 0..31 within source wave
   //   within_part  = within_wave XOR 16
   //   partner      = wave_base | within_part
+  //   isLow[L]     = (L & 16) == 0             // low row of each wave32
+  //
+  // Bit 4 of L tracks the low/high row INSIDE each source wave32
+  // (bit 5 discriminates between target lanes 0..31 and 32..63,
+  // i.e. source wave 0 vs source wave 1), so `(L & 16) == 0`
+  // selects the low row of whichever source wave the lane
+  // belongs to — the same check used in the wave64 sibling above.
   int errors = 0;
   for (int L = 0; L < N; L++) {
     int partner = (L & ~0x1F) | ((L & 0x1F) ^ 16);
-    int expVdst = 1000 + partner;
-    int expSrc0 = partner;
+    bool isLow = (L & 16) == 0;
+    int expVdst = isLow ? L       : 1000 + partner;
+    int expSrc0 = isLow ? partner : 1000 + L;
     if (hVdst[L] != expVdst || hSrc0[L] != expSrc0) {
       if (errors < 6)
         fprintf(stderr,
@@ -1166,12 +1195,121 @@ static void doTestPermlane16SwapWave32WaveNative() {
   EXPECT_EQ(errors, 0)
       << errors
       << " lane mismatches in permlane16_swap under WaveNative "
-         "projection.  If this fires, the tl.sort cross-16 merge "
-         "bug roots in `emitPermLaneSwapEmulation` at "
-         "handle_valu_cross_lane.cpp; if it passes, the root is "
-         "in the compare-and-cndmask dance around the swap — see "
-         "the 2026-04-22 learnings.md entry on "
-         "`topk_forward_bf16` for context.";
+         "projection (asymmetric per-half semantic — see matrix-"
+         "translation.md §12.4.7).  Pre-Session-8 this test fired "
+         "against the symmetric emulation; if it fires now the "
+         "fix in `emitPermLaneSwapEmulation` has regressed.";
+}
+
+// ----- P4.wave32+DivergentEXEC: v_permlane16_swap_b32 under
+//       per-destination-lane EXEC gating -----
+//
+// The sibling `doTestPermlane16SwapWave32` arm exercises the
+// asymmetric per-destination-lane semantic with EXEC=all-active.
+// This arm drops EXEC on odd lanes across the swap and verifies
+// that each destination lane's write is independently gated on
+// its own EXEC bit (matching the MI400 pragma's
+// `if EXEC[lane]: VGPR[lane][SRC0] = ...` /
+// `if EXEC[lane+16]: VGPR[lane+16][VDST] = ...`).  Under the
+// pre-Session-8 symmetric emulation (which wrapped the bpermute
+// results directly in `writeReg32`) this would also pass
+// because `writeReg32`'s `emitUnderExec` wrapper is per-lane —
+// so the emulation-level EXEC contract is pinned independently
+// of the low/high-row split, and a future change that moves the
+// writes out from under `emitUnderExec` would fire here even
+// though the convergent siblings stay green.
+static void doTestPermlane16SwapDivergentExec() {
+  printf("--- permlane16_swap_divergent_exec_kernel ---\n");
+  std::string path =
+      std::string(GFX1250_DATA_DIR) +
+      "/permlane16_swap_divergent_exec_gfx1250.hsaco";
+  auto data = transpiler::readFile(path);
+  ASSERT_FALSE(data.empty()) << "Cannot read " << path;
+  auto result = transpiler::runPipeline(
+      data, "gfx1250", "gfx942",
+      "permlane16_swap_divergent_exec_kernel");
+  ASSERT_TRUE(result.success)
+      << "Pipeline failed for permlane16_swap_divergent_exec";
+  printf("  Pipeline: raised %d/%d insts, HSACO=%zu bytes\n",
+         result.liftedCount, result.totalCount, result.hsaco.size());
+
+  constexpr int N = 32;
+  auto meta = transpiler::extractKernelMeta(
+      data, "permlane16_swap_divergent_exec_kernel");
+  ASSERT_EQ(meta.maxFlatWorkgroupSize, (uint32_t)N)
+      << "Binary's max_flat_workgroup_size ("
+      << meta.maxFlatWorkgroupSize
+      << ") != expected wave32 source N (" << N
+      << ").  The .hip's __launch_bounds__ and the test's N have "
+         "drifted.";
+
+  std::vector<int> hVdst(N, -1), hSrc0(N, -1);
+  int *dVdst, *dSrc0;
+  HIP_ASSERT(hipMalloc(&dVdst, N * sizeof(int)));
+  HIP_ASSERT(hipMalloc(&dSrc0, N * sizeof(int)));
+  HIP_ASSERT(hipMemset(dVdst, 0xff, N * sizeof(int)));
+  HIP_ASSERT(hipMemset(dSrc0, 0xff, N * sizeof(int)));
+
+  hipModule_t mod;
+  HIP_ASSERT(hipModuleLoadData(&mod, result.hsaco.data()));
+  hipFunction_t func;
+  HIP_ASSERT(hipModuleGetFunction(
+      &func, mod, "permlane16_swap_divergent_exec_kernel"));
+
+  std::vector<uint8_t> argBuf(meta.kernargSegmentSize, 0);
+  memcpy(argBuf.data() + 0, &dVdst, 8);
+  memcpy(argBuf.data() + 8, &dSrc0, 8);
+  size_t argSz = argBuf.size();
+  void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, argBuf.data(),
+                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSz,
+                    HIP_LAUNCH_PARAM_END};
+  HIP_ASSERT(hipModuleLaunchKernel(func, 1, 1, 1, N, 1, 1,
+                                   meta.groupSegmentFixedSize, nullptr,
+                                   nullptr, config));
+  HIP_ASSERT(hipDeviceSynchronize());
+  HIP_ASSERT(hipMemcpy(hVdst.data(), dVdst, N * sizeof(int),
+                       hipMemcpyDeviceToHost));
+  HIP_ASSERT(hipMemcpy(hSrc0.data(), dSrc0, N * sizeof(int),
+                       hipMemcpyDeviceToHost));
+
+  // Expected pattern — see the .hip source's top comment for the
+  // derivation.  Active lanes (even L) take the asymmetric
+  // swap; inactive lanes (odd L) keep their initial values.
+  int errors = 0;
+  for (int L = 0; L < N; L++) {
+    int partner = L ^ 16;
+    bool isLow = (L & 16) == 0;
+    bool active = (L & 1) == 0;
+    int expVdst, expSrc0;
+    if (active) {
+      expVdst = isLow ? L       : 1000 + partner;
+      expSrc0 = isLow ? partner : 1000 + L;
+    } else {
+      expVdst = L;
+      expSrc0 = 1000 + L;
+    }
+    if (hVdst[L] != expVdst || hSrc0[L] != expSrc0) {
+      if (errors < 6)
+        fprintf(stderr,
+                "  lane %2d (%s): vdst got=%d exp=%d, "
+                "src0 got=%d exp=%d\n",
+                L, active ? "active" : "inactive",
+                hVdst[L], expVdst, hSrc0[L], expSrc0);
+      errors++;
+    }
+  }
+
+  (void)hipFree(dVdst);
+  (void)hipFree(dSrc0);
+  (void)hipModuleUnload(mod);
+  printf("  Result: %d errors over %d lanes\n", errors, N);
+  EXPECT_EQ(errors, 0)
+      << errors
+      << " lane mismatches in permlane16_swap under divergent "
+         "EXEC.  Per-destination-lane EXEC gating contract broken "
+         "— see the MI400 pragma quoted in "
+         "`handle_valu_cross_lane.cpp::emitPermLaneSwapEmulation` "
+         "and the test's .hip header for the expected pattern.";
 }
 
 // ----- Diagnostic probe: gfx1250 bitonic cross-16 compare-and-swap dance -----
@@ -1460,6 +1598,7 @@ TEST_F(Gfx1250Gpu, Softmax)        { doTestSoftmax(); }        // P2 (permlanex1
 TEST_F(Gfx1250Gpu, Permlane16Swap) { doTestPermlane16Swap(); } // P4 explicit
 TEST_F(Gfx1250Gpu, Permlane16SwapWave32) { doTestPermlane16SwapWave32(); } // P4 wave32 source
 TEST_F(Gfx1250Gpu, Permlane16SwapWave32WaveNative) { doTestPermlane16SwapWave32WaveNative(); } // P4 WaveNative
+TEST_F(Gfx1250Gpu, Permlane16SwapDivergentExec) { doTestPermlane16SwapDivergentExec(); } // P4 per-lane EXEC-gate
 TEST_F(Gfx1250Gpu, BitonicCross16Probe) { doTestBitonicCross16Probe(); } // diagnostic — prints trace
 TEST_F(Gfx1250Gpu, BitonicXor3TritonState) { doTestBitonicXor3TritonState(); } // probe Triton's v3=v4=v2 init
 TEST_F(Gfx1250Gpu, DppQuadPerm)    { doTestDppQuadPerm(); }    // P5 explicit

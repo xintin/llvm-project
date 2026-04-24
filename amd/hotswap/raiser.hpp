@@ -95,61 +95,39 @@ struct RaiseResult {
 // `enablePermLane16Xor3PartnerRewrite` toggles the
 // `rewrite_permlane16_xor3_partner` pass that substitutes
 // `partner_seed` for the xor3 result at Triton's gfx1250
-// cross-16 bitonic-merge idiom (see that header's top-of-file
-// block comment for the full (a)/(b) hypothesis split).
+// cross-16 bitonic-merge idiom.
 //
-// Default **on** because:
-//   * The pass's fingerprint (two bpermutes with identical
-//     first-operand + outer xor with their xor and the shared
-//     seed) is an IR shape salmon does not emit through any
-//     other lift path, so false positives are structurally
-//     impossible.
-//   * The `canary_tl_sort_fp32_deterministic` regression guard
-//     depends on it — without the rewrite the canary reports
-//     `WRONG 16384/16384` for Triton's cross-16 bitonic merge.
+// Default **off** as of 2026-04-23: the pass was a transitional
+// bridge that compensated for the SYMMETRIC `v_permlane16_swap_
+// b32` lift that lived in `handle_valu_cross_lane.cpp` prior to
+// the matmul_fp16 fix.  With the lift corrected to match the
+// MI400 Shader Programming Guide's ASYMMETRIC semantic (§ V_
+// PERMLANE16_SWAP_B32), the xor3 composition downstream already
+// produces `partner_seed` through the standard arithmetic
+// (lanes 0..15 see `seed^partner^seed = partner`, lanes 16..31
+// see `partner^seed^seed = partner` symmetrically) without
+// needing the bpermute-level RAUW.  Default-on would actively
+// miscompile any kernel whose two bpermutes feed a matching
+// outer xor pattern — the rewrite erases correct IR.
 //
-// TRANSITIONAL — remove when either of the two conditions below
-// is met (whichever comes first):
-//
-//   (a) AMD publishes gfx1250 ISA documentation confirming the
-//       silicon semantic of `v_permlane16_swap_b32` under the
-//       `vdst_in == src0_in` initializer.  If the silicon
-//       differs from the gfx950-documented cross-wire (produces
-//       `partner` instead of `self` after the xor3), the
-//       principled fix moves UP the stack: update
-//       `emitPermLaneSwapEmulation` in
-//       `handle_valu_cross_lane.cpp` to model the gfx1250
-//       silicon semantic, at which point this pass becomes
-//       harmless dead code (the xor3 will already produce
-//       `partner` through the standard lift).
-//
-//   (b) Triton's gfx1250 codegen changes to stop emitting the
-//       `permlane16_swap + xor3` idiom (e.g. switches to
-//       `ds_swizzle_b32 swap:16` like the gfx942 codegen path
-//       already uses).  The rewrite's fingerprint stops
-//       appearing in lifted kernels; the pass becomes dead code.
-//
-// In both cases the `Gfx1250Gpu.BitonicXor3TritonState` GTest
-// and the `canary_tl_sort_fp32_deterministic` recipe pin
-// whether the rewrite still fires or has been obsoleted by the
-// upstream change.  Callers that want to audit the pre-rewrite
-// behaviour (to characterise how many recipes would regress
-// without the bridge) pass `enablePermLane16Xor3PartnerRewrite
-// = false` explicitly — raise_cli exposes this as
-// `--disable-permlane16-xor3-partner`.
+// The pass is retained for audit / bisection only — callers
+// that want to reproduce the pre-fix (buggy) behaviour can
+// pass `true` explicitly, or raise_cli exposes
+// `--enable-permlane16-xor3-partner`.
 //
 // `enablePermLane16SwapSelfPreserveRewrite` toggles the
 // `rewrite_permlane16_swap_selfpreserve` pass that rewrites the
 // second output of `emitPermLaneSwapEmulation` from
-// `partner_seed` to `seed` (the self-preserving asymmetric
-// semantic) when BOTH bpermute data arguments trace (via SPE
-// active-arm phi walks) to the same root SSA value.  See the
-// pass header for the shape-independent justification (covers
-// Triton's tl.sort xor3, tl.sort split-xor, and tl.topk max
-// idioms in one rewrite).  TRANSITIONAL on the same two
-// conditions (a)(b) as the xor3-partner sibling above;
-// default **on**, raise_cli opt-out:
-// `--disable-permlane16-swap-selfpreserve`.
+// `partner_seed` to `seed` when BOTH bpermute data arguments
+// trace (via SPE active-arm phi walks) to the same root SSA
+// value.  Same story as the xor3-partner sibling: transitional
+// compensation for the symmetric lift.  The correct asymmetric
+// lift already produces the self-preserving output for the
+// lanes that should preserve (lanes 16..31 keep `src0_in`,
+// lanes 0..15 keep `vdst_in`), so the rewrite's `RAUW →
+// seedRoot` is redundant on one half of the wave and wrong on
+// the other.  Default **off**; raise_cli opt-in:
+// `--enable-permlane16-swap-selfpreserve`.
 RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &sourceISA,
                       const std::string &kernelName,
@@ -158,8 +136,8 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                       const std::string &compilationTargetISA = "",
                       bool enableWritelaneRewrite = true,
                       bool enableWaveNative = true,
-                      bool enablePermLane16Xor3PartnerRewrite = true,
-                      bool enablePermLane16SwapSelfPreserveRewrite = true);
+                      bool enablePermLane16Xor3PartnerRewrite = false,
+                      bool enablePermLane16SwapSelfPreserveRewrite = false);
 
 } // namespace transpiler
 

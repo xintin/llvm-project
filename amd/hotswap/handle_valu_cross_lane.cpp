@@ -134,40 +134,128 @@ emitPermLaneSwapEmulation(RaiseContext &ctx, const DecodedInst &di,
   Value *bpermIdx = ctx.B.CreateShl(partner, ctx.B.getInt32(2),
                                      Twine(ssaPrefix) + "_addr");
 
-  // Two convergent ds_bpermute calls, cross-wired so the two tied
-  // output VGPRs each pick up their partner's tied-input value:
+  // Two emission shapes gated by source wave size, both emitting
+  // TWO `ds_bpermute` calls sharing `bpermIdx`:
   //
-  //   new_vdst      = bperm(addr, src0_in)
-  //   new_src0_out  = bperm(addr, vdst_in)
+  //   * WAVE32 source — ASYMMETRIC per-lane select matching the
+  //     MI400 Shader Programming Guide § V_PERMLANE16_SWAP_B32
+  //     pragma (only two of the four 16-lane rows move).
   //
-  // Emitted OUTSIDE `emitUnderExec` so all hardware lanes
-  // participate in the bpermute's LDS round-trip; `writeReg32`
-  // below wraps the stores for EXEC masking on the target side.
+  //   * WAVE64 source — SYMMETRIC cross-wired bpermute pair
+  //     (every lane swaps with its `L XOR mask` partner), which
+  //     is the lift shape that lived here before 2026-04-23.
+  //     Retained conservatively: the asymmetric pragma above is
+  //     gfx1250-specific (the only wave32 ISA that exposes
+  //     `v_permlane16_swap_b32` + `v_permlane32_swap_b32`), and
+  //     we don't currently have the gfx950 pragma in hand to
+  //     confirm whether the wave64 flavour mirrors it or is
+  //     genuinely symmetric.  The existing `c2_permlane_swap`
+  //     and `v_permlane32_swap_b32` lit fixtures exercise this
+  //     arm on gfx950 → gfx942 and pin the symmetric shape; the
+  //     graduated corpus did not regress under it before Session
+  //     8.  If a future gfx950-source regression surfaces that
+  //     points at this arm, confirm via `docs/manuals/` and
+  //     switch the branch to the asymmetric emission.
   //
-  // NB: TWO TRANSITIONAL rewrite passes post-process this
-  // emission when the ENTERING state of the swap's VGPR operands
-  // is the same SSA value (the Triton gfx1250 `tl.sort` /
-  // `tl.topk` cross-16 bitonic-merge idiom).  `rewrite_permlane
-  // 16_swap_selfpreserve.cpp` RAUWs `newSrc0Out` with the shared
-  // seed SSA (producing an asymmetric self-preserving emulation
-  // for that site), and `rewrite_permlane16_xor3_partner.cpp`
-  // substitutes the fused xor3 composition with the partner
-  // bpermute's result.  If you change the SHAPE of this emission
-  // (rename the SSA values, reorder the bpermute pair, add a
-  // third call, change the address-computation pattern) you
-  // MUST update the fingerprint in those two passes — both rely
-  // on (a) two adjacent bpermute calls sharing an SSA-identical
-  // first operand and (b) emission at the TOP of the handler
-  // body (no intervening stores) to keep the paired match
-  // narrow.  See the passes' block comments for the
-  // (a)/(b) hypothesis split and the two conditions under which
-  // they will become dead code and can be removed.
+  // Emission outside `emitUnderExec`: all hardware lanes must
+  // participate in the bpermute's LDS round-trip (fetch-invalid /
+  // `OPF_EXEC_FI` per the MI400 V_PERMLANE16_SWAP_B32 op entry),
+  // so we don't gate the compute under the source-active EXEC
+  // here.  `writeReg32` below still wraps the final stores in
+  // the target-side `emitUnderExec` so EXEC-inactive target lanes
+  // keep their prior VGPR values, matching the
+  // "OPF_WRMASK_NOT_EXEC" + asymmetric "if EXEC[lane]" write-side
+  // flags in the op's pragma.  This is the same invariant that
+  // held pre-Session-8 for the fi=0 / bc=0 assumption documented
+  // in the top-of-function block comment; the asymmetric arm
+  // does not widen the divergent-EXEC contract.
   Function *bperm = Intrinsic::getOrInsertDeclaration(
       &ctx.M, Intrinsic::amdgcn_ds_bpermute);
-  Value *newVdst = ctx.B.CreateCall(bperm, {bpermIdx, src0In},
-                                     Twine(ssaPrefix) + "_new_vdst");
-  Value *newSrc0Out = ctx.B.CreateCall(
-      bperm, {bpermIdx, vdstIn}, Twine(ssaPrefix) + "_new_src0_out");
+  Value *newVdst = nullptr;
+  Value *newSrc0Out = nullptr;
+  if (ctx.isa.isWave32()) {
+    // Asymmetric gfx1250 semantic of `v_permlane16_swap_b32`
+    // (MI400 Shader Programming Guide § V_PERMLANE16_SWAP_B32
+    // pragma, verbatim):
+    //
+    //   // Lanes 0:15 of src0 and lanes 16:31 of vdst swapped.
+    //   // Lanes 16:31 of src0 and lanes 0:15 of vdst are unchanged.
+    //   for lane in 0:15 do tmp[lane] = VGPR[lane][SRC0] endfor;
+    //   for lane in 0:15 do
+    //     if EXEC[lane]:    VGPR[lane][SRC0]  = VGPR[lane+16][VDST]
+    //     if EXEC[lane+16]: VGPR[lane+16][VDST] = tmp[lane]
+    //   endfor
+    //
+    // Only TWO of the four 16-lane "rows" move; the other two
+    // retain their old values.  Per-lane:
+    //
+    //   new_vdst[L]     = (L_low) ?  vdst_in[L]             // UNCHANGED
+    //                             :  old src0[L XOR mask]   // cross-wired
+    //   new_src0_out[L] = (L_low) ?  old vdst[L XOR mask]   // cross-wired
+    //                             :  src0_in[L]             // UNCHANGED
+    //
+    // where `L_low` is the low row of each partnered pair.  For
+    // the XOR-16 variant (partnerXorMask=16) that's `L ∈ [0,15]
+    // ∪ [32,47]` (i.e. `(L & 16) == 0`), which generalises
+    // correctly to both MODREP wave32 replicas on the wave64
+    // target (lanes 0..31 and 32..63).  The XOR-32 variant
+    // cannot reach here (no wave32 ISA exposes
+    // `v_permlane32_swap_b32` today); if one is added in the
+    // future, the SAME pattern applies with `(L & 32) == 0`.
+    //
+    // Pre-Session-8 this arm emitted the symmetric cross-wire
+    // (below) unconditionally — over-swapping the "unchanged"
+    // halves corrupted every `matmul_fp16` A-operand position
+    // because vdst_in and src0_in carry distinct data at the
+    // swap site (see § 12.4.7 of hotswap/docs/matrix-
+    // translation.md for the Session-8 root-cause pin).  The
+    // self-preserve idiom (`vdst_in == src0_in == seed`, Triton
+    // `tl.sort` / `tl.topk`) masqueraded as working because the
+    // per-lane select collapses to `seed` for the preserved half
+    // anyway, so all of the transitional "papering-over"
+    // rewrites (`rewrite_permlane16_{xor3_partner,swap_self
+    // preserve}`) are dead under this emission.
+    //
+    // `isLaneLow` is computed via `lane AND partnerXorMask == 0`
+    // rather than `lane < partnerXorMask` so the backend can
+    // fold the AND into the subsequent select without a 32-bit
+    // compare (and it extends trivially to the two MODREP
+    // replicas above).
+    Value *bpermSrc0 = ctx.B.CreateCall(
+        bperm, {bpermIdx, src0In},
+        Twine(ssaPrefix) + "_bperm_src0"); // = old src0[L XOR mask]
+    Value *bpermVdst = ctx.B.CreateCall(
+        bperm, {bpermIdx, vdstIn},
+        Twine(ssaPrefix) + "_bperm_vdst"); // = old vdst[L XOR mask]
+    Value *halfBit = ctx.B.CreateAnd(
+        laneId, ctx.B.getInt32(partnerXorMask),
+        Twine(ssaPrefix) + "_half_bit");
+    Value *isLaneLow = ctx.B.CreateICmpEQ(
+        halfBit, ctx.B.getInt32(0),
+        Twine(ssaPrefix) + "_is_lane_low");
+    newVdst = ctx.B.CreateSelect(
+        isLaneLow, vdstIn, bpermSrc0,
+        Twine(ssaPrefix) + "_new_vdst");
+    newSrc0Out = ctx.B.CreateSelect(
+        isLaneLow, bpermVdst, src0In,
+        Twine(ssaPrefix) + "_new_src0_out");
+  } else {
+    // Wave64 source (gfx950): pre-Session-8 symmetric lift.
+    // Kept verbatim — see the function-top branch comment above
+    // for the gfx950-ISA-unconfirmed caveat and the two lit
+    // fixtures that pin this shape.  Every lane's two output
+    // VGPRs take its partner's tied-input value directly:
+    //
+    //   new_vdst[L]     = bperm(addr, src0_in)  = old src0[L XOR mask]
+    //   new_src0_out[L] = bperm(addr, vdst_in)  = old vdst[L XOR mask]
+    //
+    // Unlike the wave32 arm we emit the bpermute results
+    // straight into `writeReg32`; no per-lane select.
+    newVdst = ctx.B.CreateCall(bperm, {bpermIdx, src0In},
+                               Twine(ssaPrefix) + "_new_vdst");
+    newSrc0Out = ctx.B.CreateCall(bperm, {bpermIdx, vdstIn},
+                                  Twine(ssaPrefix) + "_new_src0_out");
+  }
   ctx.writeReg32(vdstReg, newVdst);
   ctx.writeReg32(src0OutReg, newSrc0Out);
   hr.handled = true;

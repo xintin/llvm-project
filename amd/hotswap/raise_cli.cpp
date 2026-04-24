@@ -233,15 +233,16 @@ int main(int argc, char **argv) {
   // REFUSE / UNCHANGED sibling contracts.
   bool enableWritelaneRewrite = true;
   bool enableWaveNative = true;
-  // Default on (see top-of-file comment for the TRANSITIONAL rationale
-  // + the two conditions under which the rewrite becomes dead code).
-  bool enablePermLane16Xor3PartnerRewrite = true;
-  // Default on; subsumes the xor3-partner rewrite at the bpermute
-  // emission level and extends coverage to split-xor and max-based
-  // idioms.  See `rewrite_permlane16_swap_selfpreserve.hpp` for the
-  // shape-independent justification and the same two TRANSITIONAL
-  // removal conditions as the xor3-partner sibling.
-  bool enablePermLane16SwapSelfPreserveRewrite = true;
+  // Default OFF as of 2026-04-23: these two passes were a
+  // transitional bridge built atop the SYMMETRIC
+  // v_permlane16_swap_b32 lift.  With the asymmetric (MI400
+  // Shader Programming Guide § V_PERMLANE16_SWAP_B32 compliant)
+  // lift landed in `handle_valu_cross_lane.cpp`, both passes
+  // actively erase or RAUW correct IR and MUST stay off by
+  // default — callers that want to reproduce the pre-fix
+  // behaviour (audit / bisection) pass --enable-… explicitly.
+  bool enablePermLane16Xor3PartnerRewrite = false;
+  bool enablePermLane16SwapSelfPreserveRewrite = false;
   std::string emitIrKernel;
   std::string writeHsacoPath;
   std::string writeHsacoKernel;
@@ -289,22 +290,19 @@ int main(int argc, char **argv) {
       // this file's top-of-file comment.
       enableWaveNative = false;
     } else if (a == "--enable-permlane16-xor3-partner") {
+      // Opt-in only: default-off after the 2026-04-23
+      // asymmetric v_permlane16_swap_b32 fix.  Retained for
+      // audit / bisection — the pass actively erases correct IR
+      // under the post-fix asymmetric lift.
       enablePermLane16Xor3PartnerRewrite = true;
     } else if (a == "--disable-permlane16-xor3-partner") {
-      // Later-wins on the command line, symmetric with the
-      // writelane-rewrite / wave-native flag pairs.  The
-      // `--disable-` form audits the pre-rewrite shape for the
-      // Triton cross-16 bitonic-merge idiom (see top-of-file
-      // comment for the full (a)/(b) hypothesis split and the
-      // conditions under which the rewrite can be removed).
       enablePermLane16Xor3PartnerRewrite = false;
     } else if (a == "--enable-permlane16-swap-selfpreserve") {
+      // Opt-in only: same story as the xor3-partner sibling.
+      // Retained for audit; default-off after the asymmetric
+      // lift fix.
       enablePermLane16SwapSelfPreserveRewrite = true;
     } else if (a == "--disable-permlane16-swap-selfpreserve") {
-      // Later-wins on the command line, symmetric with the
-      // sibling xor3-partner flag.  `--disable-` pins the
-      // symmetric-output (gfx950-documented) cross-wire shape
-      // for audit / pre-rewrite characterisation.
       enablePermLane16SwapSelfPreserveRewrite = false;
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "raise_cli: unknown flag: %s\n", a.c_str());
