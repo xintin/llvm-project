@@ -96,8 +96,23 @@ static llvm::Value *tryGetSrcWaveMaskI1(RaiseContext &ctx, OpResolver &op,
     return nullptr;
   ParsedReg pr = op.srcReg(i);
   switch (pr.kind) {
-  case ParsedReg::SGPR:
-    return ctx.lookupSgprWaveMaskI1(pr.baseIdx);
+  case ParsedReg::SGPR: {
+    if (llvm::Value *fresh = ctx.lookupSgprWaveMaskI1(pr.baseIdx))
+      return fresh;
+    if (llvm::Value *shadowValid = ctx.loadSgprWaveMaskValid(pr.baseIdx)) {
+      llvm::Value *shadowExec = ctx.loadSgprWaveMaskExec(pr.baseIdx);
+      llvm::Value *shadowI1 =
+          ctx.projection.extractLaneBitFromWaveMask(ctx.B, shadowExec);
+      llvm::Value *sgprMask = ctx.isa.isWave32()
+                                  ? ctx.regs.loadSGPR32(ctx.B, pr.baseIdx)
+                                  : ctx.regs.loadSGPR64(ctx.B, pr.baseIdx);
+      llvm::Value *fallback =
+          ctx.projection.extractLaneBitFromWaveMask(ctx.B, sgprMask);
+      return ctx.B.CreateSelect(shadowValid, shadowI1, fallback,
+                                "sop2_src_sgpr_mask_shadow_sel");
+    }
+    return nullptr;
+  }
   case ParsedReg::VCC:
     // VCC alloca stores the per-lane i1 directly; load it to get
     // the correct wave-width i1 without the ballot-truncate-

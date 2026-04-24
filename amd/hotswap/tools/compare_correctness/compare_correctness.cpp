@@ -2612,6 +2612,74 @@ Recipe makeSAndSaveexecB32Recipe() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Recipe: vopd_bitop2_or_b32 — minimal dual-issue bitop2 TTBL probe
+// Each thread computes y = bitop2(src0=8, src1=x, ttbl=0x54), which is
+// equivalent to y = (x | 8). Kernel forces a single VOPD packet via inline asm.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Recipe makeVopdBitop2OrB32Recipe() {
+  Recipe r;
+  r.name = "vopd_bitop2_or_b32";
+  r.defaultNs     = {16, 64, 256, 1024, 4096};
+  r.defaultBlocks = {64, 128, 256};
+  r.outputElemBytes = sizeof(uint32_t);
+  r.outputElems = [](int N, int) { return N; };
+
+  r.makeInput = [](int N) {
+    std::vector<uint8_t> buf(N * sizeof(uint32_t));
+    auto *u = reinterpret_cast<uint32_t *>(buf.data());
+    std::mt19937 rng(0xB17u + N);
+    for (int i = 0; i < N; ++i) u[i] = rng();
+    return buf;
+  };
+
+  r.cpuReference = [](const std::vector<uint8_t> &input, int N, int) {
+    const uint32_t *in = reinterpret_cast<const uint32_t *>(input.data());
+    std::vector<uint8_t> out(N * sizeof(uint32_t));
+    auto *o = reinterpret_cast<uint32_t *>(out.data());
+    for (int i = 0; i < N; ++i) o[i] = (in[i] | 8u);
+    return out;
+  };
+
+  r.dispatch = [](hipModule_t mod, const std::vector<uint8_t> &input,
+                  int N, int blockSize) {
+    hipFunction_t fn;
+    HIP_ASSERT(hipModuleGetFunction(&fn, mod, "vopd_bitop2_or_b32"));
+    uint32_t *dIn = nullptr, *dOut = nullptr;
+    size_t bytes = N * sizeof(uint32_t);
+    HIP_ASSERT(hipMalloc(&dIn, bytes));
+    HIP_ASSERT(hipMalloc(&dOut, bytes));
+    HIP_ASSERT(hipMemcpy(dIn, input.data(), bytes, hipMemcpyHostToDevice));
+    HIP_ASSERT(hipMemset(dOut, 0x00, bytes));
+    struct alignas(8) Args {
+      const uint32_t *in;
+      uint32_t *out;
+      int n;
+    } args = {dIn, dOut, N};
+    size_t argSize = sizeof(args);
+    void *cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                   HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                   HIP_LAUNCH_PARAM_END};
+    int grd = (N + blockSize - 1) / blockSize;
+    HIP_ASSERT(hipModuleLaunchKernel(fn, grd, 1, 1, blockSize, 1, 1, 0,
+                                     nullptr, nullptr, cfg));
+    HIP_ASSERT(hipDeviceSynchronize());
+    std::vector<uint8_t> out(bytes);
+    HIP_ASSERT(hipMemcpy(out.data(), dOut, bytes, hipMemcpyDeviceToHost));
+    HIP_ASSERT(hipFree(dIn));
+    HIP_ASSERT(hipFree(dOut));
+    return out;
+  };
+
+  r.compare = [](const std::vector<uint8_t> &gold,
+                 const std::vector<uint8_t> &actual,
+                 int /*N*/, int /*blockSize*/, int n) {
+    return compareU32Exact(gold, actual, n);
+  };
+  return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Recipe: c4_lane_dep_cmpx — runtime evidence for Class 4 (lane-
 // position-dependent EXEC writes) per hotswap/docs/wave-size-
 // translation.md §6.
@@ -5128,6 +5196,7 @@ const std::vector<Recipe> &allRecipes() {
         makeVCmpCndmaskSgprRecipe(),
         makeVCmpxGtI32Recipe(),
         makeSAndSaveexecB32Recipe(),
+        makeVopdBitop2OrB32Recipe(),
         makeC4LaneDepCmpxRecipe(),
         makeWmmaF32_16x16x4_GemmRecipe(),
         makeMubufStoreB32Recipe(),
@@ -5887,7 +5956,7 @@ int main(int argc, char **argv) {
   if (!std::getenv("HSA_HOTSWAP_ISA_OVERRIDE"))
     setenv("HSA_HOTSWAP_ISA_OVERRIDE", "gfx942", 1);
   if (!std::getenv("HSA_HOTSWAP_RULES"))
-    setenv("HSA_HOTSWAP_RULES", "/dev/null", 1);
+    setenv("HSA_HOTSWAP_RULES", "../triton_corpus_runner/_empty_rules.json", 1);
 
   std::string exe = selfExe();
 

@@ -45,6 +45,7 @@ KERNELS        := vecadd block_sum_shfl lane_swap \
                   v_add_lshl_u32 v_bfe_i32 s_bfe_i32 s_bitset0_b32 \
                   s_bitset0_b64 v_bfi_b32 v_cmp_cndmask_sgpr \
                   v_cmpx_gt_i32 s_and_saveexec_b32 \
+                  vopd_bitop2_or_b32 \
                   c4_lane_dep_cmpx \
                   wmma_f32_16x16x4_gemm \
                   mubuf_store_b32 s_set_vgpr_msb \
@@ -99,11 +100,24 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   topk_forward_bisect_m_bf16_upconv \
                   topk_forward_bisect_m1_const_in \
                   topk_forward_bisect_m2_strict \
+                  topk_forward_bisect_m2_trace \
+                  topk_forward_bisect_m2_trace_iters \
+                  topk_forward_bisect_m2_trace_i2_parts \
+                  topk_forward_bisect_m2_bitop3_probe \
                   canary_tl_topk_bf16 \
                   canary_tl_topk_bf16_nw1 \
                   canary_tl_topk_fp32 \
                   canary_tl_sort_fp32 \
                   canary_tl_sort_fp32_n16 \
+                  canary_tl_sort_fp32_n16_nw1 \
+                  canary_tl_sort_fp32_n16_nw2 \
+                  canary_tl_sort_fp32_n16_nw8 \
+                  canary_tl_sort_fp32_n16_nw2_r32 \
+                  canary_pairsort1_fp32_n16_nw2_r32 \
+                  canary_cmp_materialize_eq_select_fp32_n16_nw2_r32 \
+                  canary_cmp_materialize_eq_select_fp32_n16_nw2_r64 \
+                  canary_cmp_materialize_eq_select_fp32_n16_nw8_r32 \
+                  canary_v_and_or_laneexpr_u32_nw2_r32 \
                   canary_tl_sort_fp32_n16_deterministic \
                   canary_tl_sort_fp32_n16_xor1 \
                   canary_tl_sort_fp32_n16_row_offset \
