@@ -983,8 +983,15 @@ void rewriteUpdateDppI32Call(CallInst *CI, Value *laneId) {
 } // namespace
 
 CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
-    Function &F, unsigned sourceWaveSize, unsigned targetWaveSize) {
+    Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
+    TargetMachine *TM) {
   CrossLaneDivergentRewriteReport report;
+  // `TM` is reserved for a future UA-backed classifier refinement.
+  // See the header doc block for the soundness analysis of why the
+  // naive "UA allow-gate on pre-rewrite IR" is insufficient.  Accept
+  // null silently — no current path uses it, and accepting nullptr
+  // is part of the documented contract.
+  (void)TM;
 
   // Direction gate. Same-wave / narrowing skip the rewrite entirely:
   // the backend's implicit readfirstlane would not collapse any per-

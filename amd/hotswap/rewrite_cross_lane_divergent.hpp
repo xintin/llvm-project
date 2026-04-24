@@ -5,6 +5,7 @@
 
 namespace llvm {
 class Function;
+class TargetMachine;
 } // namespace llvm
 
 namespace transpiler {
@@ -230,8 +231,24 @@ struct CrossLaneDivergentRewriteReport {
 // IF the forward use-chain classifier proves every site VGPR-safe.
 // Otherwise perform zero rewrites and return the refusal detail in
 // `sgprForcedDetail`. No-op when `targetWaveSize <= sourceWaveSize`.
+//
+// `TM` is an optional (default-null) handle to the compilation
+// target's `TargetMachine`. It is currently unused — the classifier
+// operates purely on the lifted IR's structural shape. The parameter
+// is kept in the signature so callers (`raiser.cpp`) can pass the
+// already-constructed target machine, and any future refinement that
+// wants to consult a target-aware analysis (`UniformityAnalysis`,
+// `TargetTransformInfo`, etc.) can wire it in without a signature
+// change. A prior attempt to use UA directly for a
+// `readfirstlane`-in-chain allow-gate was shown unsound under
+// modulo-replication (pre-rewrite UA sees `amdgcn.readlane` as
+// `AlwaysUniform`, but the rewrite lowers it to a source-wave-scoped
+// `ds_bpermute` whose result is MODREP-replica-divergent — so a
+// pre-rewrite UA verdict does not survive the rewrite), so no such
+// refinement is active today.
 CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
-    llvm::Function &F, unsigned sourceWaveSize, unsigned targetWaveSize);
+    llvm::Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
+    llvm::TargetMachine *TM = nullptr);
 
 } // namespace transpiler
 
