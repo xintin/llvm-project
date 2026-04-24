@@ -92,8 +92,14 @@ ArrayRef<SemOpAttrSpec> getHandlerSOP2Attrs() {
 //     one source is VCC.
 static llvm::Value *tryGetSrcWaveMaskI1(RaiseContext &ctx, OpResolver &op,
                                          unsigned i) {
-  if (!op.isSrcReg(i))
-    return nullptr;
+  if (!op.isSrcReg(i)) {
+    // Immediate / expr operands still denote source-width scalar wave masks in
+    // SOP2 mask algebra (e.g. `s_xor_b32 sN, sMask, -1`). Lift them through
+    // the same source->exec widening path and extract the per-lane bit so
+    // shadow propagation can preserve full wave-width i1 semantics.
+    llvm::Value *mask = op.srcExecWidth(i);
+    return ctx.projection.extractLaneBitFromWaveMask(ctx.B, mask);
+  }
   ParsedReg pr = op.srcReg(i);
   switch (pr.kind) {
   case ParsedReg::SGPR: {

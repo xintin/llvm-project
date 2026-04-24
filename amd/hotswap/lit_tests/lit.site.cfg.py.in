@@ -943,6 +943,12 @@ config.fixtures = {
     # overwritten by the sentinel).
     "v_cmp_cndmask_sgpr_scalar_clobber":
         r"@LIT_FIXTURE_V_CMP_CNDMASK_SGPR_SCALAR_CLOBBER_CO@",
+    # s_xor_imm_mask_shadow — regression fence for SOP2 immediate-source
+    # mask propagation (`s_xor_b32 sN, sN, -1`) feeding SGPR-conditioned
+    # `v_cndmask_b32_e64`. Pins that the derived per-lane i1 shadow is kept
+    # through the immediate inversion step (no fallback extract chain).
+    "s_xor_imm_mask_shadow":
+        r"@LIT_FIXTURE_S_XOR_IMM_MASK_SHADOW_CO@",
     # v_cmp_cndmask_sgpr_class — class-compare companion to
     # `v_cmp_cndmask_sgpr`. Same direct-i1 shadow path contract
     # but the producer is `v_cmp_class_f32_e64` (FP IEEE-class

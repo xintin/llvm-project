@@ -103,6 +103,9 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   topk_forward_bisect_m2_trace \
                   topk_forward_bisect_m2_trace_iters \
                   topk_forward_bisect_m2_trace_i2_parts \
+                  topk_forward_bisect_m2_cmp_probe \
+                  topk_forward_bisect_m2_invsub_probe \
+                  topk_forward_bisect_m2_bitop3_nosel_probe \
                   topk_forward_bisect_m2_bitop3_probe \
                   canary_tl_topk_bf16 \
                   canary_tl_topk_bf16_nw1 \
@@ -117,6 +120,7 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   canary_cmp_materialize_eq_select_fp32_n16_nw2_r32 \
                   canary_cmp_materialize_eq_select_fp32_n16_nw2_r64 \
                   canary_cmp_materialize_eq_select_fp32_n16_nw8_r32 \
+                  canary_cmp_invsub_u32 \
                   canary_v_and_or_laneexpr_u32_nw2_r32 \
                   canary_tl_sort_fp32_n16_deterministic \
                   canary_tl_sort_fp32_n16_xor1 \
