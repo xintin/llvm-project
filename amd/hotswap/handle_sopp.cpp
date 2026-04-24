@@ -95,6 +95,44 @@ HandlerResult handleSOPP(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+
+  // gfx1250 async-memory wait counters. Explicit arm (rather than
+  // falling through to the generic SOPP no-op catch-all below) so
+  // this handler's surface documents the async/tensor cross-target
+  // correctness argument alongside the other SOPP branches.
+  //
+  // Both counters track work in dedicated gfx1250 hardware units
+  // (`ASYNCcnt`, `TENSORcnt`; programming_manual.pdf §4.9.9 and
+  // §6 respectively) that do not exist on gfx942.  The source DMAs
+  // they gate are emulated as synchronous `load`+`store` chains on
+  // the cross-target arm (see `handle_flat.cpp`'s
+  // `GLOBAL_LOAD_ASYNC_TO_LDS_B*` handler and `handle_vimage.cpp`'s
+  // refusal → future emulation for TENSOR ops), so by the time the
+  // wait site is reached the underlying memory transfer has
+  // already completed at the IR level.  IR dataflow from the
+  // emulated `store` through subsequent LDS reads carries the
+  // happens-before the native counter was enforcing; the backend
+  // re-inserts the target-appropriate `s_waitcnt lgkmcnt(0)` on
+  // gfx942 from that ordering constraint.
+  //
+  // On the same-target arm (gfx1250 → gfx1250) this branch is
+  // still a no-op — like `S_WAITCNT` / `S_WAIT_LOADCNT` / the
+  // other wait counters handled by the generic catch-all, the
+  // async intrinsic's `IntrInaccessibleMemOrArgMemOnly`
+  // annotation prevents reorder across the wait site and the
+  // backend re-emits the native `s_wait_asynccnt` /
+  // `s_wait_tensorcnt` from the IR's load/store dataflow.  The
+  // two arms are therefore emission-identical; the explicit
+  // branch is a documentation / audit anchor, not a dispatch
+  // split.  See the `S_WAIT_ASYNCCNT` / `S_WAIT_TENSORCNT` SemOp
+  // doc block in `semop.hpp` and `sync-translation.md §5.2.b`
+  // for the full trade-off and the dependency on IR-level
+  // ordering.
+  if (sop == SemOp::S_WAIT_ASYNCCNT || sop == SemOp::S_WAIT_TENSORCNT) {
+    hr.handled = true;
+    return hr;
+  }
+
   // All other SOPP instructions (waitcnt, nop, etc.) are no-ops
   hr.handled = true;
   return hr;

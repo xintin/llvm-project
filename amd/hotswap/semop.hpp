@@ -16,6 +16,37 @@ enum class SemOp : uint16_t {
   S_CBRANCH_VCCZ, S_CBRANCH_VCCNZ,
   S_CBRANCH_EXECZ, S_CBRANCH_EXECNZ,
   S_WAITCNT, S_WAIT_LOADCNT, S_WAIT_KMCNT, S_WAIT_DSCNT, S_WAIT_XCNT,
+  // gfx1250 async-memory wait counters. `S_WAIT_ASYNCCNT` is the
+  // companion barrier for the `GLOBAL_LOAD_ASYNC_TO_LDS_B*` family
+  // below (and `DS_ATOMIC_ASYNC_BARRIER_ARRIVE_B64`); `S_WAIT_TENSORCNT`
+  // is the companion for `TENSOR_LOAD_TO_LDS` / `TENSOR_STORE_FROM_LDS`.
+  // Both track dependency counters that do not exist on gfx942 (no
+  // `ASYNCcnt` / `TENSORcnt` hardware) — the raiser lowers them as
+  // no-ops on every target:
+  //
+  //   * On gfx942 (cross-target): the source async DMA is emulated
+  //     as a synchronous `load`+`store` chain that has already
+  //     completed by the time the wait is reached. IR dataflow from
+  //     the emulated `store` through subsequent LDS reads carries
+  //     the happens-before; the backend re-inserts an `s_waitcnt
+  //     lgkmcnt(0)` before the reader. See the
+  //     `GLOBAL_LOAD_ASYNC_TO_LDS_B*` SemOp doc block for the full
+  //     trade-off argument.
+  //   * On gfx1250 (same-target): like every other wait counter in
+  //     `handle_sopp.cpp`, the raiser relies on LLVM's memory model
+  //     to re-emit the native wait from the IR's load/store
+  //     ordering.  The async intrinsic's
+  //     `IntrInaccessibleMemOrArgMemOnly` annotation prevents
+  //     reorder across the wait site, so the backend re-derives the
+  //     correct `s_wait_asynccnt` / `s_wait_tensorcnt` from that
+  //     scheduling constraint.
+  //
+  // Declared here (rather than inlined as a generic SOPP no-op) so
+  // that the opcode_map canonicalisation is explicit and a future
+  // reviewer touching the async family can grep
+  // `S_WAIT_ASYNCCNT` and find both the SemOp, its opcode_map
+  // entry, and the handler's no-op arm in one pass.
+  S_WAIT_ASYNCCNT, S_WAIT_TENSORCNT,
   S_WAIT_LOADCNT_DSCNT, S_WAIT_ALU,
   S_CLAUSE, S_DELAY_ALU, S_SET_GPR_IDX_ON, S_SET_GPR_IDX_OFF, S_SETVSKIP,
   // Barriers. GFX12+ splits s_barrier into signal + wait; earlier ISAs emit a
@@ -943,13 +974,82 @@ enum class SemOp : uint16_t {
   // The asynccnt unit and `int_amdgcn_global_load_async_to_lds_b*`
   // are gfx1250-only (`SubtargetPredicate = isGFX1250Plus` on the
   // VFLAT reals, `FeatureGFX1250Insts`). gfx942 has no asynchronous
-  // global→LDS DMA channel and no equivalent burst path. Refusing
-  // loudly via `RaiseFailure::unsupportedShape` is the only honest
-  // option; a synthesised synchronous global_load + ds_write pair
-  // would change the wave's memory-ordering and asynccnt observable
-  // state, which is exactly what gfx1250 producers (e.g. tensilelite
-  // f8 / bf16 GEMMs and triton block-pipelined matmul kernels) rely
-  // on for software pipelining.
+  // global→LDS DMA channel and no equivalent burst path.
+  //
+  // We emit a **synchronous per-lane emulation**: for each active
+  // lane, `load <T>, ptr addrspace(1) %gptr` followed by
+  // `store <T>, ptr addrspace(3) %lptr`, width `T` chosen per the
+  // b8 / b32 / b64 / b128 SemOp. The source ISA pragma
+  // (`instruction_manual.pdf §13.6.{9,10,11,12}`, verbatim):
+  //
+  //   pragma "vector" do
+  //     dsaddr  = LDS_BASE.b32 + VGPR[laneId][VDST.u32] + INST_OFFSET.b32;
+  //     memaddr = ADDR;  // CalcGlobalAddr(VADDR, SADDR, IOFFSET)
+  //     LDS[dsaddr].bN = MEM[memaddr].bN   // (N = 8/32/64/128)
+  //   endpragma
+  //
+  // — a per-lane global→LDS copy, width-parametric, identical in
+  // every respect to what the synchronous `load` + `store` pair
+  // produces *per lane*. `INST_OFFSET` applies to BOTH the LDS
+  // address and the global address (confirmed by the explicit
+  // appearance in the `dsaddr` expression and by `CalcGlobalAddr`
+  // folding `IOFFSET` into `memaddr`); the emulation folds it onto
+  // both pointers via `i8`-GEP before the `load`/`store`, matching
+  // the same-target intrinsic's immarg behaviour.
+  //
+  // === Documented semantic trade-off ===
+  //
+  // The async intrinsic carries `IntrInaccessibleMemOrArgMemOnly`
+  // and the hardware schedules the DMA against a dedicated counter
+  // (`ASYNCcnt`; `programming_manual.pdf §4.9.9`). Completion is
+  // signalled via `S_WAIT_ASYNCCNT`. The same aggregate
+  // observable per-lane LDS state is produced by a synchronous
+  // `load`+`store` chain AFTER the corresponding `s_wait_asynccnt
+  // 0`; the ONLY information lost in the emulation is the
+  // **pipelining overlap** between in-flight async DMAs and
+  // unrelated VMEM / LDS operations in the wave's own stream. On
+  // gfx1250 the DMA unit can fire while the wave's ALU path runs;
+  // the synchronous emulation blocks the wave until the global
+  // `load` retires before the `store` publishes the data to LDS.
+  //
+  // This is a **throughput regression, not a correctness
+  // regression** — every lane's final LDS state is bit-identical
+  // to the async version's state observed after
+  // `s_wait_asynccnt 0`. Kernels that depend on *observable
+  // effects under a partially-elapsed asynccnt* (e.g., a
+  // hand-written pipeliner polling asynccnt state out of the wave's
+  // instruction stream — not a pattern LLVM IR can express anyway)
+  // are NOT in the GPT-OSS corpus and remain explicitly out of
+  // scope. The GPT-OSS MoE expert-GEMM kernels (`matmul_ogs_*`)
+  // use the async DMA as a compiler-scheduled prefetch-into-LDS
+  // whose only user-visible contract is "data lands in LDS before
+  // the subsequent `s_wait_asynccnt 0` + `ds_read_*` chain reads
+  // it" — which the synchronous emulation preserves exactly.
+  //
+  // Companion `S_WAIT_ASYNCCNT` SemOp (declared above) lowers to a
+  // raiser-level no-op on the cross-target arm: the synchronous
+  // `load`+`store` pair has already completed by the time the wait
+  // is reached, so the native wait has nothing to track.  Dataflow
+  // dependencies from the emulated `store` through subsequent LDS
+  // reads carry the happens-before the source kernel relied on, and
+  // the gfx942 backend re-inserts the `s_waitcnt lgkmcnt(0)` before
+  // the reader.  On the same-target arm, `S_WAIT_ASYNCCNT` is still
+  // a no-op at the raiser (like every other wait counter, per
+  // `handle_sopp.cpp`): the intrinsic's
+  // `IntrInaccessibleMemOrArgMemOnly` annotation prevents reorder
+  // across the wait site, and the backend re-emits the native
+  // `s_wait_asynccnt` from that IR-level ordering.
+  //
+  // Rationale for preferring a documented emulation over the
+  // previous loud refusal: every `matmul_ogs_*` variant in the
+  // GPT-OSS MoE expert-GEMM surface (4 kernels, runtime-dominant
+  // in inference) hits this opcode and was blocked end-to-end.
+  // The `matmul_fp16` / `matmul_fp16_16x16` path — the shared MFMA
+  // fragment redistribution surface — already works; unblocking the
+  // MoE GEMM was the single highest-impact change. The trade-off
+  // is scoped and documented, not hidden, and matches the posture
+  // the sibling TDM axis takes in `sync-translation.md §10` ("TDM
+  // emulation lowers to synchronous buffer loads").
   GLOBAL_LOAD_ASYNC_TO_LDS_B8,
   GLOBAL_LOAD_ASYNC_TO_LDS_B32,
   GLOBAL_LOAD_ASYNC_TO_LDS_B64,

@@ -308,47 +308,95 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
   //
   // Operand layout from `FLAT_Global_Load_LDS_Pseudo<…, IsAsync=1>`
   // (FLATInstructions.td:391-417) is identical across all four widths
-  // (only the data byte size — and so the intrinsic ID — varies):
+  // (only the data byte size — and so the intrinsic ID / per-lane load
+  // type — varies):
   //
   //   plain (4 srcs): vdst:VGPR_32, vaddr:VGPR_64,            offset, cpol
   //   SADDR (5 srcs): vdst:VGPR_32, saddr:SReg_64, vaddr:VGPR_32, offset, cpol
   //
   // `vdst` is in the *input* list (because `has_vdst = IsAsync = 1`)
-  // and carries the per-lane LDS i32 base offset. The intrinsics
+  // and carries the per-lane LDS i32 base offset. The same-target
+  // arm lowers to
   // `int_amdgcn_global_load_async_to_lds_b{8,32,64,128}`
-  // (IntrinsicsAMDGPU.td:3939-3946) all share signature
-  // `AMDGPUAsyncGlobalLoadToLDS` (line 3904) and consume the LDS
-  // pointer as `local_ptr_ty`, so we materialise it via `inttoptr i32
-  // → ptr addrspace(3)`. Each lane fires its own write so the call
-  // is wrapped in `emitUnderExec`; the intrinsic's
-  // `IntrInaccessibleMemOrArgMemOnly` attribute keeps later passes
-  // from sinking it across companion `s_wait_asynccnt` barriers.
+  // (IntrinsicsAMDGPU.td:3939-3946, all sharing the
+  // `AMDGPUAsyncGlobalLoadToLDS` signature on line 3904), which
+  // consumes the LDS pointer as `local_ptr_ty` — materialised via
+  // `inttoptr i32 → ptr addrspace(3)`. The cross-target arm emits a
+  // synchronous per-lane `load <T> + store <T>` pair against the
+  // same decoded operands; see the `GLOBAL_LOAD_ASYNC_TO_LDS_B*`
+  // SemOp doc block in `semop.hpp` for the correctness argument and
+  // the documented semantic trade-off (loss of pipelining overlap,
+  // NOT of per-lane LDS state).
   //
-  // gfx942 has no asynchronous global→LDS DMA channel, so a cross-
-  // target lift (gfx1250 → gfx942) is refused loudly. See the
-  // SemOp's docstring in `semop.hpp` for the design rationale.
+  // Operand parsing is shared between the two arms so any shape
+  // that lifts on gfx1250 lifts identically on gfx942, modulo the
+  // emission tail. The ISA source-of-truth pragma
+  // (`instruction_manual.pdf §13.6.9-12`, verbatim — identical
+  // across all four widths except the LDS-store width):
+  //
+  //   pragma "vector" do
+  //     dsaddr  = LDS_BASE.b32 + VGPR[laneId][VDST.u32] + INST_OFFSET.b32;
+  //     memaddr = ADDR;  // CalcGlobalAddr(VADDR, SADDR, IOFFSET)
+  //     LDS[dsaddr].bN = MEM[memaddr].bN   // (N = 8/32/64/128)
+  //   endpragma
+  //
+  // Key observations the emulation relies on:
+  //   * `INST_OFFSET` is applied to BOTH the LDS address and the
+  //     global address. The same-target intrinsic takes `offset` as
+  //     a single immarg and the backend re-folds it onto both the
+  //     computed dsaddr AND the memaddr during isel; the
+  //     cross-target emulation reaches the same effect explicitly
+  //     by GEP'ing the offset onto both pointers before the
+  //     load/store pair.
+  //   * `pragma "vector" do` runs the body per-active-lane. Both
+  //     arms wrap in `emitUnderExec` so inactive lanes skip the
+  //     entire memory round-trip (matches hardware EXEC gating).
   if (sop == SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B8 ||
       sop == SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B32 ||
       sop == SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B64 ||
       sop == SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B128) {
-    if (!ctx.targetIsa.hasTensorOps) {
-      llvm::errs()
-          << "transpiler: FLAT: " << di.mnemonic
-          << " has no equivalent on the compilation target "
-          << "(gfx1250 asynccnt unit; LLVM intrinsic "
-          << "amdgcn.global.load.async.to.lds.b{8,32,64,128} is gated "
-          << "by FeatureGFX1250Insts). A synthesised "
-          << "global_load + ds_write pair would alter the wave's "
-          << "memory ordering and asynccnt observable state — "
-          << "refusing to emit a fallback.\n";
-      hr.failure = RaiseFailure::unsupportedShape(
-          di, "FLAT",
-          "gfx1250-only async global→LDS DMA; no equivalent on "
-          "non-gfx1250 compilation target (no asynccnt unit, no "
-          "amdgcn.global.load.async.to.lds.b* intrinsic)");
-      return hr;
+    // ---- Width → (access type, bytes) dispatch (used by both arms) ----
+    //
+    // The ISA pragma stores per lane:
+    //   b8   →  1 byte                  (i8)
+    //   b32  →  4 bytes                 (i32)
+    //   b64  →  8 bytes  = 2  x i32     (<2 x i32>)
+    //   b128 →  16 bytes = 4  x i32     (<4 x i32>)
+    //
+    // `accessBytes` is consumed on the SADDR path for
+    // `scale_offset` (cpol bit 0x400) — the ISA specifies that the
+    // scaled-offset mode multiplies the per-lane VGPR vaddr by the
+    // access element size before adding it to the SGPR base.  The
+    // same-target arm passes cpol to the intrinsic and lets the
+    // gfx12 hardware encoding do the multiply on isel; the
+    // cross-target arm has to materialise the multiply explicitly
+    // because gfx942 has no equivalent encoding bit.  `accessTy`
+    // is only used by the cross-target arm.
+    //
+    // Larger widths are lifted as vectors of i32 (mirroring the
+    // GLOBAL_LOAD_DWORDX{2,3,4} path's handling of the same
+    // aggregate shape) rather than as a single `iN` whose natural
+    // alignment (16 B for b128) the source buffer would not
+    // necessarily satisfy — the vector type lets the backend
+    // pick a `global_load_b{64,128}` opcode with the aligned-load
+    // attribute below.
+    Type *accessTy = nullptr;
+    unsigned accessBytes = 0;
+    switch (sop) {
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B8:
+      accessTy = ctx.i8Ty; accessBytes = 1; break;
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B32:
+      accessTy = ctx.i32Ty; accessBytes = 4; break;
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B64:
+      accessTy = FixedVectorType::get(ctx.i32Ty, 2); accessBytes = 8; break;
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B128:
+      accessTy = FixedVectorType::get(ctx.i32Ty, 4); accessBytes = 16; break;
+    default:
+      llvm_unreachable("dispatch matched async-to-LDS family but width "
+                       "SemOp fell through the access-type switch");
     }
 
+    // ---- Shape validation (identical on both arms) ----
     bool isSaddr = false;
     if (op.nSrcs() == 5) {
       isSaddr = true;
@@ -386,8 +434,63 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
         return hr;
       }
       Value *saddr = ctx.regs.readReg64(ctx.B, saddrPr);
+      // `zext` (not `sext`): the ISA programming manual §4.9.9
+      // ("Instruction Fields") specifies that in the SADDR form
+      // the VGPR vaddr is an "unsigned byte offset" added to the
+      // SGPR base. The address-space decoder in `flat_addr.cpp`
+      // uses `sext` for the general GLOBAL_LOAD SADDR family — an
+      // orthogonal pre-existing inconsistency (not addressed
+      // here). We mirror the same-target arm's historical choice
+      // so same-target and cross-target emit the same effective
+      // per-lane global address; any correction to the signed/
+      // unsigned semantics should be made in one place across the
+      // whole GLOBAL_LOAD surface.
       Value *voff = ctx.B.CreateZExt(
           ctx.regs.readReg32(ctx.B, vaddrPr), ctx.i64Ty, "voff_zext");
+      // The SADDR form's address is computed as `saddr + voff` at
+      // this point, WITHOUT the `scale_offset` multiplier applied.
+      // Reasoning, one clause per arm:
+      //
+      //   Same-target (gfx1250 → gfx1250, `hasTensorOps == true`):
+      //     the intrinsic consumes cpol as an immarg that includes
+      //     the `SCAL` bit (`AMDGPU::CPol::SCAL = 0x400`); on isel
+      //     the backend matches the `saddr + voff` pattern on the
+      //     intrinsic's `%gaddr` operand AND the cpol's SCAL bit,
+      //     and emits the `global_load_async_to_lds_*_SADDR ...
+      //     scale_offset` real — the HARDWARE applies the scale on
+      //     execution.  Pre-multiplying in IR would produce
+      //     `saddr + voff * N` as the `%gaddr`, which the backend
+      //     would either (a) no longer recognise as a SADDR
+      //     pattern, falling back to the plain form with unscaled
+      //     hardware behaviour (correct but bypasses the SADDR
+      //     optimisation) or (b) match the pattern anyway and
+      //     apply SCAL on top, producing `saddr + voff * N * N`
+      //     (silent 4x / 16x / 64x miscompile).  Neither outcome
+      //     is desirable.  The same-target lit fixture
+      //     (`global_load_async_to_lds_same_target.ll`) pins the
+      //     `inttoptr i64` shape with no intervening multiply —
+      //     dropping the gate below would immediately fail that
+      //     fixture with a double-scale in IR.
+      //
+      //   Cross-target (gfx1250 → gfx942, `hasTensorOps == false`):
+      //     we emit plain `load` / `store` without an intrinsic, so
+      //     there is no backend folding to rely on; the multiply
+      //     MUST be materialised explicitly here for the lane
+      //     address to match the source's per-lane semantics.
+      //     When `hasScaleOffset` is false the multiply is elided
+      //     (no observable change in either arm), so the same
+      //     code path covers the HIP-builtin fixture's
+      //     `scale_offset` form and the corpus matmul_ogs form.
+      //
+      // Reading `di.hasScaleOffset` (the decoded typed boolean)
+      // rather than `cpolImm & AMDGPU::CPol::SCAL` keeps the
+      // classification in one place — see
+      // `decode.cpp::decodeScaleOffset` for the authoritative
+      // SCAL-bit extraction.
+      if (di.hasScaleOffset && !ctx.targetIsa.hasTensorOps)
+        voff = ctx.B.CreateMul(
+            voff, ConstantInt::get(ctx.i64Ty, accessBytes),
+            "scaled_voff");
       globalAddr = ctx.B.CreateAdd(saddr, voff, "saddr_vaddr");
       immStart = 3;
     } else {
@@ -403,6 +506,10 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
       immStart = 2;
     }
 
+    // Trailing (offset, cpol) imm pair — first imm is `flat_offset`
+    // (signed 13-bit in the encoding, already sign-extended by MC),
+    // second is `cpol` (gfx12+ cachepolicy bitfield: th, scope,
+    // scale_offset).
     int64_t flatOffset = 0;
     int64_t cpolImm = 0;
     bool sawOffset = false;
@@ -421,25 +528,98 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     if (globalPtr->getType() != ctx.ptrGlobalTy)
       globalPtr = ctx.B.CreateIntToPtr(globalPtr, ctx.ptrGlobalTy);
 
-    Intrinsic::ID iid;
-    switch (sop) {
-    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B8:
-      iid = Intrinsic::amdgcn_global_load_async_to_lds_b8; break;
-    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B32:
-      iid = Intrinsic::amdgcn_global_load_async_to_lds_b32; break;
-    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B64:
-      iid = Intrinsic::amdgcn_global_load_async_to_lds_b64; break;
-    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B128:
-      iid = Intrinsic::amdgcn_global_load_async_to_lds_b128; break;
-    default:
-      llvm_unreachable("dispatch matched async-to-LDS family but width SemOp "
-                       "fell through the switch");
+    // ---- Per-arm emission ----
+    if (ctx.targetIsa.hasTensorOps) {
+      // Same-target (gfx1250 → gfx1250): emit the native intrinsic
+      // directly; `IntrInaccessibleMemOrArgMemOnly` on the
+      // intrinsic prevents downstream passes from CSEing or
+      // reordering the asynchronous fetch across companion
+      // `s_wait_asynccnt` / `s_wait_tensorcnt` barriers.
+      Intrinsic::ID iid;
+      switch (sop) {
+      case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B8:
+        iid = Intrinsic::amdgcn_global_load_async_to_lds_b8; break;
+      case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B32:
+        iid = Intrinsic::amdgcn_global_load_async_to_lds_b32; break;
+      case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B64:
+        iid = Intrinsic::amdgcn_global_load_async_to_lds_b64; break;
+      case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B128:
+        iid = Intrinsic::amdgcn_global_load_async_to_lds_b128; break;
+      default:
+        llvm_unreachable("dispatch matched async-to-LDS family but width SemOp "
+                         "fell through the switch");
+      }
+      Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
+      Value *offsetArg = ConstantInt::get(ctx.i32Ty, flatOffset);
+      Value *cpolArg = ConstantInt::get(ctx.i32Ty, cpolImm);
+      ctx.emitUnderExec([&] {
+        ctx.B.CreateCall(fn, {globalPtr, ldsPtr, offsetArg, cpolArg});
+      });
+      hr.handled = true;
+      return hr;
     }
-    Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid);
-    Value *offsetArg = ConstantInt::get(ctx.i32Ty, flatOffset);
-    Value *cpolArg = ConstantInt::get(ctx.i32Ty, cpolImm);
+
+    // Cross-target (gfx942 and earlier): synchronous per-lane
+    // emulation.  See the SemOp doc block in `semop.hpp` for the
+    // trade-off argument (throughput regression via loss of async
+    // pipelining overlap; per-lane final LDS state identical to
+    // the source's state observed after `s_wait_asynccnt 0`).
+    //
+    // Apply `flat_offset` to BOTH pointers via i8-GEP before the
+    // load/store (matching the ISA pragma's
+    // `dsaddr = ... + INST_OFFSET` AND `memaddr = CalcGlobalAddr(
+    // ..., IOFFSET)` — the same-target intrinsic folds both onto
+    // the operand bank via its `offset` immarg; the cross-target
+    // emulation materialises the GEP chains instead).
+    //
+    // Non-inbounds GEP because the ISA's signed 13-bit
+    // `flat_offset` can legitimately leave the nominal allocation
+    // (negative strides, compiler-scheduled prefetches), same
+    // convention as `flat_addr.cpp::toGlobalPtr`.  Zero offsets
+    // are elided to keep the IR shape compact when the immediate
+    // is unused — which is the common case in the observed
+    // corpus.
+    Value *emuGlobalPtr = globalPtr;
+    Value *emuLdsPtr = ldsPtr;
+    if (flatOffset != 0) {
+      emuGlobalPtr = ctx.B.CreateGEP(ctx.i8Ty, emuGlobalPtr,
+                                      ctx.B.getInt64(flatOffset),
+                                      "async_gptr_off");
+      emuLdsPtr = ctx.B.CreateGEP(ctx.i8Ty, emuLdsPtr,
+                                   ctx.B.getInt64(flatOffset),
+                                   "async_lptr_off");
+    }
+
+    // cpol (gfx12+ cachepolicy bits: th, scope, scale_offset) has
+    // no direct gfx942 equivalent.  The `scale_offset` bit has
+    // already been materialised into the `saddr_vaddr` address
+    // above via the `di.hasScaleOffset` branch (the gate is
+    // `!hasTensorOps` so the same-target arm's intrinsic-driven
+    // base is untouched).  The remaining bits (`th` temporal
+    // hint, `scope` CU/DEV/SYS) are target-level tuning hints
+    // without a gfx942 encoding — the backend re-derives cache
+    // behaviour from the IR's `load` / `store` ordering (default
+    // semantics = unordered).  Dropping them is the same posture
+    // that `sync-translation.md §5.3` takes for atomic scope
+    // recovery on pre-gfx12 targets when the decoded modifiers
+    // have no representable mapping.  The value is read only to
+    // avoid an unused-variable warning in release builds.
+    (void)cpolImm;
+
+    // Natural alignment for the access. The ISA pragma requires
+    // N-byte aligned accesses (no sub-element strides), so each
+    // access is aligned to `accessBytes`. The backend's
+    // alignment-derived codegen pass picks the appropriate
+    // `global_load_b{8,32,64,128}` (CDNA3 naming:
+    // `global_load_{ubyte,dword,dwordx2,dwordx4}`) and
+    // `ds_store_b{8,32,64,128}` opcodes from that alignment.
+    Align accessAlign(accessBytes);
+
     ctx.emitUnderExec([&] {
-      ctx.B.CreateCall(fn, {globalPtr, ldsPtr, offsetArg, cpolArg});
+      Value *loaded = ctx.B.CreateAlignedLoad(accessTy, emuGlobalPtr,
+                                               accessAlign,
+                                               "async_gload");
+      ctx.B.CreateAlignedStore(loaded, emuLdsPtr, accessAlign);
     });
 
     hr.handled = true;

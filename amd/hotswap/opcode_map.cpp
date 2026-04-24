@@ -91,6 +91,19 @@ static const Entry kCanonTable[] = {
     E(S_WAIT_KMCNT, S_WAIT_KMCNT),
     E(S_WAIT_DSCNT, S_WAIT_DSCNT),
     E(S_WAIT_XCNT, S_WAIT_XCNT),
+    // gfx1250 async-memory wait counters. Canonicalised here (not
+    // left as `SemOp::Unknown`) so that:
+    //   * the raiser's generic `Unsupported instruction` diagnostic
+    //     doesn't fire on these wait sites when the companion
+    //     async DMA / TENSOR op has been emulated or lifted; and
+    //   * `handle_sopp.cpp`'s generic SOPP no-op arm explicitly
+    //     covers them.
+    // See the `S_WAIT_ASYNCCNT` / `S_WAIT_TENSORCNT` SemOp doc
+    // block in `semop.hpp` for the cross-target correctness
+    // argument (IR dataflow carries happens-before after the
+    // synchronous `load`+`store` emulation completes).
+    E(S_WAIT_ASYNCCNT, S_WAIT_ASYNCCNT),
+    E(S_WAIT_TENSORCNT, S_WAIT_TENSORCNT),
     E(S_WAIT_LOADCNT_DSCNT, S_WAIT_LOADCNT_DSCNT),
     E(S_WAITCNT_DEPCTR, S_WAIT_ALU),
     E(S_CLAUSE, S_CLAUSE),
