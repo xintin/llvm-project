@@ -1,4 +1,5 @@
 #include "handlers.hpp"
+#include "pipeline.hpp" // isStrictMode()
 
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/Debug.h"
@@ -100,13 +101,102 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     bool isKernarg = (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
                       base.baseIdx == kernargPtrSgpr);
 
+    // The kernarg-slot fast path routes `isKernarg && immOffset` loads
+    // through `extractKernargDword` — reading the IR-level kernel
+    // argument directly rather than dereferencing the SGPR pair. That
+    // pair's alloca was seeded with a null sentinel at kernel entry
+    // (raiser.cpp Phase 4), so the dynamic path through the SGPR value
+    // is not a valid pointer. The fast path is therefore the *only*
+    // correct lowering when the pair's sbase is the kernarg pointer.
+    //
+    // When the kernel has shifted the pair by a const delta before the
+    // load (Tensile UniversalArgs: `s_add_u32 ka, ka, 0x10 ; s_addc_u32
+    // ka+1, ka+1, 0` ahead of the downstream kernarg fetches), the
+    // raiser's post-handler tracker (RaiseContext::KernargPtrDelta)
+    // records that delta so we can thread it through the fast path
+    // here. Issue #21 is the miscompile this plumbing closes: without
+    // the delta, the shifted load was extracting from the entry-time
+    // offsets, silently pulling the wrong kernarg bytes into the
+    // destination SGPRs.
+    //
+    // Refusal invariants (all loud via RaiseFailure::smemKernargMiss):
+    //
+    //  (a) `isKernarg && !delta.valid` — the pair has been clobbered in
+    //      a way the tracker cannot describe as a single 64-bit const
+    //      delta (non-canonical-shape write, overlapping write,
+    //      cross-BB merge with divergent predecessors). The sentinel-
+    //      null IR pointer cannot rescue the load, and inventing a
+    //      "best guess" offset would silently miscompile. Refuse and
+    //      require the pipeline to confront the mutation explicitly.
+    //
+    //  (b) `isKernarg && delta.pendingLow` — half-committed 64-bit
+    //      add (low dword has been advanced but the complementary
+    //      S_ADDC_U32 has not fired yet). Refusing here is how the
+    //      handler signals that the carry plumbing is mid-torn; the
+    //      post-handler hook will either commit or invalidate on the
+    //      NEXT instruction, but THIS instruction (the SMEM load in
+    //      between) cannot be served correctly either way. In
+    //      practice the Tensile preamble shape never inserts an SMEM
+    //      load between the `s_add_u32 lo` and the
+    //      `s_addc_u32 hi, hi, 0`, so this branch is defensive.
+    //
+    //  (c) `isKernarg && !immOffset` — dynamic (SGPR-valued) SMEM
+    //      offset through the kernarg pointer. `extractKernargDword`
+    //      requires a compile-time offset to pick the matching IR
+    //      argument. No kernel in the kerneldex corpus exercises this
+    //      shape; refuse rather than silently substitute zero.
+    int64_t effectiveByteOffset = byteOffset;
+    if (isKernarg) {
+      if (ctx.kernargPtrDelta.pendingLow) {
+        llvm::errs()
+            << "transpiler: " << di.mnemonic
+            << ": kernarg-pair SGPR is mid-64-bit-add (S_ADD_U32 on low "
+               "staged, S_ADDC_U32 on high not yet committed); the SMEM "
+               "load sees a torn pointer value — refuse loudly rather "
+               "than extract from a half-updated 64-bit address\n";
+        hr.failure = RaiseFailure::smemKernargMiss(di);
+        return hr;
+      }
+      if (!ctx.kernargPtrDelta.valid) {
+        llvm::errs()
+            << "transpiler: " << di.mnemonic
+            << ": kernarg-pair SGPR (s[" << kernargPtrSgpr << ":"
+            << (kernargPtrSgpr + 1)
+            << "]) has been modified in a way the raiser cannot fold to a "
+               "64-bit constant delta from entry (e.g. non-canonical "
+               "s_add/s_addc pairing, cross-BB merge with divergent "
+               "predecessors, overwrite via s_mov_b32 or s_load_b64 "
+               "through a different base). Extracting from the kernarg "
+               "slot table using the load's immediate offset alone would "
+               "silently miscompile (this is issue #21). The sentinel-null "
+               "IR value in the SGPR alloca cannot rescue the dynamic "
+               "path either — refuse instead of falling through\n";
+        hr.failure = RaiseFailure::smemKernargMiss(di);
+        return hr;
+      }
+      if (!immOffset) {
+        llvm::errs()
+            << "transpiler: " << di.mnemonic
+            << ": dynamic (SGPR) SMEM offset against the kernarg pointer "
+               "cannot be resolved to a static kernarg slot; the "
+               "extractKernargDword interface requires a compile-time "
+               "byte offset\n";
+        hr.failure = RaiseFailure::smemKernargMiss(di);
+        return hr;
+      }
+      effectiveByteOffset = ctx.kernargPtrDelta.delta + byteOffset;
+    }
+
     LLVM_DEBUG(if (isKernarg && immOffset) {
       llvm::dbgs() << "transpiler: SMEM: mn=" << di.mnemonic
                    << " raw=" << di.rawMnemonic << " full=\"" << di.fullText
-                   << "\" off=" << byteOffset << "\n";
+                   << "\" off=" << byteOffset
+                   << " delta=" << ctx.kernargPtrDelta.delta
+                   << " effective=" << effectiveByteOffset << "\n";
     });
 
-    if (isKernarg && immOffset && byteOffset < ctx.kernargs.implicitArgsBase) {
+    if (isKernarg && immOffset &&
+        effectiveByteOffset < ctx.kernargs.implicitArgsBase) {
       // Materialise the load one dword at a time. Per-dword extraction
       // is the only shape that handles every kernarg layout we see in
       // the corpus uniformly:
@@ -134,15 +224,26 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
       // any change to this loop or to `extractKernargDword` in
       // kernarg_layout.cpp must keep that fixture's IR signature
       // and `phi i32 [ %arg{1,2}, ... ]` data-flow pins green.
+      //
+      // Delta-aware kernarg offset. `effectiveByteOffset` folds in the
+      // const-delta accumulated by the post-handler tracker (see
+      // `RaiseContext::KernargPtrDelta`); when the kernel never mutated
+      // the kernarg pair, `delta == 0` and the fast path behaves
+      // identically to pre-fix. The Tensile UniversalArgs case (delta
+      // != 0) now correctly extracts from `delta + imm` instead of
+      // from `imm` alone.
       for (int d = 0; d < loadDwords; ++d) {
-        int dwordOffset = (int)byteOffset + d * 4;
+        int dwordOffset = (int)effectiveByteOffset + d * 4;
         std::string why;
         Value *v = extractKernargDword(ctx.kernargs, ctx.B, ctx.kernel,
                                        dwordOffset, &why);
         if (!v) {
           llvm::errs() << "transpiler: " << di.mnemonic
                        << " kernarg load loadBytes=" << loadBytes
-                       << " byteOffset=" << byteOffset << " dword=" << d
+                       << " byteOffset=" << byteOffset
+                       << " delta=" << ctx.kernargPtrDelta.delta
+                       << " effectiveByteOffset=" << effectiveByteOffset
+                       << " dword=" << d
                        << " (offset=" << dwordOffset << "): " << why << "\n";
           hr.failure = RaiseFailure::smemKernargMiss(di);
           return hr;
@@ -150,7 +251,14 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
         ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d, v);
       }
     } else if (isKernarg && immOffset) {
-      int implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
+      if (isStrictMode()) {
+        hr.failure = RaiseFailure::strictUnsafeLowering(
+            di, "implicitarg.ptr",
+            "cross-arch implicitarg.ptr lowering is unresolved: source implicit-arg "
+            "offsets are being applied to the target runtime hidden-arg block");
+        return hr;
+      }
+      int implOffset = effectiveByteOffset - ctx.kernargs.implicitArgsBase;
       LLVM_DEBUG(llvm::dbgs() << "transpiler: implicit kernarg load: byteOffset="
                               << byteOffset
                               << " implicitArgsBase=" << ctx.kernargs.implicitArgsBase

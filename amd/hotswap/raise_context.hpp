@@ -13,7 +13,9 @@
 #include "wave_projection.hpp"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCRegister.h"
@@ -62,6 +64,163 @@ struct RaiseContext {
   // setpc_analysis.hpp for the full contract; see semop.hpp's
   // `S_SET_PC_I64` doc for the lowering shapes.
   const SetPcAnalysis *setpcAnalysis = nullptr;
+
+  // ====== Kernarg pointer const-delta tracker ==========================
+  //
+  // The source-ABI kernarg pointer lives in an SGPR pair
+  // (`userSgprLayout->kernargSegmentPtrSgpr` = low dword; the high dword
+  // is the next SGPR index). The kernel code object owns that pair at
+  // entry, and `handle_smem.cpp` routes `s_load_b*` loads whose sbase is
+  // that pair through `extractKernargDword` — reading the matching
+  // IR-level kernel argument directly instead of dereferencing the
+  // pointer. That works as long as the pair still points at the kernarg
+  // segment at the load site.
+  //
+  // Tensile's UniversalArgs ABI breaks that invariant: it adds a small
+  // constant (typically 16 bytes) to the pair to skip a preamble before
+  // issuing the downstream kernarg reads. Without this tracker,
+  // handle_smem.cpp would route the shifted load through
+  // `extractKernargDword(imm_offset)` and silently pull kernarg bytes
+  // from offset 0 instead of offset 16 — the issue-21 miscompile.
+  //
+  // This tracker records the accumulated constant 64-bit delta from the
+  // kernarg-pair entry value within a single basic block. The only
+  // pattern it recognises is the canonical 64-bit const-add:
+  //
+  //     s_add_u32  s[ka],   s[ka],   #K      ; low dword += K, SCC = carry
+  //     s_addc_u32 s[ka+1], s[ka+1], #0      ; high dword += 0 + carry
+  //
+  // Any other write to either dword of the pair invalidates the tracker,
+  // and handle_smem.cpp refuses the kernarg-slot fast path when the
+  // tracker is invalid (no silent fallback to reading the clobbered SGPR
+  // value, which was seeded with a null sentinel in raiser.cpp's
+  // Phase 4 and would silently miscompile).
+  //
+  // Lifetime: reset to `(delta=0, valid=true)` at the kernel entry BB and
+  // invalidated (`valid=false`) at every BB boundary in the raiser's
+  // main loop. The pair's const-delta-from-entry is a single-BB property:
+  // tracking it across a CFG merge would require phi reasoning over two
+  // possibly-different deltas (e.g. Tensile's NORMAL vs HBM branches
+  // both end at `label_LoadArgsEnd` with different kernarg-pair values).
+  // The single-BB scope is sufficient to fix the dominant NORMAL-path
+  // miscompile without opening that can of worms.
+  //
+  // State machine (updated in raiser.cpp's post-handler hook after every
+  // successfully-raised instruction that writes one of the kernarg-pair
+  // dwords):
+  //
+  //   valid=true,  pendingLow=false  (initial / post-commit)
+  //     on S_ADD_U32(lo, lo, #K):           stage pendingLowDelta=K,
+  //                                          pendingLow=true
+  //     on write to lo (other shape):       valid=false
+  //     on write to hi:                     valid=false
+  //
+  //   valid=true,  pendingLow=true
+  //     on S_ADDC_U32(hi, hi, #0):          commit delta += pendingLowDelta,
+  //                                          pendingLow=false
+  //     anything else writing lo/hi:        valid=false
+  //     anything else writing SCC:          valid=false, pendingLow=false
+  //       (SCC is the carry input to s_addc_u32; if an intervening
+  //        instruction clobbers SCC the pair's high-dword add would
+  //        carry a stale bit, breaking the 64-bit semantics.)
+  //
+  //   valid=false  (terminal for the BB)
+  //     no transitions; BB boundary resets to (delta=0, valid=false).
+  //     Entry BB resets to (delta=0, valid=true).
+  //
+  // The high-dword immediate MUST be exactly 0 for the pattern to fold
+  // to a single 64-bit delta: `lo + K` with `hi + 0 + carry_out` is the
+  // standard 64-bit extended-precision add only when the high-dword's
+  // additive term is zero. Any non-zero high immediate would change the
+  // high half by more than the low carry and would not fold to a clean
+  // 64-bit const delta.
+  struct KernargPtrDelta {
+    // Accumulated 64-bit const delta from the kernarg-pair entry value.
+    // Meaningful only when `valid` is true and `pendingLow` is false.
+    int64_t delta = 0;
+    // Whether `delta` accurately reflects the pair's current value
+    // (modulo the 64-bit low/high add semantics above).
+    bool valid = true;
+    // Low dword has been advanced by `pendingLowDelta`; high dword has
+    // not yet been matched by the complementary S_ADDC_U32(hi, hi, #0).
+    // While this is true, the pair's 64-bit value is `entry + delta +
+    // (pendingLowDelta in the low dword only)` — a torn state that
+    // must not be consumed by handle_smem. The state exists so the
+    // immediately-following S_ADDC_U32 can commit it atomically.
+    bool pendingLow = false;
+    int64_t pendingLowDelta = 0;
+  };
+  KernargPtrDelta kernargPtrDelta;
+
+  // Precomputed set of BB-start offsets where the kernarg pair is
+  // *guaranteed* to still hold its entry-time value: i.e. there is no
+  // instruction on any CFG path from the kernel-entry BB to `bbStart`
+  // that writes to either dword of the pair.
+  //
+  // Populated once in `raiser.cpp`'s Phase 4.5 pre-pass via a forward
+  // dataflow over the decoded MC stream and its inferred CFG (branch
+  // targets + fall-through). Consumed by
+  // `resetKernargPtrDeltaAtBBBoundary` to decide whether to reset the
+  // tracker to `valid = true, delta = 0` at a BB boundary (pristine)
+  // or to `valid = false` (the pair may have been clobbered along at
+  // least one incoming path — we do NOT do phi reasoning over
+  // potentially-divergent deltas).
+  //
+  // Why the pristine-at-BB-start dataflow is correct-and-sufficient:
+  //
+  //   (a) The raiser emits the pair's kernarg IR value inline for
+  //       every static kernarg-slot extraction via
+  //       `extractKernargDword(delta + imm)`. That extraction reads
+  //       the matching IR function argument directly rather than
+  //       dereferencing a runtime pointer, so the pair's *current*
+  //       SGPR value at the load site is only consulted via the
+  //       tracker's `delta`. If any incoming edge writes the pair,
+  //       delta may differ per edge and the tracker cannot describe
+  //       a single 64-bit constant — we refuse.
+  //
+  //   (b) For a BB where NO incoming path writes the pair (even after
+  //       several branches), the pair's entry-time value is the
+  //       unique SSA reality on every predecessor. The tracker enters
+  //       that BB with `valid = true, delta = 0`, and any subsequent
+  //       s_add_u32/s_addc_u32 pair inside the BB advances delta per
+  //       the state machine above. Crucially this covers the Tensile
+  //       UniversalArgs HBM-path BB — `label_HBMArgs` has a single
+  //       `s_load_b64 s[0:1], s[0:1], 0x10` as its only content, with
+  //       only the entry BB as predecessor (which never writes the
+  //       pair), so it enters pristine and the load extracts from
+  //       kernarg offset 0x10 correctly.
+  //
+  // A BB whose offset is NOT in this set is reached by at least one
+  // path that writes the pair; the tracker enters with `valid =
+  // false` and handle_smem.cpp refuses the kernarg-slot fast path on
+  // any kernarg-pair SMEM load in that BB. This is the NORMAL- and
+  // HBM-path merge point in the Tensile UniversalArgs shape (the two
+  // branches carry divergent pair values — `entry + 16` vs
+  // `*(entry + 16)`). The refusal is loud and pinpoint, per the
+  // project's "fail loudly" rule.
+  //
+  // If `userSgprLayout->kernargSegmentPtrSgpr < 0` (no kernarg
+  // pointer enabled in the KD), the pre-pass skips the dataflow and
+  // leaves this set populated with every BB offset — the pair cannot
+  // be "clobbered" if it doesn't exist.
+  llvm::DenseSet<uint64_t> kernargPristineBBs;
+
+  // Reset the const-delta tracker for the start of a new BB, consulting
+  // `kernargPristineBBs` to decide whether the pair is guaranteed-
+  // pristine along every incoming path.
+  //
+  // Called once from the raiser's main loop at every BB transition
+  // (after the dataflow pre-pass has populated `kernargPristineBBs`).
+  // Not called explicitly at kernel entry: the default-constructed
+  // `KernargPtrDelta{}` is already the correct entry-BB state (delta=0,
+  // valid=true) and the entry BB is unconditionally in
+  // `kernargPristineBBs`.
+  void resetKernargPtrDeltaAtBBBoundary(uint64_t bbOffset) {
+    kernargPtrDelta.delta = 0;
+    kernargPtrDelta.valid = kernargPristineBBs.contains(bbOffset);
+    kernargPtrDelta.pendingLow = false;
+    kernargPtrDelta.pendingLowDelta = 0;
+  }
 
   // gfx1250 s_set_vgpr_msb state: only the LOW 8 bits of the instruction's
   // 16-bit immediate carry runtime meaning.  They encode the MSB bit pair for
@@ -307,6 +466,17 @@ struct RaiseContext {
   llvm::DenseMap<int, WaveMaskEntry> lastSgprWaveMaskI1 =
       llvm::DenseMap<int, WaveMaskEntry>();
 
+  // Cross-BB, dominance-safe shadow storage for SGPR wave masks.
+  // Each SGPR base index has:
+  //   * sgprWaveMaskExecShadow[idx]  : EXEC-width mask value (i32/i64)
+  //   * sgprWaveMaskValidShadow[idx] : scalar i1 validity bit
+  //
+  // Record/write sites update both allocas; invalidation writes
+  // `valid=false`. Consumers can load-valid+load-mask and pick between
+  // shadow and fallback via `select`, avoiding SSA-dominance hazards.
+  llvm::SmallVector<llvm::AllocaInst *> sgprWaveMaskExecShadow;
+  llvm::SmallVector<llvm::AllocaInst *> sgprWaveMaskValidShadow;
+
   // Record the per-lane compare i1 produced by a V_CMP_*_e64 write
   // to SGPR baseIdx in the current BB. Overwrites any prior entry
   // (last-writer wins — a later V_CMP obviates the earlier value
@@ -317,6 +487,13 @@ struct RaiseContext {
   // `invalidateSgprWaveMaskI1`'s pair-aware branch.
   void recordSgprWaveMaskI1(int baseIdx, llvm::Value *cmpI1, bool isPair) {
     lastSgprWaveMaskI1[baseIdx] = WaveMaskEntry{cmpI1, isPair};
+    if (baseIdx >= 0 &&
+        static_cast<size_t>(baseIdx) < sgprWaveMaskExecShadow.size()) {
+      llvm::Value *execMask = projection.ballotI1ToWidth(
+          B, cmpI1, regs.execTy, "wm_shadow_exec");
+      B.CreateStore(execMask, sgprWaveMaskExecShadow[baseIdx]);
+      B.CreateStore(B.getTrue(), sgprWaveMaskValidShadow[baseIdx]);
+    }
   }
 
   // Look up the cached per-lane i1 for SGPR baseIdx in the current
@@ -327,6 +504,20 @@ struct RaiseContext {
   llvm::Value *lookupSgprWaveMaskI1(int baseIdx) const {
     auto it = lastSgprWaveMaskI1.find(baseIdx);
     return it == lastSgprWaveMaskI1.end() ? nullptr : it->second.i1;
+  }
+
+  llvm::Value *loadSgprWaveMaskExec(int baseIdx) const {
+    if (baseIdx < 0 || static_cast<size_t>(baseIdx) >= sgprWaveMaskExecShadow.size())
+      return nullptr;
+    return B.CreateLoad(regs.execTy, sgprWaveMaskExecShadow[baseIdx],
+                        "sgpr_mask_exec");
+  }
+
+  llvm::Value *loadSgprWaveMaskValid(int baseIdx) const {
+    if (baseIdx < 0 || static_cast<size_t>(baseIdx) >= sgprWaveMaskValidShadow.size())
+      return nullptr;
+    return B.CreateLoad(i1Ty, sgprWaveMaskValidShadow[baseIdx],
+                        "sgpr_mask_valid");
   }
 
   // Invalidate the cached per-lane i1 for SGPR baseIdx. Called by
@@ -348,10 +539,16 @@ struct RaiseContext {
   // unrelated to a scalar write at K and must NOT be invalidated.
   void invalidateSgprWaveMaskI1(int baseIdx) {
     lastSgprWaveMaskI1.erase(baseIdx);
+    if (baseIdx >= 0 &&
+        static_cast<size_t>(baseIdx) < sgprWaveMaskValidShadow.size())
+      B.CreateStore(B.getFalse(), sgprWaveMaskValidShadow[baseIdx]);
     if (baseIdx > 0) {
       auto prev = lastSgprWaveMaskI1.find(baseIdx - 1);
-      if (prev != lastSgprWaveMaskI1.end() && prev->second.isPair)
+      if (prev != lastSgprWaveMaskI1.end() && prev->second.isPair) {
         lastSgprWaveMaskI1.erase(prev);
+        if (static_cast<size_t>(baseIdx - 1) < sgprWaveMaskValidShadow.size())
+          B.CreateStore(B.getFalse(), sgprWaveMaskValidShadow[baseIdx - 1]);
+      }
     }
   }
 
@@ -363,6 +560,12 @@ struct RaiseContext {
   // IR (see sgpr-wave-mask-translation.md section 7 evolution
   // path) can upgrade this to a proper per-BB merge.
   void clearSgprWaveMaskShadow() { lastSgprWaveMaskI1.clear(); }
+
+  void collectSgprWaveMaskShadowAllocas(
+      llvm::SmallVectorImpl<llvm::AllocaInst *> &out) const {
+    out.append(sgprWaveMaskExecShadow.begin(), sgprWaveMaskExecShadow.end());
+    out.append(sgprWaveMaskValidShadow.begin(), sgprWaveMaskValidShadow.end());
+  }
 
   // Pending failure raised during operand-read dispatch (e.g.
   // `readOp32` / `readOp64` encountering an unmodeled aperture
