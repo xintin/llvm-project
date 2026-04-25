@@ -3,6 +3,7 @@
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <algorithm>
 #include <string>
@@ -10,6 +11,25 @@
 using namespace llvm;
 
 namespace transpiler {
+
+PreloadedHiddenKernargDword classifyPreloadedHiddenKernargDword(
+    ArrayRef<KernelArgMeta> args, int byteOffset) {
+  for (const KernelArgMeta &arg : args) {
+    if (arg.offset != byteOffset)
+      continue;
+    StringRef kind(arg.valueKind);
+    if (!kind.starts_with("hidden_"))
+      return PreloadedHiddenKernargDword::NotHidden;
+    if (kind == "hidden_block_count_x")
+      return PreloadedHiddenKernargDword::HiddenBlockCountX;
+    if (kind == "hidden_block_count_y")
+      return PreloadedHiddenKernargDword::HiddenBlockCountY;
+    if (kind == "hidden_block_count_z")
+      return PreloadedHiddenKernargDword::HiddenBlockCountZ;
+    return PreloadedHiddenKernargDword::UnsupportedHidden;
+  }
+  return PreloadedHiddenKernargDword::NotHidden;
+}
 
 llvm::Value *extractKernargDword(const KernargLayout &layout,
                                  llvm::IRBuilder<> &B,

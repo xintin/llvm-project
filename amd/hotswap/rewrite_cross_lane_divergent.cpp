@@ -396,6 +396,33 @@ IntrinsicRole classifyIntrinsicUse(CallBase *CB, Value *V,
   return IntrinsicRole::Unknown;
 }
 
+SgprForcedConsumerKind classifySgprForcedIntrinsicUse(CallBase *CB,
+                                                       unsigned operandIdx) {
+  if (CB->isInlineAsm())
+    return SgprForcedConsumerKind::InlineAsm;
+
+  Function *callee = CB->getCalledFunction();
+  if (!callee)
+    return SgprForcedConsumerKind::IndirectCall;
+
+  Intrinsic::ID id = callee->getIntrinsicID();
+  if (id == Intrinsic::not_intrinsic)
+    return SgprForcedConsumerKind::OrdinaryCall;
+
+  if (id == Intrinsic::amdgcn_readfirstlane)
+    return SgprForcedConsumerKind::ExplicitReadFirstLane;
+  if (id == Intrinsic::amdgcn_s_sendmsg && operandIdx <= 1)
+    return SgprForcedConsumerKind::ScalarSendMsg;
+  if (id == Intrinsic::amdgcn_raw_buffer_load &&
+      (operandIdx == 0 || operandIdx == 3))
+    return SgprForcedConsumerKind::ScalarMemoryOperand;
+  if (id == Intrinsic::amdgcn_raw_buffer_store &&
+      (operandIdx == 1 || operandIdx == 4))
+    return SgprForcedConsumerKind::ScalarMemoryOperand;
+
+  return SgprForcedConsumerKind::Unknown;
+}
+
 // Address spaces whose pointer operand accepts a divergent VGPR. If
 // our tracked value feeds a load/store through one of these, the
 // backend emits a VGPR-addressed memory op and the per-source-wave
@@ -446,8 +473,9 @@ std::string describeUser(const Instruction *I) {
 // every transitive user is a proven-safe consumer; otherwise writes
 // a single-line description of the first blocking user to
 // `blockingDetail` and returns SGPRForced.
-UseChainVerdict classifyForwardUseChain(Value *root,
-                                         std::string &blockingDetail) {
+UseChainVerdict
+classifyForwardUseChain(Value *root, std::string &blockingDetail,
+                        SgprForcedConsumerKind &blockingKind) {
   SmallPtrSet<Value *, 32> visited;
   SmallVector<Value *, 16> worklist;
   worklist.push_back(root);
@@ -467,6 +495,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
         // this would indicate an unexpected user we cannot
         // prove safe.
         blockingDetail = "non-instruction user (ConstantExpr?)";
+        blockingKind = SgprForcedConsumerKind::Unknown;
         return UseChainVerdict::SGPRForced;
       }
 
@@ -488,6 +517,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
       if (auto *LI = dyn_cast<LoadInst>(I)) {
         if (!isVGPRAddressablePointerAS(LI->getPointerAddressSpace())) {
           blockingDetail = describeUser(I);
+          blockingKind = SgprForcedConsumerKind::ConstantAddressSpaceMemory;
           return UseChainVerdict::SGPRForced;
         }
         // Loaded value is a fresh result disconnected from our
@@ -502,6 +532,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
         // Pointer operand: same addrspace rules as load.
         if (!isVGPRAddressablePointerAS(SI->getPointerAddressSpace())) {
           blockingDetail = describeUser(I);
+          blockingKind = SgprForcedConsumerKind::ConstantAddressSpaceMemory;
           return UseChainVerdict::SGPRForced;
         }
         continue;
@@ -509,6 +540,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
       if (auto *AI = dyn_cast<AtomicRMWInst>(I)) {
         if (!isVGPRAddressablePointerAS(AI->getPointerAddressSpace())) {
           blockingDetail = describeUser(I);
+          blockingKind = SgprForcedConsumerKind::ConstantAddressSpaceMemory;
           return UseChainVerdict::SGPRForced;
         }
         continue;
@@ -516,6 +548,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
       if (auto *CmpX = dyn_cast<AtomicCmpXchgInst>(I)) {
         if (!isVGPRAddressablePointerAS(CmpX->getPointerAddressSpace())) {
           blockingDetail = describeUser(I);
+          blockingKind = SgprForcedConsumerKind::ConstantAddressSpaceMemory;
           return UseChainVerdict::SGPRForced;
         }
         continue;
@@ -526,6 +559,7 @@ UseChainVerdict classifyForwardUseChain(Value *root,
         switch (classifyIntrinsicUse(CB, V, operandIdx)) {
         case IntrinsicRole::SGPRForced:
           blockingDetail = describeUser(I);
+          blockingKind = classifySgprForcedIntrinsicUse(CB, operandIdx);
           return UseChainVerdict::SGPRForced;
         case IntrinsicRole::VGPRSafeSink:
           continue;
@@ -534,12 +568,14 @@ UseChainVerdict classifyForwardUseChain(Value *root,
           continue;
         case IntrinsicRole::Unknown:
           blockingDetail = describeUser(I) + " (unaudited)";
+          blockingKind = SgprForcedConsumerKind::Unknown;
           return UseChainVerdict::SGPRForced;
         }
       }
 
       // Any other instruction kind we did not enumerate — refuse.
       blockingDetail = describeUser(I) + " (unaudited)";
+      blockingKind = SgprForcedConsumerKind::Unknown;
       return UseChainVerdict::SGPRForced;
     }
   }
@@ -1057,7 +1093,8 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
   auto classifySite = [&](CallInst *CI,
                           const char *kind) -> bool {
     std::string detail;
-    if (classifyForwardUseChain(CI, detail) ==
+    SgprForcedConsumerKind consumerKind = SgprForcedConsumerKind::None;
+    if (classifyForwardUseChain(CI, detail, consumerKind) ==
         UseChainVerdict::VGPRSafe)
       return true;
     std::string msg;
@@ -1071,6 +1108,10 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
           "hotswap/docs/wave-size-translation.md \u00a75.6.3 (use-"
           "chain constraint).";
     report.sgprForcedDetail = os.str();
+    report.sgprForcedConsumerKind = consumerKind;
+    report.sgprForcedThreadLoopEligible =
+        consumerKind == SgprForcedConsumerKind::ExplicitReadFirstLane &&
+        (StringRef(kind) == "writelane" || StringRef(kind) == "readlane");
     return false;
   };
 

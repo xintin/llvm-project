@@ -155,6 +155,18 @@ namespace transpiler {
 // site unchanged — the implicit readfirstlane does not collapse
 // per-source-wave state when a source wave *is* a target wave.
 
+enum class SgprForcedConsumerKind {
+  None,
+  ExplicitReadFirstLane,
+  ScalarSendMsg,
+  ScalarMemoryOperand,
+  ConstantAddressSpaceMemory,
+  InlineAsm,
+  IndirectCall,
+  OrdinaryCall,
+  Unknown,
+};
+
 struct CrossLaneDivergentRewriteReport {
   // Number of `amdgcn.writelane` calls rewritten to a per-lane
   // `select`. Under cross-widening with a VGPR-safe use chain this
@@ -185,6 +197,9 @@ struct CrossLaneDivergentRewriteReport {
   // the detail string names the offending intrinsic / memory op so
   // the next investigation knows where to start.
   std::string sgprForcedDetail;
+  SgprForcedConsumerKind sgprForcedConsumerKind =
+      SgprForcedConsumerKind::None;
+  bool sgprForcedThreadLoopEligible = false;
 
   // Non-empty iff the DPP-rewrite encountered a `dpp_ctrl` value
   // outside the supported family (quad_perm / row_shl / row_shr).

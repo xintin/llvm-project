@@ -245,7 +245,7 @@ std::string formatRefusalDetail(const ICmpInst *cmp, unsigned sourceWaveSize,
 
 PredicateChainClassifierReport classifyPredicateChain(
     Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
-    bool waveNative, unsigned maxFlatWorkgroupSize) {
+    bool waveNative, unsigned maxFlatWorkgroupSize, bool threadLoop) {
   PredicateChainClassifierReport report;
 
   // Direction gate: no predicate-chain risk at same-wave or narrowing,
@@ -275,6 +275,7 @@ PredicateChainClassifierReport classifyPredicateChain(
   const bool phantomLaneGuaranteed =
       waveNative && maxFlatWorkgroupSize > 0 &&
       maxFlatWorkgroupSize < targetWaveSize;
+  const bool modrepReplicaRisk = !waveNative && !threadLoop;
 
   // ===== Pass 0: collect `@llvm.amdgcn.workitem.id.x()` call sites. =====
   SmallVector<CallInst *> sites;
@@ -341,12 +342,10 @@ PredicateChainClassifierReport classifyPredicateChain(
             "See hotswap/docs/modrep-predicate-chain.md \u00a75.");
         // Refuse under MODREP always, and under WaveNative only
         // when phantom lanes are guaranteed (see file-header
-        // docstring). The two-arm rule matches the rationale in
-        // the header: the MODREP "replica-1 EXEC-share" trap
-        // always applies; the WaveNative per-source-lane-EXEC
-        // model defends against it only when every target lane
-        // is a 1:1 source-lane image.
-        if (!waveNative || phantomLaneGuaranteed) {
+        // docstring). The ThreadLoop flag is passed only for the narrowed
+        // SGPR-forced retry path; it is not a blanket statement that every
+        // C5 shape is safe under the partial ThreadLoop projection surface.
+        if (modrepReplicaRisk || phantomLaneGuaranteed) {
           report.refused = true;
           report.phantomLaneRefusal = phantomLaneGuaranteed;
           if (report.refusalDetail.empty())
@@ -437,12 +436,15 @@ PredicateChainClassifierReport classifyPredicateChain(
     report.observedSites.push_back(detail);
 
     // Refuse under MODREP always (the historical behaviour) and
-    // under WaveNative only when phantom lanes are guaranteed
+    // under WaveNative only when phantom lanes are guaranteed. The
+    // ThreadLoop arm is enabled only by raiser.cpp's narrowed
+    // SGPR-forced retry path; it observes/logs the site but does not emit
+    // the MODREP-only refusal for that proven route.
     // (the post-`canary_bitmatrix_composite` tightening — see
     // file-header docstring). `!report.refused` avoids rewriting
     // `refusalDetail` with later sites so the diagnostic names
     // the first failing icmp deterministically.
-    if ((!waveNative || phantomLaneGuaranteed) && !report.refused) {
+    if ((modrepReplicaRisk || phantomLaneGuaranteed) && !report.refused) {
       report.refused = true;
       report.phantomLaneRefusal = phantomLaneGuaranteed;
       if (phantomLaneGuaranteed) {

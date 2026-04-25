@@ -371,6 +371,29 @@ TEST(C5PredicateChain, WaveNativeProjectionGate) {
   EXPECT_EQ(noPhantomReport.observedSites.size(), 1u);
 }
 
+TEST(C5PredicateChain, ThreadLoopProjectionGate) {
+  Harness H;
+  Value *tid = H.emitTid();
+  auto *i32Ty = Type::getInt32Ty(H.ctx);
+  Value *cmp = H.B.CreateICmpULT(
+      tid, ConstantInt::get(i32Ty, 15), "c5_cmp_thread_loop");
+  H.emitStoreGate(cmp);
+  H.finish();
+
+  auto modrepReport =
+      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/false);
+  EXPECT_TRUE(modrepReport.refused);
+
+  auto threadLoopReport = classifyPredicateChain(
+      *H.F, kSrcWs, kTgtWs, /*waveNative=*/false,
+      /*maxFlatWorkgroupSize=*/kSrcWs, /*threadLoop=*/true);
+  EXPECT_FALSE(threadLoopReport.refused);
+  EXPECT_FALSE(threadLoopReport.phantomLaneRefusal);
+  EXPECT_EQ(threadLoopReport.visitedCalls, 1u);
+  EXPECT_EQ(threadLoopReport.observedSites.size(), 1u);
+  EXPECT_TRUE(threadLoopReport.refusalDetail.empty());
+}
+
 // ---------------------------------------------------------------------
 // WaveNative + phantom-lane regime (maxFlatWorkgroupSize < targetWaveSize):
 // the classifier tightens back to refusal. Pins the

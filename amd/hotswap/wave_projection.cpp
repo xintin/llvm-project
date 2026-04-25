@@ -385,51 +385,92 @@ Value *WaveNativeProjection::extractLaneBitFromWaveMask(IRBuilder<> &B,
 
 // ----------------------------------------------------------------------------
 // ThreadLoopProjection — second rung of the coverage ladder described
-// in hotswap/docs/wave-size-translation.md §2.2, not yet implemented.
-// Every virtual override report_fatal_errors so a build that silently
-// instantiates it (e.g. a bad decider branch) surfaces as a loud
-// runtime abort rather than wrong code.
+// in hotswap/docs/wave-size-translation.md §2.2.
+//
+// This implementation is intentionally conservative at the projection
+// boundary: source-width EXEC storage, source-width lane selection for
+// lane-active/wave-mask extraction, and source-width result typing for
+// ballots. Selection remains opt-in in raiser.cpp.
 // ----------------------------------------------------------------------------
 
 ThreadLoopProjection::ThreadLoopProjection(const ISAProfile &srcIsa,
                                             const ISAProfile &tgtIsa,
                                             Type *i32Ty, Type *i64Ty)
     : WaveProjection(srcIsa, tgtIsa, i32Ty, i64Ty) {
-  report_fatal_error(
-      "ThreadLoopProjection is a placeholder for the second rung of the "
-      "coverage ladder described in hotswap/docs/wave-size-translation.md "
-      "\u00a72.2; its emission semantics are not yet implemented. See "
-      "ThreadLoopProjection's header comment for the MAINTENANCE protocol "
-      "that lands the implementation.");
+  if (tgtIsa.waveSize <= srcIsa.waveSize)
+    report_fatal_error(
+        "ThreadLoopProjection is defined only for cross-widening "
+        "(target wave > source wave)");
+  if ((tgtIsa.waveSize % srcIsa.waveSize) != 0)
+    report_fatal_error(
+        "ThreadLoopProjection requires target wave size to be an integer "
+        "multiple of source wave size");
 }
 
-Value *ThreadLoopProjection::emitLaneActiveBit(IRBuilder<> & /*B*/,
-                                                Value * /*execVal*/) const {
-  report_fatal_error("ThreadLoopProjection::emitLaneActiveBit unimplemented");
+Value *ThreadLoopProjection::emitLaneActiveBit(IRBuilder<> &B,
+                                                Value *execVal) const {
+  Value *laneId = emitLaneIdx(B);
+  Type *execTy = execVal->getType();
+  const unsigned sourceBits = sourceWaveMaskTy()->getPrimitiveSizeInBits();
+  Value *laneIdInExec = B.CreateZExtOrTrunc(laneId, execTy, "tl_lane_idx");
+  Value *laneMod = B.CreateAnd(
+      laneIdInExec, ConstantInt::get(execTy, sourceBits - 1), "tl_lane_mod");
+  Value *shifted = B.CreateLShr(execVal, laneMod, "tl_exec_at_lane");
+  Value *bit =
+      B.CreateAnd(shifted, ConstantInt::get(execTy, 1), "tl_exec_bit");
+  return B.CreateICmpNE(bit, ConstantInt::get(execTy, 0), "tl_lane_active");
 }
 
-Value *ThreadLoopProjection::ballotI1ToWidth(IRBuilder<> & /*B*/,
-                                              Value * /*pred*/,
-                                              Type * /*resultTy*/,
-                                              const Twine & /*name*/) const {
-  report_fatal_error("ThreadLoopProjection::ballotI1ToWidth unimplemented");
+Value *ThreadLoopProjection::ballotI1ToWidth(IRBuilder<> &B, Value *pred,
+                                              Type *resultTy,
+                                              const Twine &name) const {
+  assert(pred->getType() == B.getInt1Ty() &&
+         "ballotI1ToWidth requires an i1 predicate");
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *ballot = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::amdgcn_ballot, {waveMaskTy_});
+  Value *waveMask = B.CreateCall(ballot, {pred}, name);
+  const unsigned wantedBits = resultTy->getPrimitiveSizeInBits();
+  const unsigned sourceBits = sourceWaveMaskTy()->getPrimitiveSizeInBits();
+  if (wantedBits > sourceBits)
+    report_fatal_error(
+        "ThreadLoopProjection::ballotI1ToWidth requires resultTy <= source "
+        "wave mask width");
+  Type *sourceTy = sourceWaveMaskTy();
+  Value *sourceMask = waveMask;
+  if (waveMask->getType()->getPrimitiveSizeInBits() > sourceBits)
+    sourceMask = B.CreateTrunc(waveMask, sourceTy, name + "_src_trunc");
+  if (wantedBits == sourceBits)
+    return sourceMask;
+  return B.CreateTrunc(sourceMask, resultTy, name + "_trunc");
 }
 
 Value *ThreadLoopProjection::extractLaneBitFromWaveMask(
-    IRBuilder<> & /*B*/, Value * /*v*/) const {
-  report_fatal_error(
-      "ThreadLoopProjection::extractLaneBitFromWaveMask unimplemented");
+    IRBuilder<> &B, Value *v) const {
+  if (v->getType() == B.getInt1Ty())
+    return v;
+  Type *targetTy = sourceWaveMaskTy();
+  unsigned srcBits = v->getType()->getPrimitiveSizeInBits();
+  unsigned dstBits = targetTy->getPrimitiveSizeInBits();
+  if (srcBits < dstBits) {
+    v = B.CreateZExt(v, targetTy);
+  } else if (srcBits > dstBits) {
+    v = B.CreateTrunc(v, targetTy);
+  } else if (v->getType() != targetTy) {
+    v = B.CreateBitCast(v, targetTy);
+  }
+  Value *laneIdx = emitLaneIdx(B);
+  Value *laneIdxExt = B.CreateZExtOrTrunc(laneIdx, targetTy, "tl_mask_lane_idx");
+  Value *laneMod = B.CreateAnd(
+      laneIdxExt, ConstantInt::get(targetTy, dstBits - 1), "tl_mask_lane_mod");
+  Value *shifted = B.CreateLShr(v, laneMod, "tl_mask_at_lane");
+  Value *bit = B.CreateAnd(shifted, ConstantInt::get(targetTy, 1),
+                           "tl_mask_lane_bit");
+  return B.CreateICmpNE(bit, ConstantInt::get(targetTy, 0), "tl_mask_lane_i1");
 }
 
 unsigned ThreadLoopProjection::numSourceWavesPerTarget() const {
-  // Constructor `report_fatal_error`s before any instance is returned
-  // so this method is unreachable.  Provide a terminating override
-  // anyway so the base class's pure-virtual contract is satisfied at
-  // link time.  When the projection is eventually implemented, the
-  // value to return is the wrap count `W_tgt / W_src` (= 2 for the
-  // wave32 → wave64 direction this class targets per its docstring).
-  report_fatal_error("ThreadLoopProjection::numSourceWavesPerTarget "
-                     "unimplemented");
+  return tgt_.waveSize / src_.waveSize;
 }
 
 // ----------------------------------------------------------------------------

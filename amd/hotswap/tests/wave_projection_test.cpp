@@ -30,11 +30,9 @@
 //     and rely on virtual dispatch to pick the right answer per
 //     kernel.
 //
-//   * ThreadLoopProjection is NOT tested here because the class is
-//     a `report_fatal_error` placeholder today (see
-//     `wave_projection.hpp` for the rationale); if a future commit
-//     graduates it to a real projection, the author should add a
-//     test here pinning the intended return value.
+//   * `ThreadLoopProjection` is conservative-by-default and keeps
+//     source-width semantics at projection boundaries; it does not
+//     provide the full-wave EXEC invariant.
 
 #include "../wave_projection.hpp"
 
@@ -57,6 +55,7 @@
 using namespace llvm;
 using transpiler::ISAProfile;
 using transpiler::ModuloReplicationProjection;
+using transpiler::ThreadLoopProjection;
 using transpiler::WaveNativeProjection;
 using transpiler::WaveProjection;
 
@@ -189,6 +188,21 @@ TEST(WaveProjectionContract, BaseDefaultIsNotFullWaveExec) {
   EXPECT_FALSE(proj.providesFullWaveExecInvariant());
 }
 
+TEST(WaveProjectionContract, ThreadLoopDoesNotProvideFullWaveExec) {
+  LLVMContext ctx;
+  auto *i32Ty = Type::getInt32Ty(ctx);
+  auto *i64Ty = Type::getInt64Ty(ctx);
+
+  ISAProfile src = makeGfx1250Profile();
+  ISAProfile tgt = makeGfx942Profile();
+
+  ThreadLoopProjection proj(src, tgt, i32Ty, i64Ty);
+  EXPECT_FALSE(proj.providesFullWaveExecInvariant());
+
+  const WaveProjection &base = proj;
+  EXPECT_FALSE(base.providesFullWaveExecInvariant());
+}
+
 // ----------------------------------------------------------------------------
 // `numSourceWavesPerTarget()` contract.  The WMMA → MFMA lowering in
 // `wmma_lowering.cpp` iterates `groupBase ∈ {0, W_src, ..., (N-1) *
@@ -223,6 +237,21 @@ TEST(WaveProjectionContract, WaveNativeHasTwoSourceWavesPerTarget) {
   ISAProfile tgt = makeGfx942Profile();
 
   WaveNativeProjection proj(src, tgt, i32Ty, i64Ty);
+  EXPECT_EQ(proj.numSourceWavesPerTarget(), 2u);
+
+  const WaveProjection &base = proj;
+  EXPECT_EQ(base.numSourceWavesPerTarget(), 2u);
+}
+
+TEST(WaveProjectionContract, ThreadLoopReportsSourceWavesPerTargetRatio) {
+  LLVMContext ctx;
+  auto *i32Ty = Type::getInt32Ty(ctx);
+  auto *i64Ty = Type::getInt64Ty(ctx);
+
+  ISAProfile src = makeGfx1250Profile();
+  ISAProfile tgt = makeGfx942Profile();
+
+  ThreadLoopProjection proj(src, tgt, i32Ty, i64Ty);
   EXPECT_EQ(proj.numSourceWavesPerTarget(), 2u);
 
   const WaveProjection &base = proj;

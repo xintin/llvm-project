@@ -195,6 +195,14 @@ public:
   // to set HW EXEC=-1 for the kernel body.
   virtual bool providesFullWaveExecInvariant() const { return false; }
 
+  // True iff handlers should lower source-ISA lane-indexed primitives
+  // (`readlane`, `writelane`, `readfirstlane`) as source-wave-scoped
+  // operations instead of target-wave-native AMDGPU intrinsics.  The
+  // ThreadLoop route needs this because each target wave contains multiple
+  // source-wave instances; a native target-wave `readlane(31)` or
+  // `readfirstlane` would collapse those instances together.
+  virtual bool sourceWaveScopedLaneOps() const { return false; }
+
   // Number of source waves whose per-lane fragment data is present in
   // each target wave under this projection's mapping.  Callers that
   // synthesise per-source-wave passes (most notably the WMMA → MFMA
@@ -388,9 +396,8 @@ public:
 };
 
 // ============================================================================
-// ThreadLoopProjection — placeholder subclass for the second rung of
-// the coverage ladder described in hotswap/docs/wave-size-
-// translation.md §2.2.
+// ThreadLoopProjection — second rung of the coverage ladder described
+// in hotswap/docs/wave-size-translation.md §2.2.
 //
 // The thread-loop rung wraps the raised IR body in `for iter in 0..R:`
 // with R = W_tgt / W_src, using only the lower W_src target lanes per
@@ -401,15 +408,17 @@ public:
 // cross-lane obstructions (see wave-size-translation.md §7's
 // unrewritable and pending tables).
 //
-// Today no corpus kernel reaches this rung (hotswap/docs/gpt-oss-
-// derisking.md §9.1 reports every GPT-OSS / hipBLASLt / Gluon kernel
-// is outcome (a) or (b) under modulo-replication). The class is
-// declared here so the projection ladder described in wave-size-
-// translation.md §2.2 has a type-level anchor in code; constructing
-// it today is a principled `report_fatal_error` rather than silent
-// acceptance, because the projection's emission semantics require a
-// structural rewrite of the raiser's main loop that has not been
-// implemented.
+// This first implementation provides a conservative projection surface
+// that keeps source-wave-width semantics at projection boundaries:
+//   * source-width EXEC storage (`execStorageTy = sourceWaveMaskTy`)
+//   * source-width lane indexing for lane-active and wave-mask extract
+//   * target ballots narrowed to source width
+// and reports source-wave-count per target wave as `W_t / W_s`.
+//
+// The projection is intentionally opt-in and currently selected only by
+// an explicit fallback path in `raiser.cpp` after a post-raise SGPR-
+// forced cross-lane rewrite refusal. It does NOT silently replace the
+// default WaveNative/MODREP decisions.
 //
 // MAINTENANCE. When implementing thread-loop (expected trigger: a
 // corpus kernel in outcome (c) under modulo-replication that would be
@@ -426,11 +435,13 @@ public:
 //      translation.md §2.2.
 class ThreadLoopProjection final : public WaveProjection {
 public:
-  // Placeholder ctor: aborts loudly so a typo that instantiates this
-  // subclass before the implementation lands surfaces at raise time
-  // rather than as a silent miscompile.
   ThreadLoopProjection(const ISAProfile &srcIsa, const ISAProfile &tgtIsa,
                        llvm::Type *i32Ty, llvm::Type *i64Ty);
+
+  llvm::Type *execStorageTy() const override { return sourceWaveMaskTy(); }
+  bool broadcastNarrowExecLoWrite() const override { return false; }
+  bool providesFullWaveExecInvariant() const override { return false; }
+  bool sourceWaveScopedLaneOps() const override { return true; }
 
   llvm::Value *emitLaneActiveBit(llvm::IRBuilder<> &B,
                                   llvm::Value *execVal) const override;
@@ -441,12 +452,6 @@ public:
   llvm::Value *extractLaneBitFromWaveMask(llvm::IRBuilder<> &B,
                                            llvm::Value *v) const override;
 
-  // `report_fatal_error` placeholder: the projection is not
-  // implemented (see the class docstring).  An override here keeps
-  // the base class's pure-virtual contract satisfied so we don't
-  // need to reintroduce a non-pure default — a value will never be
-  // observed because the constructor aborts before any instance is
-  // returned to a caller.
   unsigned numSourceWavesPerTarget() const override;
 };
 

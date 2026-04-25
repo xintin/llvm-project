@@ -583,19 +583,47 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
   }
 
   // ---- v_readfirstlane_b32 sDST, vSRC ----
-  // Broadcast the value of vSRC from the lowest-numbered active lane
-  // (or lane 0 if EXEC==0) to sDST. A plain per-lane move would leave
-  // each lane with its own vSRC, breaking the uniformity invariant
-  // that downstream consumers (s_mov, s_load base, branch condition)
-  // rely on. Emit the native `llvm.amdgcn.readfirstlane.i32`; the
-  // SGPR dst is NOT wrapped in emitUnderExec (see
-  // `RaiseContext::writeReg32` — SGPR writes bypass predication), so
-  // the broadcast lands on all lanes.
+  // Broadcast the value of vSRC from the lowest-numbered active source
+  // lane (or lane 0 if EXEC==0) to sDST.  Same-wave lowering can use the
+  // native intrinsic directly.  Under cross-widening, however, native
+  // `readfirstlane` would pick one lane for the entire target wave64 and
+  // collapse the two source-wave halves together.  Emulate the source
+  // operation with `ds_bpermute`: compute the first active bit in the
+  // source-width modeled EXEC mask, add it to the current target lane's
+  // source-wave base (`lane_id & ~(W_s-1)`), and fetch that lane's VGPR.
+  // This is an explicit semantic translation, not a readfirstlane allow-list:
+  // downstream SGPR-forced uses now consume the already-broadcast source-wave
+  // value rather than forcing the backend to scalarise a divergent value.
   case SemOp::V_READFIRSTLANE_B32: {
-    Function *rfl = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::amdgcn_readfirstlane, {ctx.i32Ty});
     Value *src = ctx.B.CreateZExtOrTrunc(op.src(0), ctx.i32Ty, "rfl_src");
-    Value *val = ctx.B.CreateCall(rfl, {src}, "readfirstlane");
+    Value *val = nullptr;
+    if (ctx.projection.sourceWaveScopedLaneOps()) {
+      Value *exec = ctx.regs.loadExec(ctx.B);
+      exec = ctx.B.CreateZExtOrTrunc(exec, ctx.i32Ty, "rfl_exec");
+      Function *cttz = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::cttz, {ctx.i32Ty});
+      Value *firstSet = ctx.B.CreateCall(
+          cttz, {exec, ConstantInt::getFalse(ctx.i1Ty)}, "rfl_first_set");
+      Value *execIsZero = ctx.B.CreateICmpEQ(exec, ctx.B.getInt32(0),
+                                             "rfl_exec_is_zero");
+      Value *sourceLane = ctx.B.CreateSelect(execIsZero, ctx.B.getInt32(0),
+                                             firstSet, "rfl_source_lane");
+      Value *laneId = ctx.emitLaneIdx();
+      uint32_t sourceMask = ctx.isa.waveSize - 1;
+      Value *groupBase = ctx.B.CreateAnd(laneId, ctx.B.getInt32(~sourceMask),
+                                         "rfl_source_wave_base");
+      Value *targetLane = ctx.B.CreateOr(groupBase, sourceLane,
+                                         "rfl_target_lane");
+      Value *addr = ctx.B.CreateShl(targetLane, ctx.B.getInt32(2),
+                                    "rfl_bperm_addr");
+      Function *bperm = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_ds_bpermute);
+      val = ctx.B.CreateCall(bperm, {addr, src}, "readfirstlane_srcwave");
+    } else {
+      Function *rfl = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_readfirstlane, {ctx.i32Ty});
+      val = ctx.B.CreateCall(rfl, {src}, "readfirstlane");
+    }
     ctx.writeReg32(op.dst(), val);
     hr.handled = true;
     return hr;
@@ -621,9 +649,22 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
     Value *lane = op.src(1);
     lane = ctx.B.CreateZExtOrTrunc(lane, ctx.i32Ty, "wrlane_idx");
     Value *oldVal = ctx.regs.readReg32(ctx.B, dst);
-    Function *wl = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::amdgcn_writelane, {ctx.i32Ty});
-    Value *newVal = ctx.B.CreateCall(wl, {val, lane, oldVal}, "writelane");
+    Value *newVal = nullptr;
+    if (ctx.projection.sourceWaveScopedLaneOps()) {
+      Value *laneId = ctx.emitLaneIdx();
+      Value *sourceLane = ctx.B.CreateAnd(
+          laneId, ctx.B.getInt32(ctx.isa.waveSize - 1), "wrlane_source_lane");
+      Value *wantedLane = ctx.B.CreateAnd(
+          lane, ctx.B.getInt32(ctx.isa.waveSize - 1), "wrlane_wanted_lane");
+      Value *isTargetLane = ctx.B.CreateICmpEQ(sourceLane, wantedLane,
+                                               "wrlane_is_target_lane");
+      newVal = ctx.B.CreateSelect(isTargetLane, val, oldVal,
+                                  "writelane_srcwave");
+    } else {
+      Function *wl = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_writelane, {ctx.i32Ty});
+      newVal = ctx.B.CreateCall(wl, {val, lane, oldVal}, "writelane");
+    }
     ctx.writeReg32(dst, newVal);
     hr.handled = true;
     return hr;
@@ -637,9 +678,26 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
     Value *lane = op.src(1);
     lane = ctx.B.CreateZExtOrTrunc(lane, ctx.i32Ty, "rdlane_idx");
     Value *src = ctx.regs.readReg32(ctx.B, srcReg);
-    Function *rl = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::amdgcn_readlane, {ctx.i32Ty});
-    Value *val = ctx.B.CreateCall(rl, {src, lane}, "readlane");
+    Value *val = nullptr;
+    if (ctx.projection.sourceWaveScopedLaneOps()) {
+      Value *laneId = ctx.emitLaneIdx();
+      uint32_t sourceMask = ctx.isa.waveSize - 1;
+      Value *groupBase = ctx.B.CreateAnd(laneId, ctx.B.getInt32(~sourceMask),
+                                         "rdlane_source_wave_base");
+      Value *sourceLane = ctx.B.CreateAnd(lane, ctx.B.getInt32(sourceMask),
+                                          "rdlane_source_lane");
+      Value *targetLane = ctx.B.CreateOr(groupBase, sourceLane,
+                                         "rdlane_target_lane");
+      Value *addr = ctx.B.CreateShl(targetLane, ctx.B.getInt32(2),
+                                    "rdlane_bperm_addr");
+      Function *bperm = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_ds_bpermute);
+      val = ctx.B.CreateCall(bperm, {addr, src}, "readlane_srcwave");
+    } else {
+      Function *rl = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_readlane, {ctx.i32Ty});
+      val = ctx.B.CreateCall(rl, {src, lane}, "readlane");
+    }
     ctx.writeReg32(op.dst(), val);
     hr.handled = true;
     return hr;

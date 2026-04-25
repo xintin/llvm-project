@@ -55,6 +55,98 @@ using namespace llvm;
 
 namespace transpiler {
 
+namespace {
+
+namespace HsaKernelDispatchPacket {
+constexpr unsigned WorkgroupSizeXOffset = 4;
+constexpr unsigned WorkgroupSizeYOffset = 6;
+constexpr unsigned WorkgroupSizeZOffset = 8;
+constexpr unsigned GridSizeXOffset = 12;
+constexpr unsigned GridSizeYOffset = 16;
+constexpr unsigned GridSizeZOffset = 20;
+
+unsigned workgroupSizeOffset(unsigned dim) {
+  switch (dim) {
+  case 0:
+    return WorkgroupSizeXOffset;
+  case 1:
+    return WorkgroupSizeYOffset;
+  case 2:
+    return WorkgroupSizeZOffset;
+  default:
+    report_fatal_error("invalid HSA dispatch-packet workgroup-size dimension");
+  }
+}
+
+unsigned gridSizeOffset(unsigned dim) {
+  switch (dim) {
+  case 0:
+    return GridSizeXOffset;
+  case 1:
+    return GridSizeYOffset;
+  case 2:
+    return GridSizeZOffset;
+  default:
+    report_fatal_error("invalid HSA dispatch-packet grid-size dimension");
+  }
+}
+} // namespace HsaKernelDispatchPacket
+
+enum class ThreadLoopDecision {
+  NotApplicable,
+  EligibleButGateOff,
+  EligibleAndGateOn,
+  Ineligible,
+};
+
+struct ThreadLoopDecisionResult {
+  ThreadLoopDecision decision = ThreadLoopDecision::NotApplicable;
+  std::string reason;
+};
+
+ThreadLoopDecisionResult decideThreadLoopFallback(unsigned sourceWaveSize,
+                                                  unsigned targetWaveSize,
+                                                  bool sgprForcedRefusal,
+                                                  bool threadLoopEligible) {
+  if (!sgprForcedRefusal)
+    return {ThreadLoopDecision::NotApplicable, "no SGPR-forced refusal"};
+  if (!threadLoopEligible) {
+    return {ThreadLoopDecision::Ineligible,
+            "SGPR-forced sink is outside the proven readlane/writelane -> "
+            "explicit readfirstlane ThreadLoop class"};
+  }
+  if (targetWaveSize <= sourceWaveSize) {
+    return {ThreadLoopDecision::Ineligible,
+            "thread-loop fallback is cross-widen-only"};
+  }
+  if ((targetWaveSize % sourceWaveSize) != 0) {
+    return {ThreadLoopDecision::Ineligible,
+            "target wave size is not an integer multiple of source wave size"};
+  }
+  // Graduation gate for the narrow SGPR-forced post-raise refusal class.
+  //
+  // Objective trigger:
+  //   * the SSA use-chain classifier has already refused a cross-widening
+  //     writelane/readlane rewrite because the value flows into an explicit
+  //     `llvm.amdgcn.readfirstlane` consumer; and
+  //   * the target wave size is an integer multiple of the source wave size.
+  //
+  // This does not widen the rewrite allow-list. The original refusal remains
+  // the proof obligation: only after the classifier names the proven
+  // readfirstlane sink do we retry under ThreadLoopProjection, with the
+  // rewrite disabled so source-wave-scoped readlane / writelane /
+  // readfirstlane lowering owns the boundary. Other SGPR-forced sinks
+  // (scalar memory operands, inline asm, unknown calls) still refuse loudly.
+  constexpr bool kThreadLoopAutoActivateSgprForcedCrossWiden = true;
+  if (kThreadLoopAutoActivateSgprForcedCrossWiden)
+    return {ThreadLoopDecision::EligibleAndGateOn,
+            "SGPR-forced cross-widen refusal is covered by ThreadLoopProjection"};
+  return {ThreadLoopDecision::EligibleButGateOff,
+          "eligible but graduation gate is off"};
+}
+
+} // namespace
+
 // parseReg, readOp32/64/ExecWidth, and OpResolver are in raise_context.hpp/cpp
 // instructionWritesEXEC and the cross-wave gate live in wave_projection.hpp/cpp
 // RaiseFailure + reasonString are in raise_failure.hpp/cpp
@@ -63,14 +155,16 @@ namespace transpiler {
 // Main raising function
 // ============================================================================
 
-RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
-                      const std::string &sourceISA,
-                      const std::string &kernelName,
-                      const KernelMeta &meta,
-                      uint64_t kernelOffset,
-                      const std::string &compilationTargetISA,
-                      bool enableWritelaneRewrite,
-                      bool enableWaveNative) {
+static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
+                                 const std::string &sourceISA,
+                                 const std::string &kernelName,
+                                 const KernelMeta &meta,
+                                 uint64_t kernelOffset,
+                                 const std::string &compilationTargetISA,
+                                 bool enableWritelaneRewrite,
+                                 bool enableWaveNative,
+                                 bool forceThreadLoopProjection,
+                                 bool suppressC5ForThreadLoopRoute) {
   RaiseResult result;
 
   // NOTE. The `HSA_SALMON_WAVE_NATIVE=1` process-environment override
@@ -177,18 +271,28 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   const bool phantomLaneRegime =
       meta.maxFlatWorkgroupSize > 0 &&
       static_cast<unsigned>(meta.maxFlatWorkgroupSize) < targetIsa.waveSize;
-  const bool useWaveNative = enableWaveNative && isa.isWave32() &&
-                              !targetIsa.isWave32() && !phantomLaneRegime;
+  const bool useThreadLoop = forceThreadLoopProjection;
+  const bool useWaveNative = !useThreadLoop && enableWaveNative &&
+                             isa.isWave32() && !targetIsa.isWave32() &&
+                             !phantomLaneRegime;
   std::unique_ptr<WaveProjection> projectionPtr;
-  if (useWaveNative)
+  if (useThreadLoop) {
+    projectionPtr = std::make_unique<ThreadLoopProjection>(
+        isa, targetIsa, i32Ty, i64Ty);
+    errs() << "transpiler: kernel '" << kernelName
+           << "' selected ThreadLoopProjection (analysis-triggered "
+              "SGPR-forced cross-lane route; writelane/readlane rewrite "
+              "disabled for this retry)\n";
+  } else if (useWaveNative) {
     projectionPtr = std::make_unique<WaveNativeProjection>(isa, targetIsa,
                                                              i32Ty, i64Ty);
-  else
+  } else {
     projectionPtr = std::make_unique<ModuloReplicationProjection>(
         isa, targetIsa, i32Ty, i64Ty);
+  }
   WaveProjection &projection = *projectionPtr;
 
-  if (enableWaveNative && phantomLaneRegime && isa.isWave32() &&
+  if (!useThreadLoop && enableWaveNative && phantomLaneRegime && isa.isWave32() &&
       !targetIsa.isWave32()) {
     // Log the fallback so operators can trace which kernels moved to
     // MODREP and why.  A regression that silently flips WaveNative's
@@ -579,6 +683,53 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
     regs.storeSGPR32(B, userSgprLayout.workgroupIdYSgpr,
                      B.CreateCall(fnWorkgroupIdY, {}, "wg_id_y"));
   }
+  auto loadDispatchU16 = [&](Value *dispatchPtr, unsigned byteOffset,
+                             const Twine &name) -> Value * {
+    Value *p = B.CreateConstInBoundsGEP1_32(i8Ty, dispatchPtr, byteOffset);
+    return B.CreateZExt(B.CreateLoad(Type::getInt16Ty(C), p, name), i32Ty,
+                        name + "_zext");
+  };
+  auto loadDispatchU32 = [&](Value *dispatchPtr, unsigned byteOffset,
+                             const Twine &name) -> Value * {
+    Value *p = B.CreateConstInBoundsGEP1_32(i8Ty, dispatchPtr, byteOffset);
+    return B.CreateLoad(i32Ty, p, name);
+  };
+  auto emitHiddenBlockCount = [&](unsigned dim) -> Value * {
+    Function *dispatchPtrFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::amdgcn_dispatch_ptr);
+    Value *dispatchPtr = B.CreateCall(dispatchPtrFn, {}, "dispatch_ptr");
+    // HSA kernel dispatch packet layout: workgroup_size_{x,y,z} are u16 at
+    // bytes 4/6/8 and grid_size_{x,y,z} are u32 at bytes 12/16/20. Triton's
+    // hidden_block_count_* ABI wants gridDim, i.e. grid_size / workgroup_size.
+    unsigned wgOffset = HsaKernelDispatchPacket::workgroupSizeOffset(dim);
+    unsigned gridOffset = HsaKernelDispatchPacket::gridSizeOffset(dim);
+    Value *wgSize = loadDispatchU16(dispatchPtr, wgOffset,
+                                    Twine("dispatch_wg_size_") + Twine(dim));
+    Value *gridSize = loadDispatchU32(dispatchPtr, gridOffset,
+                                      Twine("dispatch_grid_size_") + Twine(dim));
+    return B.CreateUDiv(gridSize, wgSize,
+                        Twine("hidden_block_count_") + Twine(dim));
+  };
+  auto emitPreloadedHiddenKernargDword = [&](int byteOffset) -> Value * {
+    switch (classifyPreloadedHiddenKernargDword(meta.args, byteOffset)) {
+    case PreloadedHiddenKernargDword::NotHidden:
+      return nullptr;
+    case PreloadedHiddenKernargDword::HiddenBlockCountX:
+      return emitHiddenBlockCount(/*dim=*/0);
+    case PreloadedHiddenKernargDword::HiddenBlockCountY:
+      return emitHiddenBlockCount(/*dim=*/1);
+    case PreloadedHiddenKernargDword::HiddenBlockCountZ:
+      return emitHiddenBlockCount(/*dim=*/2);
+    case PreloadedHiddenKernargDword::UnsupportedHidden:
+      report_fatal_error(Twine("transpiler: preloaded hidden kernarg at byte "
+                               "offset ") +
+                         Twine(byteOffset) +
+                       " has no modeled entry-SGPR seed. Refusing instead "
+                       "of treating a runtime-provided hidden value as "
+                       "padding/undef.");
+    }
+    return nullptr;
+  };
   // Kernarg preload SGPRs carry dwords copied by hardware from the kernarg
   // segment before kernel entry. Materialize the same dwords from the IR
   // function args so early source-SGPR reads observe the descriptor-declared
@@ -588,7 +739,9 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
     if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
       continue;
     std::string why;
-    Value *dw = extractKernargDword(kernargs, B, F, entry.kernargByteOffset, &why);
+    Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
+    if (!dw)
+      dw = extractKernargDword(kernargs, B, F, entry.kernargByteOffset, &why);
     if (!dw) {
       report_fatal_error(Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
                          Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
@@ -1374,6 +1527,36 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
         *F, isa.waveSize, targetIsa.waveSize, tm.get());
 
     if (rewriteReport.refusedSgprForced()) {
+      ThreadLoopDecisionResult tlDecision = decideThreadLoopFallback(
+          isa.waveSize, targetIsa.waveSize, /*sgprForcedRefusal=*/true,
+          rewriteReport.sgprForcedThreadLoopEligible);
+      if (!forceThreadLoopProjection &&
+          tlDecision.decision == ThreadLoopDecision::EligibleAndGateOn) {
+        errs() << "transpiler: post-raise fallback: retrying kernel '"
+               << kernelName
+               << "' under ThreadLoopProjection after SGPR-forced cross-lane "
+                  "rewrite refusal (analysis-triggered, no user opt-in)\n";
+        errs() << "transpiler: thread-loop fallback trigger: "
+               << rewriteReport.sgprForcedDetail << "\n";
+        return raiseToIRImpl(textBytes, sourceISA, kernelName, meta,
+                             kernelOffset, compilationTargetISA,
+                             /*enableWritelaneRewrite=*/false,
+                             /*enableWaveNative=*/false,
+                             /*forceThreadLoopProjection=*/true,
+                             /*suppressC5ForThreadLoopRoute=*/true);
+      }
+      if (!forceThreadLoopProjection &&
+          tlDecision.decision == ThreadLoopDecision::EligibleButGateOff) {
+        errs() << "transpiler: thread-loop fallback candidate for kernel '"
+               << kernelName << "' not activated: " << tlDecision.reason
+               << ". Keeping principled loud refusal.\n";
+      }
+      if (!forceThreadLoopProjection &&
+          tlDecision.decision == ThreadLoopDecision::Ineligible) {
+        errs() << "transpiler: thread-loop fallback not eligible for kernel '"
+               << kernelName << "': " << tlDecision.reason
+               << ". Keeping principled loud refusal.\n";
+      }
       RaiseFailure f = RaiseFailure::crossWaveRewriteOracleDisagreement(
           kernelName, rewriteReport.sgprForcedDetail);
       errs() << "transpiler: post-raise abort: " << f.format << " on '"
@@ -1471,16 +1654,12 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
   // rewrite, pair it with a `RewriteId` alongside
   // `ObstructionKind::WorkitemIdPredicateChain`.
   {
-    // Pass `enableWaveNative` + the kernel's
-    // `max_flat_workgroup_size` to the classifier. The
-    // `waveNative` arm suppresses refusal for the common case
-    // (target-wave-sized WG, no phantom lanes) and enables
-    // refusal for the phantom-lane sub-case
+    // Pass the selected projection to the classifier. The WaveNative and
+    // ThreadLoop arms suppress the MODREP-specific refusal while still
+    // walking the IR so `observedSites` is populated for attribution. The
+    // WaveNative arm re-enables refusal for the phantom-lane sub-case
     // (`max_flat_workgroup_size < targetWaveSize`) — see
-    // `c5_predicate_chain_classifier.hpp`'s file-header docstring
-    // for the full two-arm rationale. The walk runs in both
-    // arms so `observedSites` is populated for the attribution
-    // breadcrumb below.
+    // `c5_predicate_chain_classifier.hpp` for the full rationale.
     PredicateChainClassifierReport predReport =
         classifyPredicateChain(*F, isa.waveSize, targetIsa.waveSize,
                                 enableWaveNative,
@@ -1488,18 +1667,21 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
                                 meta.maxFlatWorkgroupSize > 0
                                     ? static_cast<unsigned>(
                                           meta.maxFlatWorkgroupSize)
-                                    : 0u);
+                                    : 0u,
+                                useThreadLoop &&
+                                    suppressC5ForThreadLoopRoute);
 
-    if (enableWaveNative && !predReport.refused &&
+    if ((enableWaveNative || useThreadLoop) && !predReport.refused &&
         !predReport.observedSites.empty()) {
       LLVM_DEBUG({
         dbgs() << "c5-predicate-chain: observed "
                << predReport.observedSites.size()
-               << " C5-shape site(s) in '" << kernelName
-               << "' under WaveNativeProjection (refusal "
+               << " C5-shape site(s) in '" << kernelName << "' under "
+               << (useThreadLoop ? "ThreadLoopProjection"
+                                 : "WaveNativeProjection")
+               << " (refusal "
                   "suppressed per c5_predicate_chain_classifier.hpp "
-                  "`waveNative` contract; no phantom-lane "
-                  "configuration detected):\n";
+                  "projection contract):\n";
         for (const std::string &site : predReport.observedSites)
           dbgs() << "  - " << site << "\n";
       });
@@ -1537,6 +1719,21 @@ RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
 
   result.success = true;
   return result;
+}
+
+RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
+                      const std::string &sourceISA,
+                      const std::string &kernelName,
+                      const KernelMeta &meta,
+                      uint64_t kernelOffset,
+                      const std::string &compilationTargetISA,
+                      bool enableWritelaneRewrite,
+                      bool enableWaveNative) {
+  return raiseToIRImpl(textBytes, sourceISA, kernelName, meta, kernelOffset,
+                       compilationTargetISA, enableWritelaneRewrite,
+                       enableWaveNative,
+                       /*forceThreadLoopProjection=*/false,
+                       /*suppressC5ForThreadLoopRoute=*/false);
 }
 
 } // namespace transpiler

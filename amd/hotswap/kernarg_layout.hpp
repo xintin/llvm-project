@@ -2,6 +2,7 @@
 #define HOTSWAP_TRANSPILER_KERNARG_LAYOUT_HPP
 
 #include "code_object_utils.hpp"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Function.h"
 #include <string>
@@ -90,6 +91,21 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
                                  llvm::Function *F,
                                  int byteOffset,
                                  std::string *whyNot = nullptr);
+
+enum class PreloadedHiddenKernargDword {
+  NotHidden,
+  HiddenBlockCountX,
+  HiddenBlockCountY,
+  HiddenBlockCountZ,
+  UnsupportedHidden,
+};
+
+// Classify a kernarg-preload dword that lands on a hidden metadata slot.
+// Hardware preloads hidden args exactly like user args; treating them as
+// padding would turn runtime-provided values (e.g. Triton's block count for
+// `tl.num_programs`) into undef. Unsupported hidden kinds must refuse loudly.
+PreloadedHiddenKernargDword classifyPreloadedHiddenKernargDword(
+    llvm::ArrayRef<KernelArgMeta> args, int byteOffset);
 
 } // namespace transpiler
 

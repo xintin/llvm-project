@@ -240,12 +240,21 @@ struct PredicateChainClassifierReport {
 // metadata field from the HSACO's `.amdgpu_metadata` section, or
 // 0 if the caller does not have the information. Used ONLY under
 // `waveNative = true` to narrow the suppression (see the file-
-// header docstring's phantom-lane discussion); has no effect when
-// `waveNative = false` because the MODREP refusal arm already
+// header docstring's phantom-lane discussion); has no effect under
+// the MODREP arm.
+//
+// `threadLoop` parameter semantics. Setting `threadLoop = true` suppresses
+// the MODREP-only refusal but keeps the walk and `observedSites`. Callers
+// must set it only for a separately-proven ThreadLoop route; raiser.cpp does
+// so only for the SGPR-forced readlane/writelane -> explicit-readfirstlane
+// retry. It is not a blanket "ThreadLoop solves C5" assertion.
+//
+// `waveNative = false` and `threadLoop = false` is the MODREP arm; it still
 // fires unconditionally on any C5 site.
 PredicateChainClassifierReport classifyPredicateChain(
     llvm::Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
-    bool waveNative = false, unsigned maxFlatWorkgroupSize = 0);
+    bool waveNative = false, unsigned maxFlatWorkgroupSize = 0,
+    bool threadLoop = false);
 
 } // namespace transpiler
 
