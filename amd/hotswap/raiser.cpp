@@ -871,6 +871,30 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     llvm::DenseMap<uint64_t, bool> writesPairInBB;
     llvm::DenseMap<uint64_t, uint64_t> bbOfInst; // inst offset -> BB start
     llvm::DenseMap<uint64_t, const DecodedInst *> lastInstInBB;
+    auto isKernargHighCanonicalMask = [&](const DecodedInst &di) -> bool {
+      if (di.semOp != SemOp::S_AND_B32 || di.numSrcs < 2 || di.numDefs < 1)
+        return false;
+      if (!di.isReg(0))
+        return false;
+      ParsedReg dst = ctx.parseReg(di.getReg(0), 0);
+      if (dst.kind != ParsedReg::SGPR || dst.baseIdx != kaHi)
+        return false;
+
+      unsigned s0Idx = di.srcMap[0];
+      unsigned s1Idx = di.srcMap[1];
+      auto srcIsKernargHi = [&](unsigned idx) {
+        if (!di.isReg(idx))
+          return false;
+        ParsedReg src = ctx.parseReg(di.getReg(idx), idx);
+        return src.kind == ParsedReg::SGPR && src.baseIdx == kaHi;
+      };
+      auto srcIsLow16Mask = [&](unsigned idx) {
+        return di.isImm(idx) &&
+               static_cast<uint64_t>(di.getImm(idx)) == 0xffffu;
+      };
+      return (srcIsKernargHi(s0Idx) && srcIsLow16Mask(s1Idx)) ||
+             (srcIsKernargHi(s1Idx) && srcIsLow16Mask(s0Idx));
+    };
     for (uint64_t bs : blockStarts) {
       writesPairInBB.try_emplace(bs, false);
       lastInstInBB.try_emplace(bs, nullptr);
@@ -898,6 +922,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         ParsedReg pr = ctx.parseReg(di.getReg(d), d);
         if (pr.kind == ParsedReg::SGPR &&
             (pr.baseIdx == kaLo || pr.baseIdx == kaHi)) {
+          if (pr.baseIdx == kaHi && isKernargHighCanonicalMask(di))
+            continue;
           writesPairInBB[bb] = true;
           break;
         }
@@ -1008,14 +1034,12 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     //   pristine[bb]       = AND over preds p: pristine[p] AND
     //                         !writesPairInBB[p]
     //
-    // We walk BBs in blockStarts order (ascending by address, which
-    // is a reasonable linearisation for AMDGPU kernels without
-    // SetPC chains) and iterate until no change. The initial state
-    // is conservative (every non-entry BB = false) and the transfer
-    // function is monotonically non-increasing on `true`, so
-    // convergence is guaranteed in at most `#BBs` iterations — in
-    // practice one or two for the straight-line-plus-diamond shapes
-    // we see.
+    // This is a greatest-fixed-point problem: a write-free loop header with
+    // a pristine preheader and a self-edge is pristine, because every trip
+    // around the loop preserves the pair. Initialising non-entry blocks to
+    // false permanently poisons such loops. Start optimistic, then
+    // monotonically remove blocks when any predecessor is dirty or writes the
+    // pair. Unreachable non-entry blocks (no preds) are removed.
     //
     // Skipped when `kaLo < 0` (no kernarg pointer enabled): mark
     // every BB pristine unconditionally to keep the call sites
@@ -1025,7 +1049,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       for (uint64_t bs : blockStarts)
         pristine.insert(bs);
     } else {
-      pristine.insert(kernelOffset); // entry BB.
+      for (uint64_t bs : blockStarts)
+        pristine.insert(bs);
       bool changed = true;
       unsigned iters = 0;
       const unsigned maxIters = static_cast<unsigned>(blockStarts.size()) + 2;
@@ -1033,22 +1058,20 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         changed = false;
         ++iters;
         for (uint64_t bs : blockStarts) {
-          if (pristine.contains(bs))
+          if (bs == kernelOffset)
             continue;
           const auto &preds = predecessors[bs];
-          if (preds.empty())
-            continue; // unreachable (other than entry).
-          bool allPristine = true;
-          for (uint64_t p : preds) {
-            if (!pristine.contains(p) || writesPairInBB.lookup(p)) {
-              allPristine = false;
-              break;
+          bool keepPristine = !preds.empty();
+          if (keepPristine) {
+            for (uint64_t p : preds) {
+              if (!pristine.contains(p) || writesPairInBB.lookup(p)) {
+                keepPristine = false;
+                break;
+              }
             }
           }
-          if (allPristine) {
-            pristine.insert(bs);
+          if (!keepPristine && pristine.erase(bs))
             changed = true;
-          }
         }
       }
       if (iters >= maxIters && changed) {
@@ -1331,6 +1354,29 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
           };
           const bool writesLo = writesKernargDword(kaLo);
           const bool writesHi = writesKernargDword(kaHi);
+          auto isKernargHighCanonicalMask = [&]() -> bool {
+            if (di.semOp != SemOp::S_AND_B32 || di.numSrcs < 2 ||
+                di.numDefs < 1 || !di.isReg(0))
+              return false;
+            ParsedReg dst = ctx.parseReg(di.getReg(0), 0);
+            if (dst.kind != ParsedReg::SGPR || dst.baseIdx != kaHi)
+              return false;
+
+            unsigned s0Idx = di.srcMap[0];
+            unsigned s1Idx = di.srcMap[1];
+            auto srcIsKernargHi = [&](unsigned idx) {
+              if (!di.isReg(idx))
+                return false;
+              ParsedReg src = ctx.parseReg(di.getReg(idx), idx);
+              return src.kind == ParsedReg::SGPR && src.baseIdx == kaHi;
+            };
+            auto srcIsLow16Mask = [&](unsigned idx) {
+              return di.isImm(idx) &&
+                     static_cast<uint64_t>(di.getImm(idx)) == 0xffffu;
+            };
+            return (srcIsKernargHi(s0Idx) && srcIsLow16Mask(s1Idx)) ||
+                   (srcIsKernargHi(s1Idx) && srcIsLow16Mask(s0Idx));
+          };
 
           if (writesLo || writesHi) {
             // Only attempt to update the delta if the tracker is
@@ -1371,7 +1417,15 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
                 return {false, 0};
               };
 
-              if (writesLo && !writesHi && di.semOp == SemOp::S_ADD_U32) {
+              if (writesHi && !writesLo && isKernargHighCanonicalMask() &&
+                  !ctx.kernargPtrDelta.pendingLow) {
+                // AMDGPU kernels commonly canonicalise the high dword of a
+                // 48-bit kernarg pointer with `s_and_b32 hi, hi, 0xffff`
+                // before issuing initial SMEM loads.  This preserves the
+                // modeled kernarg pointer value and does not change the
+                // const delta from entry.
+              } else if (writesLo && !writesHi &&
+                         di.semOp == SemOp::S_ADD_U32) {
                 // Stage the pending low add. The `s_addc_u32 hi, hi, 0`
                 // complement is expected to be the next instruction in
                 // the straight-line Tensile shape; anything else that
