@@ -5238,7 +5238,10 @@ const std::vector<Recipe> &allRecipes() {
         makeVCmpxGtI32Recipe(),
         makeSAndSaveexecB32Recipe(),
         makeVopdBitop2OrB32Recipe(),
-        makeC4LaneDepCmpxRecipe(),
+        // c4_lane_dep_cmpx is deliberately not registered here.  It is a
+        // gfx1250-only fail-loud classifier canary with no native gfx942
+        // numerical gold; see kernels/c4_lane_dep_cmpx.hip and the
+        // Makefile's FOREIGN_ONLY_KERNELS note.
         makeWmmaF32_16x16x4_GemmRecipe(),
         makeMubufStoreB32Recipe(),
         makeSSetVgprMsbRecipe(),

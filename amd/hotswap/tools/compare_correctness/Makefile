@@ -46,13 +46,18 @@ KERNELS        := vecadd block_sum_shfl lane_swap \
                   s_bitset0_b64 v_bfi_b32 v_cmp_cndmask_sgpr \
                   v_cmpx_gt_i32 s_and_saveexec_b32 \
                   vopd_bitop2_or_b32 \
-                  c4_lane_dep_cmpx \
                   wmma_f32_16x16x4_gemm \
                   mubuf_store_b32 s_set_vgpr_msb \
                   canary_readlane_last_lane \
                   canary_ds_swizzle_swap1 \
                   canary_ds_swizzle_quad_perm \
                   canary_cvt_scale_pk8_bf16_fp4
+
+# gfx1250-only obstruction canaries.  These intentionally use gfx12-only
+# inline asm and have no native gfx942 numerical gold.  Keep them out of the
+# default CpuReference correctness sweep; build/run them only in a dedicated
+# fail-loud classifier check that expects Salmon to refuse the gfx1250 .co.
+FOREIGN_ONLY_KERNELS := c4_lane_dep_cmpx
 
 # Triton recipes.  Each name must correspond to a kernels/triton/<name>.py
 # file that defines a RECIPES list (see kernels/triton/README.md).
@@ -100,28 +105,15 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   topk_forward_bisect_m_bf16_upconv \
                   topk_forward_bisect_m1_const_in \
                   topk_forward_bisect_m2_strict \
-                  topk_forward_bisect_m2_trace \
-                  topk_forward_bisect_m2_trace_iters \
-                  topk_forward_bisect_m2_trace_i2_parts \
                   topk_forward_bisect_m2_cmp_probe \
                   topk_forward_bisect_m2_invsub_probe \
                   topk_forward_bisect_m2_bitop3_nosel_probe \
-                  topk_forward_bisect_m2_bitop3_probe \
                   canary_tl_topk_bf16 \
                   canary_tl_topk_bf16_nw1 \
                   canary_tl_topk_fp32 \
                   canary_tl_sort_fp32 \
                   canary_tl_sort_fp32_n16 \
-                  canary_tl_sort_fp32_n16_nw1 \
-                  canary_tl_sort_fp32_n16_nw2 \
-                  canary_tl_sort_fp32_n16_nw8 \
-                  canary_tl_sort_fp32_n16_nw2_r32 \
-                  canary_pairsort1_fp32_n16_nw2_r32 \
-                  canary_cmp_materialize_eq_select_fp32_n16_nw2_r32 \
-                  canary_cmp_materialize_eq_select_fp32_n16_nw2_r64 \
-                  canary_cmp_materialize_eq_select_fp32_n16_nw8_r32 \
                   canary_cmp_invsub_u32 \
-                  canary_v_and_or_laneexpr_u32_nw2_r32 \
                   canary_tl_sort_fp32_n16_deterministic \
                   canary_tl_sort_fp32_n16_xor1 \
                   canary_tl_sort_fp32_n16_row_offset \

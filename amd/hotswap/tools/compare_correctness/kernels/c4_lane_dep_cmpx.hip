@@ -1,11 +1,15 @@
 // Probe for the Class 4 obstruction (lane-position-dependent EXEC
 // writes) defined in hotswap/docs/wave-size-translation.md §6.
-// Mirrors lit_tests/c4_lane_dep_cmpx (offline classifier pin);
-// this file provides the runtime evidence that (a) native gfx942
-// produces a specific output, (b) legacy half-wave-masking produces a
-// DIFFERENT output (upper target half dead), and (c) the
-// classifier-gated salmon path refuses the kernel instead of silently
-// miscompiling.
+// Mirrors lit_tests/c4_lane_dep_cmpx (offline classifier pin).
+//
+// This is a gfx1250-only fail-loud canary, NOT a normal numerical
+// correctness recipe: the inline asm below uses gfx12-only instructions
+// (`v_cmpx_ge_u32_e64`, gfx12 global-store spelling, split waitcnt) and
+// cannot be compiled into a native gfx942 gold kernel.  Its useful role is
+// to build a gfx1250 .co and verify Salmon refuses it with the Class-4
+// lane-position-dependent EXEC diagnostic rather than producing silent
+// wrong output.  Keep it out of the default native-vs-salmon sweep until
+// the harness grows an explicit expected-refusal mode.
 //
 // Kernel design. Each thread writes 1 to `out[tid]` iff it is active
 // during the masked store. The v_cmpx compares `mbcnt_lo(-1, 0)`
@@ -23,9 +27,8 @@
 //     target lane 32..63 stay at sentinel (0). Output diverges from
 //     native at exactly those positions.
 //
-// The classifier-gated salmon path aborts with
-// "cross-wave-Class-4-lane-position-dependent", preventing the silent
-// miscompile.
+// The classifier-gated salmon path aborts with the Class-4
+// lane-position-dependent diagnostic, preventing the silent miscompile.
 
 #include <hip/hip_runtime.h>
 

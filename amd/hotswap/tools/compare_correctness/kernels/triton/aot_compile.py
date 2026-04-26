@@ -247,6 +247,74 @@ def extract_metadata(co_bytes: bytes, kernel_symbol: str) -> dict:
 # correctness rationale.  Any value outside this tuple is rejected at
 # recipe-validation time rather than sneaking through into the sidecar.
 VALID_OUTPUT_INIT_MODES = ("sentinel", "zero")
+VALID_COMPARATOR_KINDS = ("abs", "rel", "rel-rms")
+INT_SIG_TYPES = {"i1", "i8", "u8", "i16", "u16",
+                 "i32", "u32", "i64", "u64"}
+FLOAT_SIG_TYPES = {"fp16", "bf16", "fp32", "fp64"}
+
+
+def _classify_sig_type(t: str) -> str:
+    if not t:
+        return "other"
+    if t[0] == "*":
+        return "pointer"
+    if t in INT_SIG_TYPES:
+        return "int"
+    if t in FLOAT_SIG_TYPES:
+        return "float"
+    return "other"
+
+
+def validate_comparator(c: dict, where: str) -> None:
+    if c.get("kind") not in VALID_COMPARATOR_KINDS:
+        raise RuntimeError(
+            f"{where}: comparator.kind must be one of "
+            f"{VALID_COMPARATOR_KINDS}, got {c.get('kind')!r}"
+        )
+    if "tol" not in c:
+        raise RuntimeError(f"{where}: comparator missing 'tol'")
+    float(c["tol"])  # raises if not numeric
+
+
+def validate_scalar_args(recipe: dict, path: str) -> None:
+    sa = recipe.get("scalar_args")
+    if sa is None:
+        return
+    if not isinstance(sa, dict):
+        raise RuntimeError(
+            f"{path}: scalar_args must be a dict mapping arg name to value"
+        )
+    sig = recipe["signature"]
+    for name, value in sa.items():
+        if name not in sig:
+            raise RuntimeError(
+                f"{path}: scalar_args[{name!r}] is not a sig arg "
+                f"(known sig args: {list(sig.keys())})"
+            )
+        sig_type = sig[name]
+        cls = _classify_sig_type(sig_type)
+        if cls == "pointer":
+            raise RuntimeError(
+                f"{path}: scalar_args[{name!r}] targets pointer sig arg "
+                f"{sig_type!r}; pointer args come from inputs/outputs"
+            )
+        if cls == "int":
+            if not isinstance(value, str):
+                raise RuntimeError(
+                    f"{path}: scalar_args[{name!r}] has integer sig type "
+                    f"{sig_type!r}; value must be a string expression"
+                )
+        elif cls == "float":
+            if not isinstance(value, (int, float)):
+                raise RuntimeError(
+                    f"{path}: scalar_args[{name!r}] has floating sig type "
+                    f"{sig_type!r}; value must be a numeric literal"
+                )
+        else:
+            raise RuntimeError(
+                f"{path}: scalar_args[{name!r}] has unsupported sig type "
+                f"{sig_type!r}"
+            )
 
 
 def validate_recipe(recipe: dict, path: str) -> None:
@@ -268,8 +336,7 @@ def validate_recipe(recipe: dict, path: str) -> None:
         raise RuntimeError(f"{path}: recipe is missing keys: {missing}")
     if not isinstance(recipe["default_shapes"], list) or not recipe["default_shapes"]:
         raise RuntimeError(f"{path}: default_shapes must be a non-empty list")
-    if recipe["comparator"].get("kind") not in ("abs", "rel"):
-        raise RuntimeError(f"{path}: comparator.kind must be 'abs' or 'rel'")
+    validate_comparator(recipe["comparator"], f"{path}: recipe-level comparator")
     for axis in ("x", "y", "z"):
         if axis not in recipe["grid"]:
             raise RuntimeError(f"{path}: grid missing axis {axis!r}")
@@ -296,6 +363,12 @@ def validate_recipe(recipe: dict, path: str) -> None:
     outs = recipe["outputs"]
     if not outs:
         raise RuntimeError(f"{path}: at least one output is required")
+    for b in outs:
+        if "comparator" in b:
+            validate_comparator(
+                b["comparator"], f"{path}: output {b['name']!r} comparator"
+            )
+    validate_scalar_args(recipe, path)
 
 
 def _emit_input_entry(b: dict) -> dict:
@@ -349,6 +422,11 @@ def _emit_output_entry(b: dict) -> dict:
                 f"must be one of {VALID_OUTPUT_INIT_MODES}"
             )
         out["init"] = b["init"]
+    if "comparator" in b:
+        out["comparator"] = {
+            "kind": b["comparator"]["kind"],
+            "tol": float(b["comparator"]["tol"]),
+        }
     return out
 
 
@@ -435,9 +513,7 @@ def build_recipe(recipe: dict, out_dir: str, kernel_file: str) -> None:
     if "harness_constants" in recipe:
         sidecar["harness_constants"] = dict(recipe["harness_constants"])
     if "scalar_args" in recipe:
-        sidecar["scalar_args"] = {
-            k: str(v) for k, v in recipe["scalar_args"].items()
-        }
+        sidecar["scalar_args"] = dict(recipe["scalar_args"])
     sidecar_path = os.path.join(out_dir, f"{name}.sidecar.json")
     with open(sidecar_path, "w") as f:
         json.dump(sidecar, f, indent=2)
