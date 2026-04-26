@@ -103,6 +103,9 @@ LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness
 # One recipe
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=vecadd
 
+# One recipe, native/reference + Salmon only (skip legacy byte translator)
+LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=vecadd --skip-legacy
+
 # Restrict N (cross-produced with the recipe's default blocks)
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --shape=256 --shape=1024
 
@@ -115,7 +118,9 @@ LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --shape=1024 --block=1
 
 `--shape` and `--block` are both repeatable.  If both are given, the
 harness runs their cross-product.  If only one is given, the other
-dimension uses the recipe's default list.
+dimension uses the recipe's default list.  `--skip-legacy` leaves the
+legacy column visible as `skipped` but does not spawn the byte-translator
+child, which is useful when you only need native gold plus Salmon.
 
 The parent sets `HSA_HOTSWAP_ISA_OVERRIDE=gfx942` and
 `HSA_HOTSWAP_RULES=/dev/null` if not already set; these are inherited by

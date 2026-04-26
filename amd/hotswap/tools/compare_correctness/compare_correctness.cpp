@@ -2705,7 +2705,7 @@ Recipe makeVopdBitop2OrB32Recipe() {
 // wave64) is >= 16.
 // ─────────────────────────────────────────────────────────────────────────────
 
-Recipe makeC4LaneDepCmpxRecipe() {
+[[maybe_unused]] Recipe makeC4LaneDepCmpxRecipe() {
   Recipe r;
   r.name = "c4_lane_dep_cmpx";
   // Pick block sizes > warpSize=64 so both target waves of a block
@@ -5505,6 +5505,10 @@ ChildRun spawnChild(const std::string &exe, Mode mode,
 
 struct ModeResult {
   ChildRun child;
+  // True when the parent deliberately did not spawn this mode (currently
+  // `--skip-legacy`).  This is distinct from spawn-fail: skipped modes should
+  // be visible in the grid but not counted as failures.
+  bool skipped = false;
   // Present only if the child wrote a readable output file.
   std::optional<std::vector<uint8_t>> output;
   // Diff stats vs. the recipe's gold.  For HIP recipes the gold is the
@@ -5542,7 +5546,8 @@ std::string tempPath(const std::string &tag) {
   return dir + "/cmp_correct_" + std::to_string(getpid()) + "_" + tag + ".bin";
 }
 
-RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize) {
+RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize,
+                 bool skipLegacy) {
   RunResult rr;
   rr.recipe = &r;
   rr.N = N;
@@ -5615,14 +5620,16 @@ RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize) 
     if (rr.native.output) {
       rr.cpuGold = *rr.native.output;
       rr.native.mismatches = 0;  // native IS the gold
-      runMode(Mode::Legacy, rr.legacy, "legacy", /*skipCompare=*/false);
+      if (skipLegacy) rr.legacy.skipped = true;
+      else runMode(Mode::Legacy, rr.legacy, "legacy", /*skipCompare=*/false);
       runMode(Mode::Salmon, rr.salmon, "salmon", /*skipCompare=*/false);
     } else {
       rr.goldMissing = true;
     }
   } else {
     runMode(Mode::Native, rr.native, "native", /*skipCompare=*/false);
-    runMode(Mode::Legacy, rr.legacy, "legacy", /*skipCompare=*/false);
+    if (skipLegacy) rr.legacy.skipped = true;
+    else runMode(Mode::Legacy, rr.legacy, "legacy", /*skipCompare=*/false);
     runMode(Mode::Salmon, rr.salmon, "salmon", /*skipCompare=*/false);
   }
 
@@ -5638,6 +5645,7 @@ RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize) 
 // whenever we actually did (or tried to) compare the child's output against a
 // pre-existing gold.
 std::string statusStr(const ModeResult &mr, int totalElems) {
+  if (mr.skipped) return "skipped";
   if (!mr.child.launched) return "spawn-fail";
   if (mr.child.signal > 0) {
     char b[64];
@@ -5658,6 +5666,7 @@ std::string statusStr(const ModeResult &mr, int totalElems) {
 // other modes against).  If it didn't, we fall back to the usual failure
 // string.
 std::string statusStrNativeAsGold(const ModeResult &mr) {
+  if (mr.skipped) return "skipped";
   if (!mr.child.launched) return "spawn-fail";
   if (mr.child.signal > 0) {
     char b[64];
@@ -5675,9 +5684,10 @@ std::string statusStrNativeAsGold(const ModeResult &mr) {
 std::string statusStrNoGold() { return "no-gold"; }
 
 // Classify a mode result for summary counts.
-enum class ResultCat { Match, Mismatch, Crash, Gold, GoldMissing };
+enum class ResultCat { Match, Mismatch, Crash, Gold, GoldMissing, Skipped };
 
 ResultCat classify(const ModeResult &m) {
+  if (m.skipped)                                      return ResultCat::Skipped;
   if (!m.child.launched)                             return ResultCat::Crash;
   if (m.child.signal > 0)                            return ResultCat::Crash;
   if (!m.child.exitedCleanly)                        return ResultCat::Crash;
@@ -5688,6 +5698,7 @@ ResultCat classify(const ModeResult &m) {
 }
 
 ResultCat classifyNativeAsGold(const ModeResult &m) {
+  if (m.skipped)                return ResultCat::Skipped;
   if (!m.child.launched)       return ResultCat::GoldMissing;
   if (m.child.signal > 0)      return ResultCat::GoldMissing;
   if (!m.child.exitedCleanly)  return ResultCat::GoldMissing;
@@ -5721,6 +5732,9 @@ std::string oneLineTail(const std::string &s, size_t cap = 160) {
 
 // Rich, one-line diagnostic for the Failures section.
 std::string failureDetail(const ModeResult &m, int outElems) {
+  if (m.skipped) {
+    return "";
+  }
   if (!m.child.launched) {
     return "spawn-fail";
   }
@@ -5785,7 +5799,7 @@ void printReport(const std::vector<RunResult> &all) {
   // Counters for the summary matrix: cnt[mode][category].  mode: 0=native,
   // 1=legacy, 2=salmon.  We track all categories even though some only
   // apply to certain gold sources.
-  const int NUM_CATS = 5;
+  const int NUM_CATS = 6;
   int cnt[3][NUM_CATS] = {{0}, {0}, {0}};
 
   // Failures grouped per mode, in input order.
@@ -5819,7 +5833,8 @@ void printReport(const std::vector<RunResult> &all) {
         c = classify(*mm[i]);
       }
       ++cnt[i][static_cast<int>(c)];
-      bool ok = (c == ResultCat::Match) || (c == ResultCat::Gold);
+      bool ok = (c == ResultCat::Match) || (c == ResultCat::Gold) ||
+                (c == ResultCat::Skipped);
       if (!ok) {
         std::string detail;
         if (c == ResultCat::GoldMissing) {
@@ -5880,6 +5895,10 @@ void printReport(const std::vector<RunResult> &all) {
   row("match",         ResultCat::Match);
   row("mismatch",      ResultCat::Mismatch);
   row("crash/no-exit", ResultCat::Crash);
+  if (cnt[0][static_cast<int>(ResultCat::Skipped)] +
+      cnt[1][static_cast<int>(ResultCat::Skipped)] +
+      cnt[2][static_cast<int>(ResultCat::Skipped)] > 0)
+    row("skipped",       ResultCat::Skipped);
   // Only print the native-as-gold rows when there's something to show —
   // otherwise they're just noise for HIP-only runs.
   if (cnt[0][static_cast<int>(ResultCat::Gold)] +
@@ -5902,6 +5921,7 @@ struct Options {
   std::string recipeFilter;
   std::vector<int> shapeFilter;   // restrict N (parent sweep)
   std::vector<int> blockFilter;   // restrict block size (parent sweep)
+  bool skipLegacy = false;        // parent sweep: run native + salmon only
   std::string inputPath;          // child-only
   std::string outputPath;         // child-only
   int N = -1;                     // child-only
@@ -5929,6 +5949,8 @@ void printHelp(const char *argv0) {
       "  --block=<B>       restrict block sizes (repeatable). Cross-product\n"
       "                    with --shape.  If omitted, the recipe's default\n"
       "                    block list is used.\n"
+      "  --skip-legacy     do not spawn the legacy byte-translator child;\n"
+      "                    useful when only native gold + Salmon matters.\n"
       "  -h | --help       show this help\n"
       "\n"
       "Internal child mode (used by the parent when spawning):\n"
@@ -5957,6 +5979,8 @@ bool parseArgs(int argc, char **argv, Options &opt) {
       opt.shapeFilter.push_back(std::atoi(tmp.c_str()));
     } else if (eq("--block=", tmp)) {
       opt.blockFilter.push_back(std::atoi(tmp.c_str()));
+    } else if (a == "--skip-legacy") {
+      opt.skipLegacy = true;
     } else if (eq("--N=", tmp)) {
       opt.N = std::atoi(tmp.c_str());
     } else if (eq("--B=", tmp)) {
@@ -6015,6 +6039,7 @@ int main(int argc, char **argv) {
          std::getenv("LD_PRELOAD") ? std::getenv("LD_PRELOAD") : "(unset)");
   printf("  LD_LIBRARY_PATH          = %s\n",
          std::getenv("LD_LIBRARY_PATH") ? std::getenv("LD_LIBRARY_PATH") : "(unset)");
+  printf("  skip_legacy          = %s\n", opt.skipLegacy ? "yes" : "no");
 
   std::vector<RunResult> all;
   // Precompute a fast name -> TritonRecipe* map so the shape-filter
@@ -6136,7 +6161,7 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "  [run] recipe=%s %s ...\n",
                 r.name.c_str(), shapeLog(N, B).c_str());
-        all.push_back(runOne(exe, r, N, B));
+        all.push_back(runOne(exe, r, N, B, opt.skipLegacy));
       }
     }
   }
