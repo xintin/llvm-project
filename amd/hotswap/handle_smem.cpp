@@ -98,16 +98,31 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     bool immOffset = di.isImm(offIdx);
     int64_t byteOffset = immOffset ? op.srcImm(1) : 0;
     int kernargPtrSgpr = getKernargPtrSgpr(ctx);
-    bool isKernarg = (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
-                      base.baseIdx == kernargPtrSgpr);
+    bool baseIsKernargPair =
+        (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
+         base.baseIdx == kernargPtrSgpr);
+    bool isKernarg =
+        baseIsKernargPair &&
+        ctx.kernargPtrDelta.baseKind ==
+            RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
 
     // The kernarg-slot fast path routes `isKernarg && immOffset` loads
     // through `extractKernargDword` — reading the IR-level kernel
     // argument directly rather than dereferencing the SGPR pair. That
     // pair's alloca was seeded with a null sentinel at kernel entry
     // (raiser.cpp Phase 4), so the dynamic path through the SGPR value
-    // is not a valid pointer. The fast path is therefore the *only*
-    // correct lowering when the pair's sbase is the kernarg pointer.
+    // is not a valid pointer while the pair still denotes the kernarg
+    // segment. The fast path is therefore the *only* correct lowering
+    // when the pair's sbase is the entry kernarg pointer (possibly plus
+    // a tracked constant delta).
+    //
+    // Once the pair has been fully overwritten with a non-kernarg value
+    // (for example SGLang/Triton computes `s[0:1] = preloaded_ptr +
+    // wg_offset` before issuing `s_load_b32 sN, s[0:1], 0`), it is no
+    // longer a kernarg-segment pointer despite occupying the same
+    // physical SGPRs. `raiser.cpp` marks that provenance as NonKernarg,
+    // and this handler deliberately falls through to the normal SGPR
+    // address path. Unknown provenance still refuses loudly below.
     //
     // When the kernel has shifted the pair by a const delta before the
     // load (Tensile UniversalArgs: `s_add_u32 ka, ka, 0x10 ; s_addc_u32
@@ -146,6 +161,22 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     //      argument. No kernel in the kerneldex corpus exercises this
     //      shape; refuse rather than silently substitute zero.
     int64_t effectiveByteOffset = byteOffset;
+    if (baseIsKernargPair &&
+        ctx.kernargPtrDelta.baseKind ==
+            RaiseContext::KernargPtrDelta::BaseKind::Unknown) {
+      llvm::errs()
+          << "transpiler: " << di.mnemonic << ": kernarg-pair SGPR (s["
+          << kernargPtrSgpr << ":" << (kernargPtrSgpr + 1)
+          << "]) has unknown provenance at this load site. It may still be "
+             "derived from the entry kernarg pointer by a non-foldable "
+             "mutation or by a CFG merge with divergent incoming values; "
+             "falling through to the normal SGPR-address path would "
+             "dereference the sentinel-seeded entry value and can silently "
+             "miscompile. Refuse instead.\n";
+      hr.failure = RaiseFailure::smemKernargMiss(di);
+      return hr;
+    }
+
     if (isKernarg) {
       if (ctx.kernargPtrDelta.pendingLow) {
         llvm::errs()
@@ -372,8 +403,25 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     // given sbase is treated as "the kernarg pointer" is a single
     // source-ABI question, not two independently-drifted heuristics.
     int kernargPtrSgpr = getKernargPtrSgpr(ctx);
-    bool isKernarg = (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
-                      base.baseIdx == kernargPtrSgpr);
+    bool baseIsKernargPair =
+        (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
+         base.baseIdx == kernargPtrSgpr);
+    bool isKernarg =
+        baseIsKernargPair &&
+        ctx.kernargPtrDelta.baseKind ==
+            RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
+    if (baseIsKernargPair &&
+        ctx.kernargPtrDelta.baseKind ==
+            RaiseContext::KernargPtrDelta::BaseKind::Unknown) {
+      llvm::errs()
+          << "transpiler: " << di.mnemonic << ": kernarg-pair SGPR (s["
+          << kernargPtrSgpr << ":" << (kernargPtrSgpr + 1)
+          << "]) has unknown provenance at this narrow load site; refusing "
+             "rather than dereferencing a possibly sentinel-seeded kernarg "
+             "pointer value\n";
+      hr.failure = RaiseFailure::smemKernargMiss(di);
+      return hr;
+    }
     if (isKernarg) {
       llvm::errs() << "transpiler: " << di.mnemonic
                    << ": narrow scalar load directly off the kernarg pointer "

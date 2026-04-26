@@ -83,18 +83,22 @@ struct RaiseContext {
   // `extractKernargDword(imm_offset)` and silently pull kernarg bytes
   // from offset 0 instead of offset 16 — the issue-21 miscompile.
   //
-  // This tracker records the accumulated constant 64-bit delta from the
-  // kernarg-pair entry value within a single basic block. The only
-  // pattern it recognises is the canonical 64-bit const-add:
+  // This tracker records the provenance of the SGPR pair that *started*
+  // life as the kernarg pointer. When the pair still denotes the kernarg
+  // segment, it also records the accumulated constant 64-bit delta from
+  // the entry value within a single basic block. The only kernarg-preserving
+  // mutation it recognises is the canonical 64-bit const-add:
   //
   //     s_add_u32  s[ka],   s[ka],   #K      ; low dword += K, SCC = carry
   //     s_addc_u32 s[ka+1], s[ka+1], #0      ; high dword += 0 + carry
   //
-  // Any other write to either dword of the pair invalidates the tracker,
-  // and handle_smem.cpp refuses the kernarg-slot fast path when the
-  // tracker is invalid (no silent fallback to reading the clobbered SGPR
-  // value, which was seeded with a null sentinel in raiser.cpp's
-  // Phase 4 and would silently miscompile).
+  // Writes that derive from the entry kernarg pointer but cannot be folded
+  // to a single constant delta make the pair Unknown, and handle_smem.cpp
+  // refuses the kernarg-slot fast path when the tracker is Unknown (no
+  // silent fallback to reading the sentinel-seeded SGPR value). Complete
+  // overwrites from independent values, or SMEM loads that materialise both
+  // halves of the pair, make the pair NonKernarg: later `s_load_b*` through
+  // the same physical registers must lower as ordinary scalar memory.
   //
   // Lifetime: reset to `(delta=0, valid=true)` at the kernel entry BB and
   // invalidated (`valid=false`) at every BB boundary in the raiser's
@@ -124,9 +128,14 @@ struct RaiseContext {
   //        instruction clobbers SCC the pair's high-dword add would
   //        carry a stale bit, breaking the 64-bit semantics.)
   //
-  //   valid=false  (terminal for the BB)
-  //     no transitions; BB boundary resets to (delta=0, valid=false).
-  //     Entry BB resets to (delta=0, valid=true).
+  //   baseKind=Unknown  (terminal for the BB unless a later instruction
+  //     fully overwrites both halves from non-kernarg sources)
+  //     handle_smem refuses loads through the pair. BB boundary resets to
+  //     Kernarg for pristine BBs, Unknown otherwise.
+  //
+  //   baseKind=NonKernarg
+  //     the pair holds an ordinary scalar value/pointer. handle_smem must
+  //     take the normal SGPR-address path, not the kernarg extractor.
   //
   // The high-dword immediate MUST be exactly 0 for the pattern to fold
   // to a single 64-bit delta: `lo + K` with `hi + 0 + carry_out` is the
@@ -135,11 +144,23 @@ struct RaiseContext {
   // high half by more than the low carry and would not fold to a clean
   // 64-bit const delta.
   struct KernargPtrDelta {
+    enum class BaseKind {
+      Kernarg,
+      NonKernarg,
+      Unknown,
+    };
+
+    // Whether the SGPR pair currently denotes the kernarg segment pointer,
+    // an ordinary non-kernarg value, or an unmodelled value derived from the
+    // entry kernarg pointer.
+    BaseKind baseKind = BaseKind::Kernarg;
     // Accumulated 64-bit const delta from the kernarg-pair entry value.
-    // Meaningful only when `valid` is true and `pendingLow` is false.
+    // Meaningful only when `baseKind == Kernarg`, `valid` is true, and
+    // `pendingLow` is false.
     int64_t delta = 0;
     // Whether `delta` accurately reflects the pair's current value
-    // (modulo the 64-bit low/high add semantics above).
+    // (modulo the 64-bit low/high add semantics above). Kept for the
+    // existing handler checks; false whenever `baseKind != Kernarg`.
     bool valid = true;
     // Low dword has been advanced by `pendingLowDelta`; high dword has
     // not yet been matched by the complementary S_ADDC_U32(hi, hi, #0).
@@ -151,6 +172,97 @@ struct RaiseContext {
     int64_t pendingLowDelta = 0;
   };
   KernargPtrDelta kernargPtrDelta;
+
+  // Single-BB provenance for SGPR dwords that may carry the sentinel-modeled
+  // entry kernarg pointer. This deliberately tracks only the question the SMEM
+  // kernarg fast path needs to answer:
+  //
+  //   "Is this SGPR dword definitely independent of the entry kernarg
+  //    pointer, definitely the low/high dword of that pointer plus a known
+  //    const delta, or unknown?"
+  //
+  // It is NOT a general value-numbering engine. At BB boundaries we reset to
+  // Unknown (except for the original kernarg pair in pristine BBs), because
+  // cross-BB provenance would require real reaching-definition/phi reasoning.
+  // Within a BB it closes the important aliasing hole: a copy of s[ka:ka+1]
+  // into another SGPR pair remains Kernarg-derived, so writing s[ka:ka+1]
+  // from that alias cannot be mistaken for an independent non-kernarg
+  // overwrite.
+  struct SgprKernargProvenance {
+    enum class Kind {
+      Unknown,
+      NonKernarg,
+      Kernarg,
+    };
+
+    Kind kind = Kind::Unknown;
+    int64_t delta = 0;
+    uint8_t subDword = 0; // 0 = low, 1 = high when kind == Kernarg.
+  };
+  llvm::SmallVector<SgprKernargProvenance> sgprKernargProvenance;
+  // BB starts whose only predecessor is the immediately preceding block in
+  // source address order. The raiser processes those blocks immediately after
+  // their sole predecessor, so carrying the single-BB provenance state across
+  // that boundary is dominance-correct. All other BB entries reset to Unknown
+  // unless the original kernarg pair is proven pristine by
+  // `kernargPristineBBs`.
+  llvm::DenseSet<uint64_t> sgprProvenanceFallthroughBBs;
+
+  void initializeSgprKernargProvenance() {
+    sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
+    if (userSgprLayout == nullptr)
+      return;
+
+    for (size_t i = 0; i < userSgprLayout->entries.size() &&
+                       i < sgprKernargProvenance.size();
+         ++i) {
+      const auto &entry = userSgprLayout->entries[i];
+      if (entry.source == UserSgprLayout::Source::KernargSegmentPtr) {
+        sgprKernargProvenance[i].kind =
+            SgprKernargProvenance::Kind::Kernarg;
+        sgprKernargProvenance[i].delta = 0;
+        sgprKernargProvenance[i].subDword = entry.subDword;
+      } else if (entry.source != UserSgprLayout::Source::Unset) {
+        sgprKernargProvenance[i].kind =
+            SgprKernargProvenance::Kind::NonKernarg;
+      }
+    }
+  }
+
+  void setKernargPairProvenance(KernargPtrDelta::BaseKind kind,
+                                int64_t delta = 0) {
+    if (userSgprLayout == nullptr)
+      return;
+    const int kaLo = userSgprLayout->kernargSegmentPtrSgpr;
+    if (kaLo < 0 || static_cast<size_t>(kaLo + 1) >=
+                        sgprKernargProvenance.size())
+      return;
+
+    switch (kind) {
+    case KernargPtrDelta::BaseKind::Kernarg:
+      sgprKernargProvenance[kaLo].kind =
+          SgprKernargProvenance::Kind::Kernarg;
+      sgprKernargProvenance[kaLo].delta = delta;
+      sgprKernargProvenance[kaLo].subDword = 0;
+      sgprKernargProvenance[kaLo + 1].kind =
+          SgprKernargProvenance::Kind::Kernarg;
+      sgprKernargProvenance[kaLo + 1].delta = delta;
+      sgprKernargProvenance[kaLo + 1].subDword = 1;
+      break;
+    case KernargPtrDelta::BaseKind::NonKernarg:
+      sgprKernargProvenance[kaLo] = {};
+      sgprKernargProvenance[kaLo].kind =
+          SgprKernargProvenance::Kind::NonKernarg;
+      sgprKernargProvenance[kaLo + 1] = {};
+      sgprKernargProvenance[kaLo + 1].kind =
+          SgprKernargProvenance::Kind::NonKernarg;
+      break;
+    case KernargPtrDelta::BaseKind::Unknown:
+      sgprKernargProvenance[kaLo] = {};
+      sgprKernargProvenance[kaLo + 1] = {};
+      break;
+    }
+  }
 
   // Precomputed set of BB-start offsets where the kernarg pair is
   // *guaranteed* to still hold its entry-time value: i.e. there is no
@@ -216,10 +328,20 @@ struct RaiseContext {
   // valid=true) and the entry BB is unconditionally in
   // `kernargPristineBBs`.
   void resetKernargPtrDeltaAtBBBoundary(uint64_t bbOffset) {
+    if (sgprProvenanceFallthroughBBs.contains(bbOffset))
+      return;
+
     kernargPtrDelta.delta = 0;
-    kernargPtrDelta.valid = kernargPristineBBs.contains(bbOffset);
+    kernargPtrDelta.baseKind = kernargPristineBBs.contains(bbOffset)
+                                   ? KernargPtrDelta::BaseKind::Kernarg
+                                   : KernargPtrDelta::BaseKind::Unknown;
+    kernargPtrDelta.valid =
+        kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg;
     kernargPtrDelta.pendingLow = false;
     kernargPtrDelta.pendingLowDelta = 0;
+    sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
+    if (kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg)
+      setKernargPairProvenance(KernargPtrDelta::BaseKind::Kernarg, 0);
   }
 
   // gfx1250 s_set_vgpr_msb state: only the LOW 8 bits of the instruction's

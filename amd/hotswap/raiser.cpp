@@ -49,6 +49,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <map>
+#include <utility>
 
 #define DEBUG_TYPE "wave-projection"
 
@@ -145,6 +146,563 @@ ThreadLoopDecisionResult decideThreadLoopFallback(unsigned sourceWaveSize,
   return {ThreadLoopDecision::EligibleButGateOff,
           "eligible but graduation gate is off"};
 }
+
+// Tracks one narrow question while raising a single instruction:
+//
+//   "Did this instruction prove that the source-ABI kernarg SGPR pair no
+//    longer denotes the sentinel-modeled entry kernarg pointer?"
+//
+// This is intentionally not a general dataflow engine. It is a local
+// provenance update over the SGPR dword table stored in RaiseContext, paired
+// with the older constant-delta tracker for the original kernarg pair. Unknown
+// provenance remains loud: handle_smem.cpp refuses loads through s[ka:ka+1]
+// unless this updater proves either `Kernarg + const delta` or `NonKernarg`.
+class KernargSgprProvenanceUpdater {
+  using PairKind = RaiseContext::KernargPtrDelta::BaseKind;
+  using DwordProv = RaiseContext::SgprKernargProvenance;
+  using DwordKind = RaiseContext::SgprKernargProvenance::Kind;
+
+public:
+  KernargSgprProvenanceUpdater(RaiseContext &Ctx, const DecodedInst &DI,
+                               OpResolver &Op, int KaLo)
+      : Ctx(Ctx), DI(DI), Op(Op), KaLo(KaLo), KaHi(KaLo + 1) {
+    HasLogicalDst = computeLogicalDst(LogicalDst);
+  }
+
+  void update() {
+    const bool writesLo = writesKernargDword(KaLo);
+    const bool writesHi = writesKernargDword(KaHi) || hasWideDefAtKernargLo();
+
+    updateOriginalKernargPair(writesLo, writesHi);
+    updateGenericSgprProvenance();
+  }
+
+private:
+  RaiseContext &Ctx;
+  const DecodedInst &DI;
+  OpResolver &Op;
+  int KaLo = -1;
+  int KaHi = -1;
+  ParsedReg LogicalDst;
+  bool HasLogicalDst = false;
+
+  static bool semOpHasLogicalDst(SemOp Sop) {
+    switch (Sop) {
+    case SemOp::S_GETREG_B32:
+    case SemOp::S_MOV_B32:
+    case SemOp::S_MOV_B64:
+    case SemOp::S_AND_B32:
+    case SemOp::S_OR_B32:
+    case SemOp::S_XOR_B32:
+    case SemOp::S_ANDN2_B32:
+    case SemOp::S_ORN2_B32:
+    case SemOp::S_NAND_B32:
+    case SemOp::S_NOR_B32:
+    case SemOp::S_XNOR_B32:
+    case SemOp::S_ADD_U32:
+    case SemOp::S_ADDC_U32:
+    case SemOp::S_SUB_U32:
+    case SemOp::S_SUBB_U32:
+    case SemOp::S_MUL_I32:
+    case SemOp::S_MUL_HI_U32:
+    case SemOp::S_MUL_HI_I32:
+    case SemOp::S_LSHL_B32:
+    case SemOp::S_LSHR_B32:
+    case SemOp::S_ASHR_I32:
+    case SemOp::S_BFE_U32:
+    case SemOp::S_BFE_I32:
+    case SemOp::S_BFM_B32:
+    case SemOp::S_CSELECT_B32:
+    case SemOp::S_NOT_B64:
+    case SemOp::S_CMOV_B64:
+    case SemOp::S_AND_B64:
+    case SemOp::S_OR_B64:
+    case SemOp::S_XOR_B64:
+    case SemOp::S_ANDN2_B64:
+    case SemOp::S_ORN2_B64:
+    case SemOp::S_NAND_B64:
+    case SemOp::S_NOR_B64:
+    case SemOp::S_XNOR_B64:
+    case SemOp::S_LSHL_B64:
+    case SemOp::S_LSHR_B64:
+    case SemOp::S_ASHR_I64:
+    case SemOp::S_BFM_B64:
+    case SemOp::S_CSELECT_B64:
+    case SemOp::S_BITSET0_B64:
+    case SemOp::S_BITSET1_B64:
+    case SemOp::S_ADD_NC_U64:
+    case SemOp::S_SUB_NC_U64:
+    case SemOp::S_MUL_U64:
+    case SemOp::S_LOAD_B32:
+    case SemOp::S_LOAD_B64:
+    case SemOp::S_LOAD_B96:
+    case SemOp::S_LOAD_B128:
+    case SemOp::S_LOAD_B256:
+    case SemOp::S_LOAD_B512:
+    case SemOp::S_LOAD_U8:
+    case SemOp::S_LOAD_I8:
+    case SemOp::S_LOAD_U16:
+    case SemOp::S_LOAD_I16:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  static bool semOpWritesScalarPair(SemOp Sop) {
+    switch (Sop) {
+    case SemOp::S_MOV_B64:
+    case SemOp::S_NOT_B64:
+    case SemOp::S_CMOV_B64:
+    case SemOp::S_AND_B64:
+    case SemOp::S_OR_B64:
+    case SemOp::S_XOR_B64:
+    case SemOp::S_ANDN2_B64:
+    case SemOp::S_ORN2_B64:
+    case SemOp::S_NAND_B64:
+    case SemOp::S_NOR_B64:
+    case SemOp::S_XNOR_B64:
+    case SemOp::S_LSHL_B64:
+    case SemOp::S_LSHR_B64:
+    case SemOp::S_ASHR_I64:
+    case SemOp::S_BFM_B64:
+    case SemOp::S_CSELECT_B64:
+    case SemOp::S_BITSET0_B64:
+    case SemOp::S_BITSET1_B64:
+    case SemOp::S_ADD_NC_U64:
+    case SemOp::S_SUB_NC_U64:
+    case SemOp::S_MUL_U64:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  static bool isSmemLoadResult(SemOp Sop) {
+    switch (Sop) {
+    case SemOp::S_LOAD_B32:
+    case SemOp::S_LOAD_B64:
+    case SemOp::S_LOAD_B96:
+    case SemOp::S_LOAD_B128:
+    case SemOp::S_LOAD_B256:
+    case SemOp::S_LOAD_B512:
+    case SemOp::S_LOAD_U8:
+    case SemOp::S_LOAD_I8:
+    case SemOp::S_LOAD_U16:
+    case SemOp::S_LOAD_I16:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  static int smemLoadDwords(SemOp Sop) {
+    switch (Sop) {
+    case SemOp::S_LOAD_B64:
+      return 2;
+    case SemOp::S_LOAD_B96:
+      return 3;
+    case SemOp::S_LOAD_B128:
+      return 4;
+    case SemOp::S_LOAD_B256:
+      return 8;
+    case SemOp::S_LOAD_B512:
+      return 16;
+    default:
+      return 1;
+    }
+  }
+
+  bool computeLogicalDst(ParsedReg &Out) {
+    if (!semOpHasLogicalDst(DI.semOp))
+      return false;
+    Out = Op.dst();
+    return true;
+  }
+
+  int semanticDefDwords(ParsedReg PR) const {
+    if (PR.kind != ParsedReg::SGPR)
+      return 0;
+    if (PR.width >= 2)
+      return PR.width;
+    if (semOpWritesScalarPair(DI.semOp) || DI.semOp == SemOp::S_LOAD_B64)
+      return 2;
+    if (isSmemLoadResult(DI.semOp))
+      return smemLoadDwords(DI.semOp);
+    return 1;
+  }
+
+  bool writesKernargDword(int BaseIdx) {
+    if (HasLogicalDst && LogicalDst.kind == ParsedReg::SGPR) {
+      int Lo = LogicalDst.baseIdx;
+      int Hi = LogicalDst.baseIdx + LogicalDst.width - 1;
+      if (Lo <= BaseIdx && BaseIdx <= Hi)
+        return true;
+    }
+    for (unsigned D = 0; D < DI.numDefs; ++D) {
+      if (!DI.isReg(D))
+        continue;
+      ParsedReg PR = Ctx.parseReg(DI.getReg(D), D);
+      if (PR.kind != ParsedReg::SGPR)
+        continue;
+      int Lo = PR.baseIdx;
+      int Hi = PR.baseIdx + PR.width - 1;
+      if (Lo <= BaseIdx && BaseIdx <= Hi)
+        return true;
+    }
+    return false;
+  }
+
+  bool hasWideDefAtKernargLo() {
+    bool DefStartsAtLo = false;
+    if (HasLogicalDst && LogicalDst.kind == ParsedReg::SGPR &&
+        LogicalDst.baseIdx == KaLo) {
+      if (LogicalDst.width >= 2)
+        return true;
+      DefStartsAtLo = true;
+    }
+    for (unsigned D = 0; D < DI.numDefs; ++D) {
+      if (!DI.isReg(D))
+        continue;
+      ParsedReg PR = Ctx.parseReg(DI.getReg(D), D);
+      if (PR.kind == ParsedReg::SGPR && PR.baseIdx == KaLo) {
+        if (PR.width >= 2)
+          return true;
+        DefStartsAtLo = true;
+      }
+    }
+    if (!DefStartsAtLo)
+      return false;
+    return semOpWritesScalarPair(DI.semOp) ||
+           DI.semOp == SemOp::S_LOAD_B64 || DI.semOp == SemOp::S_LOAD_B96 ||
+           DI.semOp == SemOp::S_LOAD_B128 ||
+           DI.semOp == SemOp::S_LOAD_B256 ||
+           DI.semOp == SemOp::S_LOAD_B512;
+  }
+
+  bool isKernargHighCanonicalMask() {
+    if (DI.semOp != SemOp::S_AND_B32 || DI.numSrcs < 2 ||
+        DI.numDefs < 1 || !DI.isReg(0))
+      return false;
+    ParsedReg Dst = Ctx.parseReg(DI.getReg(0), 0);
+    if (Dst.kind != ParsedReg::SGPR || Dst.baseIdx != KaHi)
+      return false;
+
+    unsigned S0Idx = DI.srcMap[0];
+    unsigned S1Idx = DI.srcMap[1];
+    auto SrcIsKernargHi = [&](unsigned Idx) {
+      if (!DI.isReg(Idx))
+        return false;
+      ParsedReg Src = Ctx.parseReg(DI.getReg(Idx), Idx);
+      return Src.kind == ParsedReg::SGPR && Src.baseIdx == KaHi;
+    };
+    auto SrcIsLow16Mask = [&](unsigned Idx) {
+      return DI.isImm(Idx) &&
+             static_cast<uint64_t>(DI.getImm(Idx)) == 0xffffu;
+    };
+    return (SrcIsKernargHi(S0Idx) && SrcIsLow16Mask(S1Idx)) ||
+           (SrcIsKernargHi(S1Idx) && SrcIsLow16Mask(S0Idx));
+  }
+
+  void markKernargUnknown() {
+    Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
+    Ctx.kernargPtrDelta.delta = 0;
+    Ctx.kernargPtrDelta.valid = false;
+    Ctx.kernargPtrDelta.pendingLow = false;
+    Ctx.kernargPtrDelta.pendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(PairKind::Unknown);
+  }
+
+  void markNonKernarg() {
+    Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
+    Ctx.kernargPtrDelta.delta = 0;
+    Ctx.kernargPtrDelta.valid = false;
+    Ctx.kernargPtrDelta.pendingLow = false;
+    Ctx.kernargPtrDelta.pendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(PairKind::NonKernarg);
+  }
+
+  void markTrackedKernarg(int64_t Delta) {
+    Ctx.kernargPtrDelta.baseKind = PairKind::Kernarg;
+    Ctx.kernargPtrDelta.delta = Delta;
+    Ctx.kernargPtrDelta.valid = true;
+    Ctx.kernargPtrDelta.pendingLow = false;
+    Ctx.kernargPtrDelta.pendingLowDelta = 0;
+    Ctx.setKernargPairProvenance(PairKind::Kernarg, Delta);
+  }
+
+  bool sgprOverlapsKernargPair(ParsedReg PR) const {
+    if (PR.kind != ParsedReg::SGPR)
+      return false;
+    int Lo = PR.baseIdx;
+    int Hi = PR.baseIdx + PR.width - 1;
+    return Lo <= KaHi && Hi >= KaLo;
+  }
+
+  DwordProv dwordProvenance(int Idx) const {
+    if (Idx < 0 ||
+        static_cast<size_t>(Idx) >= Ctx.sgprKernargProvenance.size())
+      return {};
+    return Ctx.sgprKernargProvenance[Idx];
+  }
+
+  bool regIsDefinitelyNonKernarg(ParsedReg PR) const {
+    if (PR.kind != ParsedReg::SGPR)
+      return true;
+    int Width = PR.width;
+    if (Width < 2 && semOpWritesScalarPair(DI.semOp))
+      Width = 2;
+    for (int I = 0; I < Width; ++I) {
+      if (dwordProvenance(PR.baseIdx + I).kind != DwordKind::NonKernarg)
+        return false;
+    }
+    return true;
+  }
+
+  bool allSourcesDefinitelyNonKernarg() {
+    for (unsigned S = 0; S < DI.numSrcs; ++S) {
+      unsigned Idx = DI.srcMap[S];
+      if (!DI.isReg(Idx))
+        continue;
+      if (!regIsDefinitelyNonKernarg(Ctx.parseReg(DI.getReg(Idx), Idx)))
+        return false;
+    }
+    return true;
+  }
+
+  void setDwordProv(int Idx, DwordProv P) {
+    if (Idx < 0 ||
+        static_cast<size_t>(Idx) >= Ctx.sgprKernargProvenance.size())
+      return;
+    Ctx.sgprKernargProvenance[Idx] = P;
+  }
+
+  void setDwordKind(int Idx, DwordKind Kind) {
+    DwordProv P;
+    P.kind = Kind;
+    setDwordProv(Idx, P);
+  }
+
+  void setOriginalPairDwordKind(int Idx, DwordKind Kind) {
+    setDwordKind(Idx, Kind);
+  }
+
+  void refreshOriginalPairFromDwords() {
+    auto Lo = dwordProvenance(KaLo);
+    auto Hi = dwordProvenance(KaHi);
+    if (Lo.kind == DwordKind::NonKernarg &&
+        Hi.kind == DwordKind::NonKernarg) {
+      Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
+      Ctx.kernargPtrDelta.valid = false;
+      Ctx.kernargPtrDelta.pendingLow = false;
+      Ctx.kernargPtrDelta.pendingLowDelta = 0;
+      Ctx.kernargPtrDelta.delta = 0;
+    }
+  }
+
+  bool smemLoadMaterializesFullPair(bool WritesLo, bool WritesHi) const {
+    if (!(WritesLo && WritesHi))
+      return false;
+    switch (DI.semOp) {
+    case SemOp::S_LOAD_B64:
+    case SemOp::S_LOAD_B96:
+    case SemOp::S_LOAD_B128:
+    case SemOp::S_LOAD_B256:
+    case SemOp::S_LOAD_B512:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  std::pair<bool, int64_t> classifyConstInPlaceAdd(int DstBase) {
+    if (DI.numSrcs < 2)
+      return {false, 0};
+    unsigned S0Idx = DI.srcMap[0];
+    unsigned S1Idx = DI.srcMap[1];
+    const bool S0Reg = DI.isReg(S0Idx);
+    const bool S1Reg = DI.isReg(S1Idx);
+    const bool S0Imm = DI.isImm(S0Idx);
+    const bool S1Imm = DI.isImm(S1Idx);
+
+    auto RegMatchesDst = [&](unsigned Idx) {
+      ParsedReg PR = Ctx.parseReg(DI.getReg(Idx), Idx);
+      return PR.kind == ParsedReg::SGPR && PR.baseIdx == DstBase;
+    };
+
+    if (S0Reg && S1Imm && RegMatchesDst(S0Idx))
+      return {true, DI.getImm(S1Idx)};
+    if (S1Reg && S0Imm && RegMatchesDst(S1Idx))
+      return {true, DI.getImm(S0Idx)};
+    return {false, 0};
+  }
+
+  void updateOriginalKernargPair(bool WritesLo, bool WritesHi) {
+    if (!(WritesLo || WritesHi)) {
+      if (Ctx.kernargPtrDelta.valid && Ctx.kernargPtrDelta.pendingLow &&
+          DI.defsSCC)
+        markKernargUnknown();
+      return;
+    }
+
+    const bool WritesFullPair = WritesLo && WritesHi;
+    const bool FullIndependentOverwrite =
+        WritesFullPair && allSourcesDefinitelyNonKernarg();
+    if (FullIndependentOverwrite ||
+        smemLoadMaterializesFullPair(WritesLo, WritesHi)) {
+      markNonKernarg();
+      return;
+    }
+    if (!WritesFullPair && allSourcesDefinitelyNonKernarg()) {
+      Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
+      Ctx.kernargPtrDelta.delta = 0;
+      Ctx.kernargPtrDelta.valid = false;
+      Ctx.kernargPtrDelta.pendingLow = false;
+      Ctx.kernargPtrDelta.pendingLowDelta = 0;
+      if (WritesLo)
+        setOriginalPairDwordKind(KaLo, DwordKind::NonKernarg);
+      if (WritesHi)
+        setOriginalPairDwordKind(KaHi, DwordKind::NonKernarg);
+      refreshOriginalPairFromDwords();
+      return;
+    }
+    if (!Ctx.kernargPtrDelta.valid) {
+      markKernargUnknown();
+      return;
+    }
+    if (WritesHi && !WritesLo && isKernargHighCanonicalMask() &&
+        !Ctx.kernargPtrDelta.pendingLow)
+      return;
+    if (WritesLo && !WritesHi && DI.semOp == SemOp::S_ADD_U32) {
+      auto [Ok, Imm] = classifyConstInPlaceAdd(KaLo);
+      if (!Ok) {
+        markKernargUnknown();
+        return;
+      }
+      if (Ctx.kernargPtrDelta.pendingLow) {
+        markKernargUnknown();
+        return;
+      }
+      Ctx.kernargPtrDelta.pendingLow = true;
+      Ctx.kernargPtrDelta.pendingLowDelta = Imm;
+      Ctx.setKernargPairProvenance(PairKind::Unknown);
+      return;
+    }
+    if (WritesHi && !WritesLo && DI.semOp == SemOp::S_ADDC_U32 &&
+        Ctx.kernargPtrDelta.pendingLow) {
+      auto [Ok, Imm] = classifyConstInPlaceAdd(KaHi);
+      if (Ok && Imm == 0) {
+        markTrackedKernarg(Ctx.kernargPtrDelta.delta +
+                           Ctx.kernargPtrDelta.pendingLowDelta);
+      } else {
+        markKernargUnknown();
+      }
+      return;
+    }
+    markKernargUnknown();
+  }
+
+  void setPairFromBaseKind(int Dst, PairKind Kind, int64_t Delta = 0) {
+    switch (Kind) {
+    case PairKind::Kernarg: {
+      DwordProv Lo, Hi;
+      Lo.kind = DwordKind::Kernarg;
+      Lo.delta = Delta;
+      Lo.subDword = 0;
+      Hi.kind = DwordKind::Kernarg;
+      Hi.delta = Delta;
+      Hi.subDword = 1;
+      setDwordProv(Dst, Lo);
+      setDwordProv(Dst + 1, Hi);
+      break;
+    }
+    case PairKind::NonKernarg:
+      setDwordKind(Dst, DwordKind::NonKernarg);
+      setDwordKind(Dst + 1, DwordKind::NonKernarg);
+      break;
+    case PairKind::Unknown:
+      setDwordKind(Dst, DwordKind::Unknown);
+      setDwordKind(Dst + 1, DwordKind::Unknown);
+      break;
+    }
+  }
+
+  std::pair<PairKind, int64_t> pairProvenanceFromReg(ParsedReg PR) const {
+    if (PR.kind != ParsedReg::SGPR)
+      return {PairKind::Unknown, 0};
+    auto Lo = dwordProvenance(PR.baseIdx);
+    auto Hi = dwordProvenance(PR.baseIdx + 1);
+    if (Lo.kind == DwordKind::NonKernarg &&
+        Hi.kind == DwordKind::NonKernarg)
+      return {PairKind::NonKernarg, 0};
+    if (Lo.kind == DwordKind::Kernarg && Hi.kind == DwordKind::Kernarg &&
+        Lo.subDword == 0 && Hi.subDword == 1 && Lo.delta == Hi.delta)
+      return {PairKind::Kernarg, Lo.delta};
+    return {PairKind::Unknown, 0};
+  }
+
+  std::pair<PairKind, int64_t> pairProvenanceFromSrc0() {
+    if (DI.numSrcs < 1)
+      return {PairKind::Unknown, 0};
+    unsigned Idx = DI.srcMap[0];
+    if (!DI.isReg(Idx))
+      return {PairKind::NonKernarg, 0};
+    return pairProvenanceFromReg(Ctx.parseReg(DI.getReg(Idx), Idx));
+  }
+
+  DwordProv dwordProvenanceFromSrc0() {
+    DwordProv P;
+    if (DI.numSrcs < 1)
+      return P;
+    unsigned Idx = DI.srcMap[0];
+    if (!DI.isReg(Idx)) {
+      P.kind = DwordKind::NonKernarg;
+      return P;
+    }
+    ParsedReg Src = Ctx.parseReg(DI.getReg(Idx), Idx);
+    if (Src.kind != ParsedReg::SGPR) {
+      P.kind = DwordKind::NonKernarg;
+      return P;
+    }
+    return dwordProvenance(Src.baseIdx);
+  }
+
+  void updateGenericDefProvenance(ParsedReg Def) {
+    int DefDwords = semanticDefDwords(Def);
+    if (DefDwords == 0 || sgprOverlapsKernargPair(Def))
+      return;
+
+    if (isSmemLoadResult(DI.semOp)) {
+      for (int I = 0; I < DefDwords; ++I)
+        setDwordKind(Def.baseIdx + I, DwordKind::NonKernarg);
+      return;
+    }
+    if (DI.semOp == SemOp::S_MOV_B64 && DefDwords >= 2) {
+      auto [Kind, Delta] = pairProvenanceFromSrc0();
+      setPairFromBaseKind(Def.baseIdx, Kind, Delta);
+      return;
+    }
+    if (DI.semOp == SemOp::S_MOV_B32 && DefDwords == 1) {
+      setDwordProv(Def.baseIdx, dwordProvenanceFromSrc0());
+      return;
+    }
+
+    DwordKind Kind =
+        allSourcesDefinitelyNonKernarg() ? DwordKind::NonKernarg
+                                         : DwordKind::Unknown;
+    for (int I = 0; I < DefDwords; ++I)
+      setDwordKind(Def.baseIdx + I, Kind);
+  }
+
+  void updateGenericSgprProvenance() {
+    for (unsigned D = 0; D < DI.numDefs; ++D) {
+      if (DI.isReg(D))
+        updateGenericDefProvenance(Ctx.parseReg(DI.getReg(D), D));
+    }
+    if (HasLogicalDst)
+      updateGenericDefProvenance(LogicalDst);
+  }
+};
 
 } // namespace
 
@@ -821,6 +1379,7 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
+  ctx.initializeSgprKernargProvenance();
 
   // ==== Phase 4.5: Kernarg-pair pristine-at-BB-entry dataflow ====
   //
@@ -1028,6 +1587,23 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         if (it != predecessors.end())
           it->second.push_back(bb);
       }
+    }
+
+    // Provenance carry is safe only for the lexical fallthrough block whose
+    // sole predecessor is the block we just finished emitting. Any branch
+    // target that is not the immediate next block would require saving and
+    // restoring predecessor-exit state; any merge would require phi-style
+    // joins. Both remain loud/conservative via the normal BB-boundary reset.
+    uint64_t prevBB = 0;
+    bool havePrevBB = false;
+    for (uint64_t bs : blockStarts) {
+      if (havePrevBB) {
+        const auto &preds = predecessors[bs];
+        if (preds.size() == 1 && preds[0] == prevBB)
+          ctx.sgprProvenanceFallthroughBBs.insert(bs);
+      }
+      prevBB = bs;
+      havePrevBB = true;
     }
 
     // Step 3: iterative forward dataflow.
@@ -1333,162 +1909,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       // HandlerResult.
       if (ctx.userSgprLayout != nullptr) {
         const int kaLo = ctx.userSgprLayout->kernargSegmentPtrSgpr;
-        if (kaLo >= 0) {
-          const int kaHi = kaLo + 1;
-
-          // Identify writes to the kernarg pair by walking the def
-          // slots of the MCInst. `di.numDefs` is the count; the
-          // operand list starts with defs (see
-          // `MCInstrDesc::getNumDefs()` convention). parseReg on each
-          // def gives us an SGPR baseIdx we can compare to kaLo / kaHi.
-          // S_ADD_U32 / S_ADDC_U32 have exactly one def (the written
-          // scalar); their src operand layout is (dst, src0, src1).
-          auto writesKernargDword = [&](int baseIdx) {
-            for (unsigned d = 0; d < di.numDefs; ++d) {
-              if (!di.isReg(d))
-                continue;
-              ParsedReg pr = ctx.parseReg(di.getReg(d), d);
-              if (pr.kind == ParsedReg::SGPR && pr.baseIdx == baseIdx)
-                return true;
-            }
-            return false;
-          };
-          const bool writesLo = writesKernargDword(kaLo);
-          const bool writesHi = writesKernargDword(kaHi);
-          auto isKernargHighCanonicalMask = [&]() -> bool {
-            if (di.semOp != SemOp::S_AND_B32 || di.numSrcs < 2 ||
-                di.numDefs < 1 || !di.isReg(0))
-              return false;
-            ParsedReg dst = ctx.parseReg(di.getReg(0), 0);
-            if (dst.kind != ParsedReg::SGPR || dst.baseIdx != kaHi)
-              return false;
-
-            unsigned s0Idx = di.srcMap[0];
-            unsigned s1Idx = di.srcMap[1];
-            auto srcIsKernargHi = [&](unsigned idx) {
-              if (!di.isReg(idx))
-                return false;
-              ParsedReg src = ctx.parseReg(di.getReg(idx), idx);
-              return src.kind == ParsedReg::SGPR && src.baseIdx == kaHi;
-            };
-            auto srcIsLow16Mask = [&](unsigned idx) {
-              return di.isImm(idx) &&
-                     static_cast<uint64_t>(di.getImm(idx)) == 0xffffu;
-            };
-            return (srcIsKernargHi(s0Idx) && srcIsLow16Mask(s1Idx)) ||
-                   (srcIsKernargHi(s1Idx) && srcIsLow16Mask(s0Idx));
-          };
-
-          if (writesLo || writesHi) {
-            // Only attempt to update the delta if the tracker is
-            // currently valid (i.e. we are still tracking a well-
-            // defined 64-bit const delta in this BB). If an earlier
-            // instruction already invalidated it, further writes
-            // cannot re-validate — wait for the BB boundary to reset
-            // via the Phase 4.5 dataflow-driven pristine check.
-            if (!ctx.kernargPtrDelta.valid) {
-              // Nothing to do; already invalid.
-            } else {
-              // The canonical pattern requires the dst register to equal
-              // one of its sources (in-place increment). `src0` is at
-              // logical index 0 and `src1` at logical index 1 for both
-              // S_ADD_U32 and S_ADDC_U32. An immediate operand signals
-              // the constant; register-class operands are parsed to
-              // identify the in-place source. We accept either operand
-              // order because s_add_u32 is commutative.
-              auto classify = [&](int dstBase) -> std::pair<bool, int64_t> {
-                if (di.numSrcs < 2)
-                  return {false, 0};
-                unsigned s0Idx = di.srcMap[0];
-                unsigned s1Idx = di.srcMap[1];
-                const bool s0Reg = di.isReg(s0Idx);
-                const bool s1Reg = di.isReg(s1Idx);
-                const bool s0Imm = di.isImm(s0Idx);
-                const bool s1Imm = di.isImm(s1Idx);
-
-                auto regMatchesDst = [&](unsigned idx) {
-                  ParsedReg pr = ctx.parseReg(di.getReg(idx), idx);
-                  return pr.kind == ParsedReg::SGPR && pr.baseIdx == dstBase;
-                };
-
-                if (s0Reg && s1Imm && regMatchesDst(s0Idx))
-                  return {true, di.getImm(s1Idx)};
-                if (s1Reg && s0Imm && regMatchesDst(s1Idx))
-                  return {true, di.getImm(s0Idx)};
-                return {false, 0};
-              };
-
-              if (writesHi && !writesLo && isKernargHighCanonicalMask() &&
-                  !ctx.kernargPtrDelta.pendingLow) {
-                // AMDGPU kernels commonly canonicalise the high dword of a
-                // 48-bit kernarg pointer with `s_and_b32 hi, hi, 0xffff`
-                // before issuing initial SMEM loads.  This preserves the
-                // modeled kernarg pointer value and does not change the
-                // const delta from entry.
-              } else if (writesLo && !writesHi &&
-                         di.semOp == SemOp::S_ADD_U32) {
-                // Stage the pending low add. The `s_addc_u32 hi, hi, 0`
-                // complement is expected to be the next instruction in
-                // the straight-line Tensile shape; anything else that
-                // intervenes will either commit the pending via the
-                // matching S_ADDC_U32 branch below, or invalidate the
-                // tracker via the generic "any other write" fall-through.
-                auto [ok, imm] = classify(kaLo);
-                if (ok) {
-                  // A second staged low-add before the first commits is a
-                  // torn state. Invalidate; no carry-propagation fiction.
-                  if (ctx.kernargPtrDelta.pendingLow) {
-                    ctx.kernargPtrDelta.valid = false;
-                    ctx.kernargPtrDelta.pendingLow = false;
-                  } else {
-                    ctx.kernargPtrDelta.pendingLow = true;
-                    ctx.kernargPtrDelta.pendingLowDelta = imm;
-                  }
-                } else {
-                  // Write to the low dword that isn't a recognised
-                  // in-place const-add: cannot fold to a delta.
-                  ctx.kernargPtrDelta.valid = false;
-                  ctx.kernargPtrDelta.pendingLow = false;
-                }
-              } else if (writesHi && !writesLo &&
-                         di.semOp == SemOp::S_ADDC_U32 &&
-                         ctx.kernargPtrDelta.pendingLow) {
-                // Commit the pending low add iff this is the matching
-                // `s_addc_u32 hi, hi, 0`. Non-zero high imm or non-
-                // in-place-hi pattern: invalidate.
-                auto [ok, imm] = classify(kaHi);
-                if (ok && imm == 0) {
-                  ctx.kernargPtrDelta.delta += ctx.kernargPtrDelta.pendingLowDelta;
-                  ctx.kernargPtrDelta.pendingLow = false;
-                  ctx.kernargPtrDelta.pendingLowDelta = 0;
-                } else {
-                  ctx.kernargPtrDelta.valid = false;
-                  ctx.kernargPtrDelta.pendingLow = false;
-                }
-              } else {
-                // Writes both halves of the pair in one instruction
-                // (e.g. a 64-bit S_LOAD_B64 through another base), or
-                // writes one half with an opcode other than the
-                // canonical add/addc shape (S_MOV_B32, S_SUB_U32, etc.).
-                // Either breaks the const-delta contract.
-                ctx.kernargPtrDelta.valid = false;
-                ctx.kernargPtrDelta.pendingLow = false;
-              }
-            }
-          } else if (ctx.kernargPtrDelta.valid &&
-                     ctx.kernargPtrDelta.pendingLow && di.defsSCC) {
-            // A staged low-add exists but this instruction writes SCC
-            // without being the matching S_ADDC_U32. The carry bit the
-            // pending low-add would feed into is dead; the high dword
-            // will never receive the low's overflow. Collapse the
-            // pending state and invalidate. The tracker reports a
-            // torn 64-bit pointer value — handle_smem.cpp's loud
-            // refusal is preferable to inventing carry semantics out
-            // of a now-unrelated SCC.
-            ctx.kernargPtrDelta.valid = false;
-            ctx.kernargPtrDelta.pendingLow = false;
-          }
-        }
+        if (kaLo >= 0)
+          KernargSgprProvenanceUpdater(ctx, di, op, kaLo).update();
       }
       raisedCount++;
       continue;

@@ -354,15 +354,18 @@ python3 compare_gpt_oss_sglang.py \
   --timeout 900
 ```
 
-Current real Salmon status: the proof gate reaches the loader-side Salmon
-path, then fails before generation on SGLang helper kernels:
+Current real Salmon status after the modified-kernarg-pair SMEM fix: the
+proof gate reaches the loader-side Salmon path and the first SGLang helper
+kernels translate successfully (`create_flashinfer_kv_indices_triton`, both
+captured shapes). The run still fails before generation, but the frontier has
+moved past Salmon's `s_load_b32` / `s_load_b64` refusal to a later Triton/LLD
+compile/link error:
 
-- with CUDA graph capture: `create_flashinfer_kv_indices_triton` fails on
-  `s_load_b32`;
-- with CUDA graph disabled: `write_req_to_token_pool_triton` fails on
-  `s_load_b64`.
+```text
+error: amdgpu_user_sgpr_count smaller than than implied by enabled user SGPRs
+```
 
-This is a valid GPT-OSS end-to-end finding, not a comparison pass.
+This is still a valid GPT-OSS end-to-end finding, not a comparison pass.
 
 ### External SGLang/AITER setup used for investigation
 
