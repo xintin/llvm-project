@@ -100,6 +100,12 @@ local scope and the shim cannot find the symbol.
 # Full default sweep: every recipe, cross-product of its default Ns and blocks
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness
 
+# Recommended Salmon-focused sweep: native/reference + Salmon only
+LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --skip-legacy
+
+# Refresh native-as-gold baselines, then run future Salmon sweeps from cache
+LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --skip-legacy --refresh-baseline
+
 # One recipe
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=vecadd
 
@@ -132,6 +138,11 @@ code-object contents, sidecar contents, and deterministic input bytes, so
 repeated Salmon-focused runs do not have to relaunch the reference kernel.
 Cached output size is validated before use.  Use `--refresh-baseline`
 when you want to force native to rerun and replace the cached output.
+
+The default sweep includes every committed recipe registered in the
+Makefile, including the committed Triton numerical recipes under
+`kernels/triton/`.  It does not run the separate `triton_corpus_runner`
+breadth-only script sweep.
 
 The parent sets `HSA_HOTSWAP_ISA_OVERRIDE=gfx942` and
 `HSA_HOTSWAP_RULES=/dev/null` if not already set; these are inherited by

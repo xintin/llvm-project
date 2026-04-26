@@ -5101,6 +5101,30 @@ tritonCompare(const TritonRecipe &t,
       const auto *g = reinterpret_cast<const double *>(gp);
       const auto *a = reinterpret_cast<const double *>(ap);
       for (int i = 0; i < ne; ++i) judge(g[i], a[i], i);
+    } else if (out.dtype == "i8" || out.dtype == "u8") {
+      if (cmp.kind == "rel-rms") {
+        if (out.dtype == "i8") {
+          const auto *g = reinterpret_cast<const int8_t *>(gp);
+          const auto *a = reinterpret_cast<const int8_t *>(ap);
+          for (int i = 0; i < ne; ++i)
+            judge(static_cast<double>(g[i]), static_cast<double>(a[i]), i);
+        } else { // u8
+          const auto *g = reinterpret_cast<const uint8_t *>(gp);
+          const auto *a = reinterpret_cast<const uint8_t *>(ap);
+          for (int i = 0; i < ne; ++i)
+            judge(static_cast<double>(g[i]), static_cast<double>(a[i]), i);
+        }
+      } else {
+        const auto *g = reinterpret_cast<const uint8_t *>(gp);
+        const auto *a = reinterpret_cast<const uint8_t *>(ap);
+        for (int i = 0; i < ne; ++i)
+          if (g[i] != a[i] && bufMismatches++ == 0) {
+            bufFirstIdx = i;
+            bufFirstG = static_cast<double>(g[i]);
+            bufFirstA = static_cast<double>(a[i]);
+            if (bufMaxAbs < 1.0) bufMaxAbs = 1.0;
+          }
+      }
     } else if (out.dtype == "i16" || out.dtype == "u16") {
       // Integer output compare.
       //
