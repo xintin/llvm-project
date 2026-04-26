@@ -918,7 +918,20 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
           Value *condVal = ctx.isa.isWave32()
                                ? ctx.regs.loadSGPR32(ctx.B, condReg.baseIdx)
                                : ctx.regs.loadSGPR64(ctx.B, condReg.baseIdx);
-          cond = ctx.projection.extractLaneBitFromWaveMask(ctx.B, condVal);
+          Value *fallback =
+              ctx.projection.extractLaneBitFromWaveMask(ctx.B, condVal);
+          // Cross-BB path: prefer the memory-backed shadow if valid.
+          // This avoids carrying non-dominating `i1` SSA values across
+          // blocks while still preserving the full EXEC-width compare mask.
+          if (Value *shadowValid = ctx.loadSgprWaveMaskValid(condReg.baseIdx)) {
+            Value *shadowExec = ctx.loadSgprWaveMaskExec(condReg.baseIdx);
+            Value *shadowI1 =
+                ctx.projection.extractLaneBitFromWaveMask(ctx.B, shadowExec);
+            cond = ctx.B.CreateSelect(shadowValid, shadowI1, fallback,
+                                      "sgpr_mask_shadow_sel");
+          } else {
+            cond = fallback;
+          }
         }
       } else {
         cond = ctx.regs.loadVCC(ctx.B);
