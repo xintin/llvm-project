@@ -5,6 +5,8 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -12,6 +14,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <map>
+#include <optional>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -70,6 +73,57 @@ static std::vector<std::string> collectCoFiles(const std::string &path) {
   }
   std::sort(results.begin(), results.end());
   return results;
+}
+
+static std::vector<std::string>
+selectScopeDiscoveryMatmulOgs(const std::string &scopeDir) {
+  std::string manifestPath = scopeDir + "/manifest.jsonl";
+  auto manifestOrErr = llvm::MemoryBuffer::getFile(manifestPath);
+  if (!manifestOrErr) {
+    ADD_FAILURE() << "Cannot read scope discovery manifest: " << manifestPath
+                  << " (" << manifestOrErr.getError().message() << ")";
+    return {};
+  }
+
+  // `manifest.jsonl` is the source of truth for which captured GPT-OSS
+  // HSACOs are tooling-clean.  Keep only manifest-ok `_matmul_ogs` entries
+  // so this async-copy gate tracks the north-star kernels documented in
+  // `async-copy-translation.md` §5/§6 without sweeping unrelated
+  // scope-discovery surfaces that may have their own expected failures.
+  std::string scopeRoot = scopeDir + "/..";
+  std::vector<std::string> selected;
+  llvm::StringRef remaining = (*manifestOrErr)->getBuffer();
+  while (!remaining.empty()) {
+    auto split = remaining.split('\n');
+    llvm::StringRef line = split.first.trim();
+    remaining = split.second;
+    if (line.empty()) continue;
+
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(line);
+    if (!parsed) {
+      ADD_FAILURE() << "Malformed scope discovery manifest line in "
+                    << manifestPath << ": "
+                    << llvm::toString(parsed.takeError());
+      return {};
+    }
+    auto *obj = parsed->getAsObject();
+    EXPECT_NE(obj, nullptr) << "Manifest line is not a JSON object: "
+                            << line.str();
+    if (!obj) return {};
+
+    std::optional<llvm::StringRef> status = obj->getString("status");
+    if (!status || *status != "ok") continue;
+    std::optional<llvm::StringRef> kernel = obj->getString("kernel");
+    std::optional<llvm::StringRef> hsaco = obj->getString("hsaco");
+    if (!kernel || !hsaco) continue;
+    if (*kernel != "_matmul_ogs") continue;
+    if (!hsaco->starts_with("kernels/_matmul_ogs_") ||
+        !hsaco->ends_with(".hsaco"))
+      continue;
+    selected.push_back(scopeRoot + "/" + hsaco->str());
+  }
+  std::sort(selected.begin(), selected.end());
+  return selected;
 }
 
 static void runBatchRaise(const std::string &path, const std::string &isa) {
@@ -217,8 +271,14 @@ static void runBatchRaiseIsolated(const std::vector<std::string> &coFiles,
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
         auto meta = transpiler::extractKernelMeta(coData, kName);
+        // Match `raise_cli`'s symbol-relative entry point.  Captured
+        // scope-discovery HSACOs are not guaranteed to place every kernel at
+        // .text+0; raising from byte zero would test a different instruction
+        // stream than the manual sweep this GTest is replacing.
+        uint64_t kernelOffset =
+            transpiler::findKernelSymbolOffset(coData, kName);
         auto raised = transpiler::raiseToIR(text.bytes, isa, kName, meta,
-                                            /*kernelOffset=*/0,
+                                            kernelOffset,
                                             compilationTargetIsa);
         shm->success = raised.success;
         if (!raised.success) {
@@ -288,6 +348,34 @@ TEST(BatchRaise, Gfx1250TestData) {
   if (!fileExists(path))
     GTEST_SKIP() << "Test data directory not found: " << path;
   runBatchRaise(path, "gfx1250");
+}
+
+// GPT-OSS scope-discovery async-copy regression guard.
+//
+// `instruction_manual.pdf §13.6.{9,10,11,12}` defines the
+// `GLOBAL_LOAD_ASYNC_TO_LDS_B*` family as `OPF_ASYNCCNT` async global->LDS
+// copies, and `programming_manual.pdf §4.9.9` names `S_WAIT_ASYNCCNT` as
+// the completion check.  `async-copy-translation.md` §5/§6 records the four
+// GPT-OSS `_matmul_ogs_*.hsaco` kernels that use this path to prefetch A/B
+// tiles into LDS.  This test turns that manual raise_cli sweep into a CTest
+// gate: any future regression in the FLAT async-load SemOp mapping or
+// synchronous cross-target emulation fails loudly.  The kernels also contain
+// `s_wait_asynccnt 0`, but this consumer gate is intentionally about the
+// async-copy lift surface; wait-counter mapping is documented on the SOPP
+// SemOp/handler path.
+TEST(BatchRaise, ScopeDiscoveryGptOss) {
+  std::string scopeDir = SCOPE_DISCOVERY_DIR;
+  if (!fileExists(scopeDir))
+    GTEST_SKIP() << "Scope discovery kernels not found: " << scopeDir;
+
+  auto selected = selectScopeDiscoveryMatmulOgs(scopeDir);
+  ASSERT_EQ(selected.size(), 4u)
+      << "Expected exactly the four manifest-ok _matmul_ogs HSACOs from "
+         "async-copy-translation.md §5";
+
+  runBatchRaiseIsolated(selected, "gfx1250", "gfx942",
+                        "scope_discovery_gpt_oss_gfx1250_to_gfx942",
+                        /*expectedFailures=*/0);
 }
 
 // Deterministic "representative subset" selector for the AITER gfx950 corpus.
