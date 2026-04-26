@@ -16,6 +16,7 @@ config.file_check = r"@LIT_TOOL_FILECHECK@"
 config.not_tool = r"@LIT_TOOL_NOT@"
 config.llvm_mc = r"@LIT_TOOL_LLVM_MC@"
 config.ld_lld = r"@LIT_TOOL_LD_LLD@"
+config.salmon_have_tdm_runtime = "@LIT_SALMON_HAVE_TDM_RUNTIME@" == "1"
 config.test_source_root = r"@LIT_SOURCE_DIR@"
 # Keep lit's per-test `Output/` artifacts (the generated `.script` files
 # and any tmpfiles a test writes to `%t`) out of the source tree. Without

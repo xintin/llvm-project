@@ -1,44 +1,27 @@
+; REQUIRES: tdm-runtime
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %not %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=tensor_load_to_lds_kernel 2>&1 | %FileCheck %s --check-prefix=STDERR
+; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=tensor_load_to_lds_kernel 2>&1 | %FileCheck %s --check-prefix=IR-XT
 ;
-; Lift refusal test for VIMAGE TENSOR `tensor_load_to_lds_d2`. Pins
-; the contractual cross-target loud-failure behaviour of
-; transpiler/handle_vimage.cpp under SemOp::TENSOR_LOAD_TO_LDS.
+; Lift test for VIMAGE TENSOR `tensor_load_to_lds_d2`. Pins the
+; cross-target TDM-emulation behaviour of transpiler/handle_vimage.cpp
+; under SemOp::TENSOR_LOAD_TO_LDS.
 ;
 ; The gfx1250 TENSOR cnt unit (`MIMGInstructions.td:2049-2113`,
-; `let SubtargetPredicate = isGFX125xOnly`) has no equivalent on
-; gfx942. The handler refuses with `RaiseFailure::unsupportedShape`
-; carrying the `VIMAGE` format bucket; the user-rules forbid silent
-; fallbacks so a "synth a global_load chain" stub would be a
-; regression. The matching LLVM intrinsic
-; (`int_amdgcn_tensor_load_to_lds`) is itself gated isGFX125xOnly
-; in IntrinsicsAMDGPU.td:4213, so even an intrinsic-emit on a
-; non-gfx1250 target would fail at codegen — the principled lift
-; is the loud refusal pinned here.
+; `let SubtargetPredicate = isGFX125xOnly`) has no native equivalent
+; on gfx942 and the matching LLVM intrinsic is also gated
+; isGFX125xOnly. Cross-target lifts therefore call the link-merged
+; TDM runtime helper instead of emitting the intrinsic directly. This
+; fixture is gated on `tdm-runtime`; no-runtime builds keep the
+; handler's loud refusal path and skip this helper-call test.
 ;
-; We assert two things:
-;
-;   1. The raiser exits non-zero (`%not` inverts the exit code — the
-;      test passes only when raise_cli actually failed).
-;   2. The stderr diagnostic from raise_cli names the offending
-;      mnemonic (`tensor_load_to_lds`) and the encoding format
-;      (`VIMAGE`). raise_cli's failure-line format is fixed
-;      (raise_cli.cpp:213): `kernel '<name>' failed to raise:
-;      <mnemonic> [<format>]`.
-;
-; The handler also emits an explicit `transpiler: VIMAGE: ...`
-; line that names the architectural mismatch and the
-; same-target intrinsic; pinning that line keeps the diagnostic
-; text from drifting into something less actionable for users
-; who read raise_cli's stderr directly.
-
-; STDERR: transpiler: VIMAGE: tensor_load_to_lds
-; STDERR-SAME: gfx1250 TENSORcnt unit
-; STDERR-SAME: amdgcn.tensor.load.to.lds
-
-; STDERR: raise_cli: kernel 'tensor_load_to_lds_kernel' failed to raise:
-; STDERR-SAME: tensor_load_to_lds
-; STDERR-SAME: [VIMAGE]
+; Cross-target helper call: _d2 supplies groups 0/1 and zero-fills
+; groups 2/3 before calling the four-argument runtime helper.
+; IR-XT: call void @salmon_tdm_load_to_lds(
+; IR-XT-SAME: <4 x i32> %td_grp0
+; IR-XT-SAME: <8 x i32> %td_grp1
+; IR-XT-SAME: <4 x i32> zeroinitializer
+; IR-XT-SAME: <4 x i32> zeroinitializer
+; IR-XT-SAME: )
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx1250 --emit-ir=tensor_load_to_lds_kernel 2>&1 | %FileCheck %s --check-prefix=IR
@@ -47,8 +30,8 @@
 ; (gfx1250 -> gfx1250) intrinsic-emit path. Pins the principled
 ; lift in transpiler/handle_vimage.cpp under
 ; SemOp::TENSOR_LOAD_TO_LDS when `ctx.targetIsa.hasTensorOps` is
-; true. Companion fixture to `tensor_load_to_lds.ll`, which pins
-; the cross-target (gfx942) loud refusal.
+; true. Companion RUN line above pins the cross-target (gfx942)
+; helper-call path.
 ;
 ; The MIMGInstructions.td:2049-2113 `VIMAGE_TENSOR_Pseudo` operand
 ; layout for the `_d2` form is `vaddr0:SReg_128, vaddr1:SReg_256,

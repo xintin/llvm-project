@@ -30,6 +30,11 @@ if not getattr(config, "test_exec_root", None):
         tempfile.gettempdir(), "salmon-transpiler-lit"
     )
 
+if not hasattr(config, "available_features") or config.available_features is None:
+    config.available_features = set()
+if getattr(config, "salmon_have_tdm_runtime", False):
+    config.available_features.add("tdm-runtime")
+
 config.substitutions.append(("%raise_cli", config.raise_cli))
 config.substitutions.append(("%FileCheck", config.file_check))
 config.substitutions.append(("%not", config.not_tool))

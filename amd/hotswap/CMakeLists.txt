@@ -57,6 +57,54 @@ link_directories(${LLVM_LIBRARY_DIRS})
 # --- LLVM definitions ---------------------------------------------------------
 add_definitions(${LLVM_DEFINITIONS})
 
+# --- TDM emulation runtime helper (HIP -> bitcode -> embedded array) --------
+# When `hipcc` is available we build `runtime/tdm.hip` to LLVM bitcode for
+# gfx942 and embed the bytes via `cmake/EmbedBinary.cmake`. The transpiler
+# parses and link-merges the bitcode into each raised IR module that uses
+# the cross-target VIMAGE TENSOR helper (see `tdm_runtime.{hpp,cpp}` and
+# `raiser.cpp` Phase 6.7). When hipcc is missing the embedded blob is
+# empty (one-byte stub in tdm_runtime.cpp), `tdmRuntimeAvailable()`
+# returns false, and the cross-target VIMAGE handler keeps today's loud
+# refusal. This preserves the no-hipcc build behaviour exactly.
+find_program(HIPCC hipcc)
+set(SALMON_TDM_RUNTIME_GENERATED_CPP "")
+if(HIPCC)
+  set(_tdm_src "${CMAKE_CURRENT_SOURCE_DIR}/runtime/tdm.hip")
+  set(_tdm_bc  "${CMAKE_CURRENT_BINARY_DIR}/tdm_runtime.gfx942.bc")
+  set(_tdm_cpp "${CMAKE_CURRENT_BINARY_DIR}/tdm_runtime_blob.cpp")
+
+  add_custom_command(
+    OUTPUT ${_tdm_bc}
+    COMMAND ${HIPCC}
+            --offload-arch=gfx942
+            -O2 -emit-llvm -c
+            -fgpu-rdc
+            --cuda-device-only
+            -o ${_tdm_bc} ${_tdm_src}
+    DEPENDS ${_tdm_src}
+    COMMENT "Building TDM emulation runtime bitcode (gfx942)"
+    VERBATIM)
+
+  add_custom_command(
+    OUTPUT ${_tdm_cpp}
+    COMMAND ${CMAKE_COMMAND}
+            -DINPUT=${_tdm_bc}
+            -DOUTPUT=${_tdm_cpp}
+            -DSYMBOL=tdm_runtime_bc
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake
+    DEPENDS ${_tdm_bc} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedBinary.cmake
+    COMMENT "Embedding TDM runtime bitcode into C++ blob"
+    VERBATIM)
+
+  set(SALMON_TDM_RUNTIME_GENERATED_CPP ${_tdm_cpp})
+  set(SALMON_HAVE_TDM_RUNTIME 1)
+  message(STATUS "TDM runtime helper enabled (hipcc=${HIPCC})")
+else()
+  set(SALMON_HAVE_TDM_RUNTIME 0)
+  message(STATUS "TDM runtime helper DISABLED (hipcc not found); "
+                 "cross-target gfx1250->gfx942 TENSOR ops will keep refusing")
+endif()
+
 # --- Raiser + Pipeline library ------------------------------------------------
 add_library(hotswap-transpiler STATIC
   raiser.cpp
@@ -98,6 +146,12 @@ add_library(hotswap-transpiler STATIC
   code_object_utils.cpp
   kernarg_layout.cpp
   user_sgpr_layout.cpp
+  tdm_runtime.cpp
+  ${SALMON_TDM_RUNTIME_GENERATED_CPP}
+)
+
+target_compile_definitions(hotswap-transpiler PRIVATE
+  SALMON_HAVE_TDM_RUNTIME=${SALMON_HAVE_TDM_RUNTIME}
 )
 
 # Match LLVM's compile flags (no-rtti, no-exceptions, etc.). LLVM is built
@@ -226,6 +280,7 @@ set(TEST_SOURCES
   tests/kernarg_layout_test.cpp
   tests/mc_context_inline_srcmgr_test.cpp
   tests/mxfp4_dequant_test.cpp
+  tests/tdm_gpu_test.cpp
   tests/wave_projection_test.cpp
 )
 
