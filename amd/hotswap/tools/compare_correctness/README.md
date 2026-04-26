@@ -106,6 +106,9 @@ LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=vecadd
 # One recipe, native/reference + Salmon only (skip legacy byte translator)
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=vecadd --skip-legacy
 
+# Force native-as-gold Triton baselines to rerun and update the cache
+LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --recipe=corpus_add_fp32 --refresh-baseline
+
 # Restrict N (cross-produced with the recipe's default blocks)
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --shape=256 --shape=1024
 
@@ -121,6 +124,13 @@ harness runs their cross-product.  If only one is given, the other
 dimension uses the recipe's default list.  `--skip-legacy` leaves the
 legacy column visible as `skipped` but does not spawn the byte-translator
 child, which is useful when you only need native gold plus Salmon.
+
+For Triton recipes, the native gfx942 output is the gold.  The harness
+caches those native outputs in `.baseline_cache/` (or
+`COMPARE_CORRECTNESS_BASELINE_CACHE_DIR`) keyed by recipe, shape, and the
+native code object's size/mtime, so repeated Salmon-focused runs do not
+have to relaunch the reference kernel.  Use `--refresh-baseline` when you
+want to force native to rerun and replace the cached output.
 
 The parent sets `HSA_HOTSWAP_ISA_OVERRIDE=gfx942` and
 `HSA_HOTSWAP_RULES=/dev/null` if not already set; these are inherited by

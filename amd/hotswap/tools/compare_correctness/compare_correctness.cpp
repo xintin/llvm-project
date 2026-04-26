@@ -57,6 +57,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +87,8 @@ namespace {
 // the running binary.  Populated by the build (Makefile).
 const char *KERNEL_DIR_ENV = "COMPARE_CORRECTNESS_KERNEL_DIR";
 const char *KERNEL_DIR_DEFAULT = "./kernels/build";
+const char *BASELINE_CACHE_ENV = "COMPARE_CORRECTNESS_BASELINE_CACHE_DIR";
+const char *BASELINE_CACHE_DEFAULT = "./.baseline_cache";
 
 std::string kernelDir() {
   if (const char *e = std::getenv(KERNEL_DIR_ENV); e && *e) return e;
@@ -94,6 +97,11 @@ std::string kernelDir() {
 
 std::string coPathFor(const std::string &name, const std::string &isa) {
   return kernelDir() + "/" + name + "." + isa + ".co";
+}
+
+std::string baselineCacheDir() {
+  if (const char *e = std::getenv(BASELINE_CACHE_ENV); e && *e) return e;
+  return BASELINE_CACHE_DEFAULT;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,11 +137,54 @@ std::vector<uint8_t> readFile(const std::string &path) {
   return buf;
 }
 
+std::optional<std::vector<uint8_t>> tryReadFile(const std::string &path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) return std::nullopt;
+  auto n = f.tellg();
+  f.seekg(0);
+  std::vector<uint8_t> buf(static_cast<size_t>(n));
+  if (!f.read(reinterpret_cast<char *>(buf.data()), buf.size()))
+    die("short read on %s", path.c_str());
+  return buf;
+}
+
 void writeFile(const std::string &path, const std::vector<uint8_t> &buf) {
   std::ofstream f(path, std::ios::binary | std::ios::trunc);
   if (!f) die("cannot create %s: %s", path.c_str(), std::strerror(errno));
   f.write(reinterpret_cast<const char *>(buf.data()), buf.size());
   if (!f) die("short write on %s", path.c_str());
+}
+
+void ensureDir(const std::string &path) {
+  if (path.empty()) die("empty directory path");
+  std::string cur;
+  size_t i = 0;
+  if (path[0] == '/') {
+    cur = "/";
+    i = 1;
+  }
+  while (i <= path.size()) {
+    size_t j = path.find('/', i);
+    std::string part = path.substr(i, j == std::string::npos ? j : j - i);
+    if (!part.empty()) {
+      if (!cur.empty() && cur.back() != '/') cur.push_back('/');
+      cur += part;
+      if (mkdir(cur.c_str(), 0777) != 0 && errno != EEXIST)
+        die("mkdir %s failed: %s", cur.c_str(), std::strerror(errno));
+    }
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+}
+
+std::string sanitizeForPath(const std::string &s) {
+  std::string out;
+  out.reserve(s.size());
+  for (unsigned char c : s) {
+    out.push_back(std::isalnum(c) || c == '-' || c == '_' ? static_cast<char>(c)
+                                                          : '_');
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -214,6 +265,19 @@ struct Recipe {
   // means the combination is accepted.
   std::function<std::optional<std::string>(int N, int blockSize)> validate;
 };
+
+std::string baselineCachePath(const Recipe &r, int N, int blockSize) {
+  struct stat st;
+  std::string nativeCo = coPathFor(r.name, "gfx942");
+  if (stat(nativeCo.c_str(), &st) != 0)
+    die("stat %s failed: %s", nativeCo.c_str(), std::strerror(errno));
+  char buf[512];
+  std::snprintf(buf, sizeof(buf), "%s_N%d_B%d_size%lld_mtime%lld.bin",
+                sanitizeForPath(r.name).c_str(), N, blockSize,
+                static_cast<long long>(st.st_size),
+                static_cast<long long>(st.st_mtime));
+  return baselineCacheDir() + "/" + buf;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Recipe: vecadd (sanity; no cross-lane ops)
@@ -5509,6 +5573,9 @@ struct ModeResult {
   // `--skip-legacy`).  This is distinct from spawn-fail: skipped modes should
   // be visible in the grid but not counted as failures.
   bool skipped = false;
+  // True when native-as-gold output came from the baseline cache instead of
+  // spawning a native child.  Only used for NativeExecution recipes.
+  bool baselineCached = false;
   // Present only if the child wrote a readable output file.
   std::optional<std::vector<uint8_t>> output;
   // Diff stats vs. the recipe's gold.  For HIP recipes the gold is the
@@ -5547,7 +5614,7 @@ std::string tempPath(const std::string &tag) {
 }
 
 RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize,
-                 bool skipLegacy) {
+                 bool skipLegacy, bool refreshBaseline) {
   RunResult rr;
   rr.recipe = &r;
   rr.N = N;
@@ -5616,7 +5683,21 @@ RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize,
     // itself (by definition it matches itself).  If native didn't produce
     // output we can't judge legacy/salmon, so we flag the row as
     // gold-missing and skip their spawns.
-    runMode(Mode::Native, rr.native, "native", /*skipCompare=*/true);
+    std::string cachePath = baselineCachePath(r, N, blockSize);
+    if (!refreshBaseline) {
+      if (auto cached = tryReadFile(cachePath)) {
+        rr.native.output = std::move(*cached);
+        rr.native.baselineCached = true;
+        rr.native.mismatches = 0;
+      }
+    }
+    if (!rr.native.output) {
+      runMode(Mode::Native, rr.native, "native", /*skipCompare=*/true);
+      if (rr.native.output) {
+        ensureDir(baselineCacheDir());
+        writeFile(cachePath, *rr.native.output);
+      }
+    }
     if (rr.native.output) {
       rr.cpuGold = *rr.native.output;
       rr.native.mismatches = 0;  // native IS the gold
@@ -5667,6 +5748,7 @@ std::string statusStr(const ModeResult &mr, int totalElems) {
 // string.
 std::string statusStrNativeAsGold(const ModeResult &mr) {
   if (mr.skipped) return "skipped";
+  if (mr.baselineCached) return "gold-cache";
   if (!mr.child.launched) return "spawn-fail";
   if (mr.child.signal > 0) {
     char b[64];
@@ -5699,6 +5781,7 @@ ResultCat classify(const ModeResult &m) {
 
 ResultCat classifyNativeAsGold(const ModeResult &m) {
   if (m.skipped)                return ResultCat::Skipped;
+  if (m.baselineCached)         return ResultCat::Gold;
   if (!m.child.launched)       return ResultCat::GoldMissing;
   if (m.child.signal > 0)      return ResultCat::GoldMissing;
   if (!m.child.exitedCleanly)  return ResultCat::GoldMissing;
@@ -5922,6 +6005,7 @@ struct Options {
   std::vector<int> shapeFilter;   // restrict N (parent sweep)
   std::vector<int> blockFilter;   // restrict block size (parent sweep)
   bool skipLegacy = false;        // parent sweep: run native + salmon only
+  bool refreshBaseline = false;   // parent sweep: rerun native gold cache
   std::string inputPath;          // child-only
   std::string outputPath;         // child-only
   int N = -1;                     // child-only
@@ -5951,6 +6035,9 @@ void printHelp(const char *argv0) {
       "                    block list is used.\n"
       "  --skip-legacy     do not spawn the legacy byte-translator child;\n"
       "                    useful when only native gold + Salmon matters.\n"
+      "  --refresh-baseline\n"
+      "                    rerun native-as-gold baselines and replace cached\n"
+      "                    outputs instead of reusing .baseline_cache.\n"
       "  -h | --help       show this help\n"
       "\n"
       "Internal child mode (used by the parent when spawning):\n"
@@ -5981,6 +6068,8 @@ bool parseArgs(int argc, char **argv, Options &opt) {
       opt.blockFilter.push_back(std::atoi(tmp.c_str()));
     } else if (a == "--skip-legacy") {
       opt.skipLegacy = true;
+    } else if (a == "--refresh-baseline") {
+      opt.refreshBaseline = true;
     } else if (eq("--N=", tmp)) {
       opt.N = std::atoi(tmp.c_str());
     } else if (eq("--B=", tmp)) {
@@ -6039,7 +6128,9 @@ int main(int argc, char **argv) {
          std::getenv("LD_PRELOAD") ? std::getenv("LD_PRELOAD") : "(unset)");
   printf("  LD_LIBRARY_PATH          = %s\n",
          std::getenv("LD_LIBRARY_PATH") ? std::getenv("LD_LIBRARY_PATH") : "(unset)");
-  printf("  skip_legacy          = %s\n", opt.skipLegacy ? "yes" : "no");
+  printf("  skip_legacy              = %s\n", opt.skipLegacy ? "yes" : "no");
+  printf("  baseline_cache_dir       = %s\n", baselineCacheDir().c_str());
+  printf("  refresh_baseline         = %s\n", opt.refreshBaseline ? "yes" : "no");
 
   std::vector<RunResult> all;
   // Precompute a fast name -> TritonRecipe* map so the shape-filter
@@ -6161,7 +6252,8 @@ int main(int argc, char **argv) {
         }
         fprintf(stderr, "  [run] recipe=%s %s ...\n",
                 r.name.c_str(), shapeLog(N, B).c_str());
-        all.push_back(runOne(exe, r, N, B, opt.skipLegacy));
+        all.push_back(runOne(exe, r, N, B, opt.skipLegacy,
+                             opt.refreshBaseline));
       }
     }
   }
