@@ -37,6 +37,10 @@ struct ISAProfile {
   // the cross-target loud refusal: the gfx942 and earlier ISAs have
   // no equivalent hardware unit, so cross-target lifts must refuse.
   bool hasTensorOps = false;
+  // gfx125 widens compute_pgm_rsrc2.USER_SGPR_COUNT from the older 5-bit
+  // GFX6-GFX120 field to a 6-bit field. Keep this as an ABI property rather
+  // than deriving it from a string at each use site.
+  bool hasGfx125UserSgprCountField = false;
 
   bool isWave32() const { return waveSize == 32; }
 
@@ -52,6 +56,7 @@ struct ISAProfile {
     p.hasWMMA12 = STI.hasFeature(llvm::AMDGPU::FeatureWMMA128bInsts) ||
                   STI.hasFeature(llvm::AMDGPU::FeatureWMMA256bInsts);
     p.hasTensorOps = STI.hasFeature(llvm::AMDGPU::FeatureGFX1250Insts);
+    p.hasGfx125UserSgprCountField = llvm::AMDGPU::isGFX1250Plus(STI);
     return p;
   }
 

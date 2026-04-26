@@ -77,6 +77,10 @@ enum class RaiseFailureReason : uint16_t {
   // how many dwords are preloaded, where workgroup-id SGPRs live), so
   // every Phase-4 SGPR seed would be a guess. We refuse the lift.
   MissingKernelDescriptor,
+  // Phase 4 init: the KD was present, but its raw USER_SGPR_COUNT field
+  // disagreed with the layout implied by kernel_code_properties plus
+  // kernarg_preload for the source ISA.
+  UserSgprLayoutMismatch,
 };
 
 // Human-readable name for a `RaiseFailureReason`. Stable enough for
@@ -206,6 +210,10 @@ struct RaiseFailure {
   // diagnostic; there is no `DecodedInst` because the failure happens
   // before the disassembly is consumed.
   static RaiseFailure missingKernelDescriptor(llvm::StringRef kernelName);
+
+  // Phase 4 init: descriptor-derived UserSgprLayout consistency check failed.
+  static RaiseFailure userSgprLayoutMismatch(llvm::StringRef kernelName,
+                                             const llvm::Twine &detail);
 };
 
 } // namespace transpiler

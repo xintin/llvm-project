@@ -32,6 +32,8 @@ const char *reasonString(RaiseFailureReason r) {
     return "strict-unsafe-lowering";
   case RaiseFailureReason::MissingKernelDescriptor:
     return "missing-kernel-descriptor";
+  case RaiseFailureReason::UserSgprLayoutMismatch:
+    return "user-sgpr-layout-mismatch";
   }
   return "UnknownRaiseFailureReason";
 }
@@ -175,6 +177,17 @@ RaiseFailure RaiseFailure::missingKernelDescriptor(llvm::StringRef kernelName) {
   f.format = reasonString(RaiseFailureReason::MissingKernelDescriptor);
   f.offset = 0;
   f.detail = ("kernel '" + kernelName + "': .kd symbol not parsed").str();
+  return f;
+}
+
+RaiseFailure RaiseFailure::userSgprLayoutMismatch(
+    llvm::StringRef kernelName, const llvm::Twine &detail) {
+  RaiseFailure f;
+  f.reason = RaiseFailureReason::UserSgprLayoutMismatch;
+  f.mnemonic = "<user-sgpr-layout>";
+  f.format = reasonString(RaiseFailureReason::UserSgprLayoutMismatch);
+  f.offset = 0;
+  f.detail = ("kernel '" + kernelName + "': " + detail).str();
   return f;
 }
 

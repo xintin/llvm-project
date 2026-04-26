@@ -12,6 +12,11 @@ struct PipelineResult {
   std::string irText;
   std::string asmText;
   std::string failMnemonic;
+  std::string failKernel;
+  std::string failReason;
+  std::string failFormat;
+  std::string failDetail;
+  uint64_t failOffset = 0;
   int liftedCount = 0;
   int totalCount = 0;
   bool success = false;
@@ -72,8 +77,8 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
 
 /// Raise and lower ALL kernels in a code object, producing a single merged
 /// HSACO containing every kernel.  Returns success only if every kernel was
-/// raised and compiled.  On failure, PipelineResult::failMnemonic identifies
-/// the unsupported instruction (if any).
+/// raised and compiled. On raise failure, the `fail*` fields carry the
+/// structured `RaiseFailure` details for proof logs and corpus summaries.
 PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
                                      const std::string &sourceISA,
                                      const std::string &targetISA,

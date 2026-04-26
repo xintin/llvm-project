@@ -2,6 +2,7 @@
 #define HOTSWAP_TRANSPILER_USER_SGPR_LAYOUT_HPP
 
 #include "code_object_utils.hpp"
+#include "isa_profile.hpp"
 
 #include <cstdint>
 #include <string>
@@ -33,10 +34,10 @@ namespace transpiler {
 // the kernarg pointer?" should compare against these fields rather than
 // re-walking `entries`.
 //
-// We never silently fall back to a hardcoded layout: if
-// `KernelMeta::hasKernelDescriptor` is false the factory aborts via
-// llvm::report_fatal_error. The caller is expected to refuse the lift
-// before reaching this point.
+// We never silently fall back to a hardcoded layout. Callers that can surface a
+// structured lift refusal should use `tryFromKernelMeta`; the legacy
+// `fromKernelMeta` wrapper still aborts loudly for call sites that cannot
+// propagate a failure.
 struct UserSgprLayout {
   enum class Source : uint8_t {
     Unset,
@@ -94,10 +95,20 @@ struct UserSgprLayout {
   uint8_t preloadedKernargLength = 0;
   uint16_t preloadedKernargByteOffset = 0;
 
-  // Build the layout from a parsed kernel descriptor. Aborts via
-  // report_fatal_error if `meta.hasKernelDescriptor` is false; the caller
-  // is responsible for refusing the lift earlier in the pipeline.
-  static UserSgprLayout fromKernelMeta(const KernelMeta &meta);
+  // Build the layout from a parsed kernel descriptor. Returns false and fills
+  // `failureDetail` when the descriptor is missing or internally inconsistent.
+  // `sourceProfile` selects ABI-versioned fields such as gfx125's 6-bit
+  // compute_pgm_rsrc2.USER_SGPR_COUNT. `sourceISA` is used only in diagnostics.
+  static bool tryFromKernelMeta(const KernelMeta &meta,
+                                const ISAProfile &sourceProfile,
+                                const std::string &sourceISA,
+                                UserSgprLayout &layout,
+                                std::string &failureDetail);
+
+  // Fatal wrapper for callers that cannot return a structured RaiseFailure.
+  static UserSgprLayout fromKernelMeta(const KernelMeta &meta,
+                                       const ISAProfile &sourceProfile,
+                                       const std::string &sourceISA);
 
   // Render a one-line debug summary: useful for HSA_HOTSWAP_DEBUG output
   // and for failure diagnostics. Format:

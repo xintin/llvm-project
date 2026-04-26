@@ -212,9 +212,16 @@ static bool raiseAndCompileKernel(const TextSection &text,
                            enableWaveNative);
   if (!raised.success) {
     llvm::errs() << "transpiler: Raising '" << kernelName << "' to LLVM IR failed";
+    result.failKernel = kernelName;
     if (!raised.failure.mnemonic.empty()) {
       llvm::errs() << " (unsupported: " << raised.failure.mnemonic << ")";
       result.failMnemonic = raised.failure.mnemonic;
+    }
+    if (raised.failure.hasFailed()) {
+      result.failReason = reasonString(raised.failure.reason);
+      result.failFormat = raised.failure.format;
+      result.failDetail = raised.failure.detail;
+      result.failOffset = raised.failure.offset;
     }
     llvm::errs() << "\n";
     return false;

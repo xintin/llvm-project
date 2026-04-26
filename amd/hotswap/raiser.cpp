@@ -1211,7 +1211,18 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // Build the source-ISA user-SGPR ABI from the kernel descriptor.
   // Phase 4 seeding and handler-side ABI-sensitive decoding (e.g.
   // handle_smem's kernarg-pointer detection) both key off this layout.
-  UserSgprLayout userSgprLayout = UserSgprLayout::fromKernelMeta(meta);
+  UserSgprLayout userSgprLayout;
+  std::string userSgprFailureDetail;
+  if (!UserSgprLayout::tryFromKernelMeta(meta, isa, sourceISA, userSgprLayout,
+                                         userSgprFailureDetail)) {
+    result.failure = meta.hasKernelDescriptor
+                         ? RaiseFailure::userSgprLayoutMismatch(
+                               kernelName, userSgprFailureDetail)
+                         : RaiseFailure::missingKernelDescriptor(kernelName);
+    if (!userSgprFailureDetail.empty())
+      errs() << userSgprFailureDetail << "\n";
+    return result;
+  }
   // ==== Phase 3: Create basic blocks ====
   std::map<uint64_t, BasicBlock *> offsetToBB;
   for (uint64_t addr : blockStarts)
