@@ -11,6 +11,9 @@ tools/compare_correctness/compare_correctness
 tools/compare_correctness/libsalmon_intercept.so
 tools/compare_correctness/kernels/build/
 tools/compare_correctness/RESULTS.md
+tools/compare_correctness/MEETING_REPORT.md
+tools/compare_correctness/MEETING_REPORT.csv
+tools/compare_correctness/_parse_report.py
 
 # Upstream projects/rocr-runtime/.gitignore ignores every file named
 # "Makefile" anywhere beneath it; un-ignore our hand-written tool Makefiles.

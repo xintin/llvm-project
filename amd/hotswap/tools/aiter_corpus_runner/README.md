@@ -268,6 +268,20 @@ close the gap:
   `native PASS + legacy PASS + salmon HANG` row is usually a libhsa
   integration issue, not an asm-transpilation regression.  `legacy` is
   the stable baseline for the transpiler itself.
+- A handful of heavy modules (notably `module_rmsnorm`,
+  `module_rope_1c_cached_bwd`) take 10+ minutes of `hipcc` time to
+  JIT-compile on a cold cache and can time out under the default
+  `--timeout 600`.  Once the `_jit_cache/` is warm they're near-free.
+  The runner reaps any orphan `*.lock` / `.baton` files from previous
+  killed runs on startup so a fresh sweep isn't blocked by a stale
+  lock.
+- AITER hardcodes `/tmp/aiter_configs/` for merged tuned-config CSVs.
+  On a shared host another user's run can leave that dir un-writable
+  and brick every GEMM on first run.  The runner redirects that path
+  (via a tiny `pathlib.Path` monkey-patch inside
+  `AITER_CONFIG.update_config_files` only) to
+  `$AITER_CORPUS_CONFIG_DIR`, defaulting to
+  `<--jit-cache>/aiter_configs/`.  No AITER source is modified.
 
 ## Setup — one-time
 
@@ -323,7 +337,7 @@ python3 runner.py --aiter-root /path/to/your/aiter \
 | `--modes`            | `native,legacy,salmon`                                                     | comma-separated subset of `{native,legacy,salmon}`                       |
 | `--source-gfx`       | `gfx950`                                                                   | AITER ISA forced in legacy/salmon modes                                  |
 | `--native-gfx`       | auto-detected via `rocminfo`                                               | real device ISA; override for cross-host testing                         |
-| `--strict-tolerance` | `0.01`                                                                     | `checkAllclose` mismatch percent above which the patched wrapper raises  |
+| `--strict-tolerance` | `0.05`                                                                     | `checkAllclose` mismatch percent above which the patched wrapper raises (matches AITER's own `tol_err_ratio=0.05`; set lower to hunt silent transpilation miscompiles) |
 | `--perftest-iters`   | `1`                                                                        | informational; the patched perftest always calls the kernel exactly once |
 | `--rng-seed`         | `0`                                                                        | seed for `random` / `numpy` / `torch` before every script                |
 | `--timeout`          | `600` s                                                                    | per-child wall clock; SIGKILL on overshoot                               |
@@ -339,7 +353,7 @@ python3 runner.py --aiter-root /path/to/your/aiter \
 | `--triton-venv`      | `../triton_corpus_runner/.venv-rocm7`                                      | venv with torch + rocm7                                                  |
 | `--libsalmon`        | `../compare_correctness/libsalmon_intercept.so`                            | intercept shim                                                           |
 | `--libhsa`           | `~/rocm-systems/projects/rocr-runtime/build/rocr/lib/libhsa-runtime64.so.1`| Salmon-enabled libhsa                                                    |
-| `--libamdhip`        | —                                                                          | only set when the venv's torch ships HIP older than the Salmon ROCR      |
+| `--libamdhip`        | auto-detected from system `hipcc` (e.g. `/opt/rocm/lib/libamdhip64.so.7`)  | `LD_PRELOAD`ed ahead of the venv's bundled HIP **in every mode**; pins AITER-JIT'd `.so` files to the same HIP ABI they were hipcc-compiled against.  Required in practice because ROCm shifts `hipDeviceAttribute_*` enum values between versions (e.g. `PciChipId` moved from 10019 in HIP 7.0 to 10020 in HIP 7.2.1 — the older runtime aborts if AITER's `.so` asks for the newer attribute).  Pass `""` to disable. |
 | `--libarch-spoof`    | `<HERE>/libaiter_arch_spoof.so`                                            | arch-spoof shim built by `make` here                                     |
 | `--spoof-arch`       | `--source-gfx`                                                             | value written into `gcnArchName` by the shim                             |
 

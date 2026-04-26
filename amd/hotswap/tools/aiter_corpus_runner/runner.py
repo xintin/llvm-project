@@ -18,7 +18,9 @@ Per (script, mode) we record one of:
                  failure inside the script — the script ran far
                  enough to compare results).
     CRASH        terminated by signal (SIGSEGV / SIGABRT / SIGILL...)
-    HANG         exceeded ``--timeout`` and was SIGKILLed.
+    HANG         no stdout/stderr activity for ``--idle-timeout``
+                 seconds, or ``--max-wallclock`` elapsed overall,
+                 and was SIGKILLed.
     SPAWN_FAIL   the subprocess couldn't even start (missing python,
                  missing libsalmon_intercept, etc.).
 
@@ -54,6 +56,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -231,9 +234,48 @@ DEFAULT_LIBSALMON = os.path.normpath(
 DEFAULT_LIBHSA = os.path.normpath(os.path.expanduser(
     "~/rocm-systems/projects/rocr-runtime/build/rocr/lib/libhsa-runtime64.so.1"
 ))
-# Empty by default — the rocm-7 torch wheel ships a HIP runtime that
-# tolerates the Salmon ROCR's multi-ISA agent enumeration directly.
-DEFAULT_LIBAMDHIP = ""
+# System libamdhip64.so.7 to LD_PRELOAD ahead of the venv's bundled
+# HIP.  Autodetected from the sibling of the system ``hipcc`` — the
+# same ROCm install AITER's JIT compiles its per-op .so files against.
+#
+# Why this is necessary even in native mode:
+#   ROCm periodically inserts new attributes into the middle of the
+#   ``hipDeviceAttribute_*`` enum.  Between HIP 7.0 (the version the
+#   current torch nightly wheel bundles as ``torch/lib/libamdhip64.so``)
+#   and HIP 7.2.1 (what ``/opt/rocm/bin/hipcc`` compiles against on this
+#   box), a new ``hipDeviceAttributeMaxAvailableVgprsPerThread`` was
+#   inserted at 10019, shifting ``hipDeviceAttributePciChipId`` from
+#   10019 to 10020.  AITER's per-op .so files (e.g.
+#   ``mha_fwd_fp8bf16*.so``) are hipcc-compiled with the system 7.2.1
+#   header, so they call ``hipDeviceGetAttribute(&id, 10020, dev)``.
+#   At process start torch imports its bundled HIP 7.0 ``libamdhip64``
+#   first; when AITER's .so runs its ``get_pci_chip_id()`` lookup in
+#   ``is_mi308_device()`` it resolves to the already-loaded HIP 7.0
+#   runtime, which doesn't know attribute 10020 and aborts the process
+#   with ``[HIP error](invalid argument)``.  Preloading the system
+#   ``libamdhip64.so.7`` ahead of torch's bundled copy forces both
+#   torch and AITER-JIT'd .so files to bind to the same (newer) HIP
+#   ABI the hipcc headers were compiled against, which eliminates the
+#   enum-shift mismatch.  This is a runner-level workaround; the
+#   principled upstream fix would be either (a) shipping a torch wheel
+#   built against the same ROCm as /opt/rocm, or (b) AITER using
+#   ``hipDeviceGetAttribute`` symbol lookups that don't depend on enum
+#   numerics.
+#
+# Falls back to ``""`` (no preload, trust venv HIP) when no system
+# hipcc is found.  Users can pass ``--libamdhip ""`` to force-disable.
+def _autodetect_libamdhip() -> str:
+    hipcc = shutil.which("hipcc")
+    if not hipcc:
+        return ""
+    rocm_dir = os.path.dirname(os.path.dirname(os.path.realpath(hipcc)))
+    candidate = os.path.join(rocm_dir, "lib", "libamdhip64.so.7")
+    if os.path.exists(candidate):
+        return candidate
+    return ""
+
+
+DEFAULT_LIBAMDHIP = _autodetect_libamdhip()
 # Local arch-spoofing shim that hooks hipGetDevicePropertiesR0000 /
 # R0600 and rewrites gcnArchName to AITER_CORPUS_SPOOF_ARCH (only
 # loaded for legacy/salmon modes).  Built by this directory's
@@ -249,6 +291,41 @@ DEFAULT_LIBARCH_SPOOF = os.path.normpath(
 )
 
 EMPTY_RULES = os.path.join(HERE, "_empty_rules.json")
+
+# Two sources of ground truth for "the transpiler was exercised on
+# a code object this run":
+#
+#   (a) The Salmon preload shim (tests/salmon_intercept.cpp:228):
+#         salmon_intercept: patched e_flags for <isa> (<sz> bytes, ...)
+#       Fires once per hipModuleLoadData / hipModuleLoadDataEx call
+#       that the shim intercepts at the HIP-driver layer — the path
+#       AITER's ``hsaco_launcher.py`` and CK's RTC use.
+#
+#   (b) The hotswap hook inside the Salmon-enabled libhsa-runtime
+#       (hotswap.cpp:1265):
+#         hotswap: retarget: assembling <N> instructions for <cpu>...
+#       Fires once per HSA code object that actually needed
+#       instruction-level retargeting — the path AITER's dlopen'd
+#       ``compile_ops`` .so files end up on via __hipRegisterFatBinary.
+#
+# A given (script, mode) run may trip either or both channels.  We
+# count the union: any hit on either regex counts as one transpile
+# event.  Summing is correct — the two log lines are emitted by
+# distinct code paths that process distinct code objects, not the
+# same object twice (the shim hands its patched buffer to HIP, HSA
+# then creates its own code object for the hotswap layer to see).
+#
+# Both regexes are anchored at start-of-line so test output that
+# happens to mention either string in passing (e.g. printing an
+# error message) can't inflate the count.  We also only look at the
+# fixed prefix so minor format tweaks downstream (adding new
+# fields, changing the ISA name) don't silently stop counting.
+_TRANSPILE_EVENT_RES = (
+    re.compile(r"^salmon_intercept: patched e_flags for\b",
+               re.MULTILINE),
+    re.compile(r"^hotswap: retarget: assembling \d+ instructions\b",
+               re.MULTILINE),
+)
 
 # Auto-clone target.  ``--setup`` does ``git clone --recursive
 # https://github.com/ROCm/aiter.git`` here on first run.
@@ -388,6 +465,18 @@ class RunResult:
     signal_name: Optional[str]
     elapsed_s: float
     stderr_tail: str
+    # Count of code-object loads that went through Salmon's ELF-patch
+    # path in this run — i.e. every time the preload shim intercepted
+    # ``hipModuleLoadData``/``hipModuleLoadDataEx``, rewrote the ELF
+    # e_flags to the target ISA, and handed it to the HIP loader for
+    # the hotswap layer to actually translate.  Grepped out of the
+    # child's full stderr (``salmon_intercept: patched e_flags``).
+    # Zero for ``native`` runs (no preload).  Non-zero for legacy/
+    # salmon runs confirms the mode under test actually exercised
+    # the transpiler for that script — a HANG/CRASH on a script with
+    # ``transpile_events=0`` means the failure happened before any
+    # kernel was loaded and is NOT a transpiler finding.
+    transpile_events: int = 0
 
 
 # -- subprocess plumbing ----------------------------------------------------
@@ -433,6 +522,20 @@ def _build_env(
     # and crash on first import.
     os.makedirs(jit_cache, exist_ok=True)
     env["AITER_JIT_DIR"] = jit_cache
+
+    # Per-user redirect for AITER's hardcoded ``/tmp/aiter_configs/``.
+    # AITER has no env hook for this path — the monkey-patch lives in
+    # ``_bootstrap.py::_patch_aiter_config_dir`` and reads
+    # ``AITER_CORPUS_CONFIG_DIR`` to decide where to redirect.  We
+    # co-locate it with the JIT cache so a single ``rm -rf _jit_cache``
+    # clears all runner-owned AITER state at once, and so a shared
+    # ``/tmp/aiter_configs/`` (owned by some other user from a prior
+    # AITER run) can't make the first GEMM test fail with
+    # ``PermissionError`` when the FileBaton lock tries to O_CREAT |
+    # O_EXCL in a directory it doesn't have write access to.
+    config_dir = os.path.join(jit_cache, "aiter_configs")
+    os.makedirs(config_dir, exist_ok=True)
+    env["AITER_CORPUS_CONFIG_DIR"] = config_dir
 
     # Avoid matplotlib trying to open a display on a tutorial-style
     # test that imports it for benchmark plots.
@@ -489,12 +592,34 @@ def _build_env(
         env.setdefault("HSA_HOTSWAP_ISA_OVERRIDE", "gfx942")
         env.setdefault("HSA_HOTSWAP_RULES", EMPTY_RULES)
     else:
-        # Native runs must be *clean* — no inherited preload from an
-        # interactive shell that already had one set.
-        env.pop("LD_PRELOAD", None)
+        # Native runs must be clean of *runner-specific* preloads (no
+        # Salmon intercept, no arch-spoof shim, no Salmon libhsa) —
+        # that's what makes native the reference baseline.  But
+        # ``libamdhip64.so.7`` is not a runner-specific preload; it
+        # only pins torch and AITER's JIT'd .so files to the same HIP
+        # ABI they were hipcc-compiled against, which is required for
+        # correctness on any host where /opt/rocm's hipcc is a
+        # different ROCm version than the venv torch wheel's bundled
+        # HIP (see the ``DEFAULT_LIBAMDHIP`` comment for the full
+        # enum-shift rationale).  An inherited LD_PRELOAD from the
+        # user's shell is *not* preserved — we set it explicitly from
+        # ``--libamdhip`` or clear it entirely.
         env.pop("HSA_HOTSWAP_ISA_OVERRIDE", None)
         env.pop("HSA_HOTSWAP_IR_RAISER", None)
         env.pop("HSA_HOTSWAP_RULES", None)
+        if libamdhip:
+            if not os.path.exists(libamdhip):
+                raise RuntimeError(
+                    f"--libamdhip {libamdhip!r} does not exist; pass an "
+                    f"empty string to disable libamdhip preload"
+                )
+            env["LD_PRELOAD"] = libamdhip
+            env["LD_LIBRARY_PATH"] = ":".join(
+                [os.path.dirname(libamdhip),
+                 env.get("LD_LIBRARY_PATH", "")]
+            ).rstrip(":")
+        else:
+            env.pop("LD_PRELOAD", None)
 
     if mode.needs_ir_raiser:
         env["HSA_HOTSWAP_IR_RAISER"] = "1"
@@ -809,7 +934,8 @@ def _run_one(
     strict_tol: float,
     perftest_iters: int,
     jit_cache: str,
-    timeout_s: float,
+    idle_timeout_s: float,
+    max_wallclock_s: float,
     visible_devices: Optional[str],
     script_args: List[str],
     rng_seed: str,
@@ -952,6 +1078,17 @@ def _run_one(
         f"[{_sanitize_log_component(script_label)}::{mode.name}] "
     ).encode() if tee_stderr else b""
 
+    # Idle-activity clock driven by the pump threads: every byte
+    # either pump receives advances this timestamp.  The main thread
+    # uses it (below) to decide whether a still-running child is
+    # actually making progress (hipcc chatter, AITER prints) or has
+    # genuinely stalled.  The list-of-one holds a single monotonic()
+    # value mutated in place so both pumps can update it without
+    # needing ``nonlocal`` gymnastics; reads from the main thread
+    # are racy-but-benign — a missed update at worst delays the kill
+    # decision by one 4 KiB pipe read, not by any meaningful amount.
+    last_activity = [time.monotonic()]
+
     # ``log_state`` and ``tee_state`` are mutable cells driven by
     # the pump threads — they let us disable a broken sink
     # exactly once across both pumps without hoisting the logic
@@ -1003,10 +1140,26 @@ def _run_one(
 
     def _pump(stream, is_stderr: bool) -> None:
         pending = bytearray()  # partial trailing line across chunks
+        # Use ``read1`` instead of ``read`` so we return AS SOON AS
+        # any data is available from the pipe, rather than blocking
+        # until the 4 KiB buffer fills up.  Without this, small
+        # writes from the child (e.g. a 50-byte heartbeat every
+        # 5 s) accumulate inside ``io.BufferedReader`` until ~80 of
+        # them fit, which defeats the whole point of the
+        # ``--idle-timeout`` watchdog — the watchdog sees zero
+        # activity for minutes while the child has actually been
+        # printing continuously, and SIGKILLs a perfectly alive
+        # child.  ``read1(n)`` is the exact API for "give me
+        # whatever's buffered, up to n bytes, now".
         while True:
-            chunk = stream.read(4096)
+            chunk = stream.read1(4096)
             if not chunk:
                 break
+            # Every received byte proves the child is still making
+            # progress.  The idle-timeout watchdog on the main thread
+            # reads this.  Plain assignment; no lock, no RMW — see
+            # ``last_activity`` declaration above for why that's fine.
+            last_activity[0] = time.monotonic()
             if log_state["fh"] is not None:
                 try:
                     log_state["fh"].write(chunk)
@@ -1049,11 +1202,46 @@ def _run_one(
     t_err.start()
     t_out.start()
 
+    # Two concurrent watchdogs on the running child:
+    #
+    #   1. Idle-timeout (``idle_timeout_s``).  We kill the child if
+    #      no byte has crossed either pipe for this many seconds.
+    #      AITER + hipcc emit continuous progress chatter during
+    #      JIT compile (module names, "waiting for baton release",
+    #      mangled kernel signatures, "assembling N instructions"),
+    #      so a compiling child is "alive" by this metric and will
+    #      not be killed.  A child genuinely wedged in a GPU kernel
+    #      or a deadlocked ``baton.wait()`` goes silent on both
+    #      streams and is killed on schedule.
+    #   2. Max-wallclock (``max_wallclock_s``).  A hard upper bound
+    #      against a chatty infinite loop — e.g. a child that
+    #      spam-prints "retrying" forever and never makes real
+    #      progress.  Much larger than the idle cutoff; belts and
+    #      braces.
+    #
+    # Both thresholds cause a ``HANG`` verdict; the detail string
+    # records which one tripped so triage can tell them apart.
     timed_out = False
-    try:
-        proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    hang_kind: Optional[str] = None
+    poll_interval = 0.5
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        now = time.monotonic()
+        idle_for = now - last_activity[0]
+        wall_for = now - t0
+        if idle_for > idle_timeout_s:
+            timed_out = True
+            hang_kind = "idle"
+            break
+        if wall_for > max_wallclock_s:
+            timed_out = True
+            hang_kind = "wall"
+            break
+        time.sleep(poll_interval)
+
+    if timed_out:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -1105,7 +1293,16 @@ def _run_one(
 
     if timed_out:
         verdict, sig_name = "HANG", None
-        detail = f"exceeded timeout of {timeout_s:.0f}s; SIGKILLed"
+        if hang_kind == "idle":
+            detail = (
+                f"no stdout/stderr activity for "
+                f"{idle_timeout_s:.0f}s (idle-timeout); SIGKILLed"
+            )
+        else:
+            detail = (
+                f"exceeded max wall clock of "
+                f"{max_wallclock_s:.0f}s; SIGKILLed"
+            )
     else:
         verdict, sig_name = _classify_exit(proc.returncode)
         if verdict == "CRASH":
@@ -1116,6 +1313,20 @@ def _run_one(
             detail = "ok"
     if log_path is not None:
         detail = f"{detail}; log={log_path}"
+
+    # Count transpile events in the captured stderr.  See
+    # ``_TRANSPILE_EVENT_RES`` for the two log lines we match and
+    # why summing them (rather than taking the max) is the right
+    # thing.  This per-(script, mode) number is the primary evidence
+    # that the transpiler was actually exercised during this run:
+    # a HANG/CRASH on a non-native run with ``n_transpile_events=0``
+    # means the failure happened before any code object reached the
+    # transpiler (dep import error, test collection failure,
+    # PyTorch-fallback path, etc.) and should not count as a salmon
+    # finding.
+    n_transpile_events = sum(
+        len(pat.findall(stderr)) for pat in _TRANSPILE_EVENT_RES
+    )
 
     # Child is done — either exited, crashed, or was SIGKILLed on
     # timeout — and has been reaped by ``proc.wait``.  Drop it from
@@ -1132,6 +1343,7 @@ def _run_one(
         signal_name=sig_name,
         elapsed_s=elapsed,
         stderr_tail=_tail(stderr),
+        transpile_events=n_transpile_events,
     )
 
 
@@ -1185,19 +1397,39 @@ def _reap_orphan_build_locks(jit_cache: str) -> Tuple[List[str], List[str]]:
     if not os.path.isdir(build_dir):
         return [], []
 
+    # AITER places FileBaton lock files at several distinct paths,
+    # none of which can be captured with a flat listdir(build_dir):
+    #
+    #   * build/lock_<module>            — aiter/jit/core.py mp_lock
+    #   * build/lock_3rdparty_clone_*    — aiter/jit/core.py 3rdparty guard
+    #   * build/<module>/build/lock      — aiter/jit/utils/cpp_extension.py
+    #   * build/<...>/<config>.lock      — aiter/jit/core.py config writer
+    #
+    # Walk the whole build tree and match any regular file whose
+    # basename is ``"lock"``, starts with ``"lock_"``, or ends in
+    # ``".lock"``.  Walking is cheap in practice (a few dozen
+    # entries per module) and correct for every current AITER call
+    # site.  A listdir-only scan misses the nested per-module
+    # ``build/<module>/build/lock`` files entirely, which is the
+    # common case: after one SIGKILL during JIT compile, every
+    # subsequent run of the same script hangs forever in
+    # ``baton.wait()`` on the orphan.
+    lock_paths: List[str] = []
     try:
-        lock_names = [n for n in os.listdir(build_dir) if n.startswith("lock_")]
+        for root, _dirs, files in os.walk(build_dir):
+            for f in files:
+                if f == "lock" or f.startswith("lock_") or f.endswith(".lock"):
+                    lock_paths.append(os.path.join(root, f))
     except OSError as e:
-        return [], [f"listdir({build_dir}): {e}"]
-    if not lock_names:
+        return [], [f"walk({build_dir}): {e}"]
+    if not lock_paths:
         return [], []
 
     # Resolve each candidate lock to its (st_dev, st_ino) so we can
     # match on inode rather than path — robust against someone
     # renaming or moving the file under us mid-scan.
     targets: Dict[Tuple[int, int], str] = {}
-    for name in lock_names:
-        p = os.path.join(build_dir, name)
+    for p in lock_paths:
         try:
             st = os.stat(p)
         except FileNotFoundError:
@@ -1337,7 +1569,8 @@ def _run_parallel(
                 strict_tol=args.strict_tolerance,
                 perftest_iters=args.perftest_iters,
                 jit_cache=args.jit_cache,
-                timeout_s=args.timeout,
+                idle_timeout_s=args.idle_timeout,
+                max_wallclock_s=args.max_wallclock,
                 visible_devices=gpu,
                 script_args=args.script_arg,
                 rng_seed=args.rng_seed,
@@ -1514,6 +1747,19 @@ def _do_setup(aiter_root: str,
           file=sys.stderr, flush=True)
     subprocess.run([pip, "install", "-r", requirements], check=True)
 
+    # Extra deps the AITER op-tests themselves import but that AITER
+    # does not list in its own requirements.txt.  Adding them here
+    # means ``--setup`` is a single command and the corpus sweep
+    # doesn't silently lose scripts to ``ModuleNotFoundError`` later.
+    # Keep this list minimal and justified inline.
+    extra_deps = [
+        "scipy",   # test_sampling.py imports scipy.stats
+    ]
+    print(f"[setup] {pip} install {' '.join(extra_deps)}  "
+          f"(runner-extra deps used by AITER's op_tests but not in "
+          f"AITER requirements.txt)", file=sys.stderr, flush=True)
+    subprocess.run([pip, "install", *extra_deps], check=True)
+
     print("[setup] done; AITER is on PYTHONPATH and its Python deps "
           "are installed.  C++ ops will compile lazily on first use "
           "via aiter's @compile_ops decorator (cached in --jit-cache).",
@@ -1582,10 +1828,22 @@ def _print_grid(results: List[RunResult], mode_names: List[str],
             r = by_script[script].get(m)
             if r is None:
                 cell = "—"
-            elif r.verdict == "PASS":
-                cell = "PASS"
             else:
-                cell = f"{r.verdict} ({r.detail})"
+                # Annotate non-native cells with the number of
+                # Salmon ELF-patch events observed.  An "xN" suffix
+                # on a legacy/salmon cell confirms the transpiler
+                # was exercised N times.  A PASS without any events
+                # on legacy/salmon means no gfx950 code object was
+                # loaded — the script PASSed but trivially, without
+                # going through the path under test.  The summary
+                # block below turns this into an explicit warning.
+                if r.verdict == "PASS":
+                    base = "PASS"
+                else:
+                    base = f"{r.verdict} ({r.detail})"
+                if r.mode != "native":
+                    base = f"{base} x{r.transpile_events}"
+                cell = base
             row += "   " + cell[:cell_w].ljust(cell_w)
         print(row)
 
@@ -1608,9 +1866,14 @@ def _print_failures(results: List[RunResult], mode_names: List[str],
             continue
         print(f"\n{m}")
         for r in runs:
+            extra = (
+                f", transpile_events={r.transpile_events}"
+                if r.mode != "native" else ""
+            )
             print(
                 f"  {_short_label(r.script, base_dirs)}"
-                f"  {r.verdict}  ({r.detail}, {r.elapsed_s:.1f}s)"
+                f"  {r.verdict}  ({r.detail}, "
+                f"{r.elapsed_s:.1f}s{extra})"
             )
             if r.stderr_tail.strip():
                 for line in r.stderr_tail.rstrip().splitlines()[-12:]:
@@ -1638,24 +1901,84 @@ def _print_summary(results: List[RunResult], mode_names: List[str]) -> None:
             row += "   " + str(counts[v][m]).rjust(8)
         print(row)
 
-    by_script: Dict[str, Dict[str, str]] = {}
+    by_script_verdict: Dict[str, Dict[str, str]] = {}
+    by_script_result: Dict[str, Dict[str, RunResult]] = {}
     for r in results:
-        by_script.setdefault(r.script, {})[r.mode] = r.verdict
+        by_script_verdict.setdefault(r.script, {})[r.mode] = r.verdict
+        by_script_result.setdefault(r.script, {})[r.mode] = r
+
+    # Transpile-exercise summary: how many scripts actually loaded
+    # at least one gfx950 code object through the Salmon preload
+    # path under each non-native mode, broken down by verdict.  This
+    # is the answer to "did we really test the transpiler?".
+    for transp in ("legacy", "salmon"):
+        if transp not in mode_names:
+            continue
+        ran = [
+            r for r in results
+            if r.mode == transp and r.transpile_events > 0
+        ]
+        zero = [
+            r for r in results
+            if r.mode == transp and r.transpile_events == 0
+        ]
+        total_events = sum(r.transpile_events for r in ran)
+        n_scripts_total = len([r for r in results if r.mode == transp])
+        print(
+            f"\n  {transp}: transpiler exercised on "
+            f"{len(ran)}/{n_scripts_total} scripts "
+            f"({total_events} total Salmon ELF-patch events)"
+        )
+        if zero:
+            # Non-native runs that loaded *zero* gfx950 code objects
+            # are harness-noise, not transpiler signal.  Highlight
+            # them so they don't silently inflate PASS rates.
+            print(
+                f"    scripts with 0 transpile events (NOT a valid "
+                f"{transp} test — failure / pass is not the "
+                f"transpiler's doing):"
+            )
+            for r in sorted(zero, key=lambda r: r.script):
+                print(
+                    f"      - {os.path.basename(r.script)} "
+                    f"[{r.verdict}]"
+                )
 
     if "native" in mode_names:
-        native_ok = [s for s, m in by_script.items() if m.get("native") == "PASS"]
+        native_ok = [s for s, m in by_script_verdict.items()
+                     if m.get("native") == "PASS"]
         for transp in ("legacy", "salmon"):
             if transp not in mode_names:
                 continue
-            broke = [s for s in native_ok if by_script[s].get(transp) != "PASS"]
+            # Only count scripts where the non-native run actually
+            # exercised the transpiler — a "PASS" with zero events
+            # is not evidence the transpiler works, it's evidence
+            # the script doesn't load a gfx950 code object on this
+            # box.  Excluding these from the numerator AND the
+            # denominator keeps the reported ratio honest.
+            exercised = [
+                s for s in native_ok
+                if by_script_result[s].get(transp) is not None
+                and by_script_result[s][transp].transpile_events > 0
+            ]
+            broke = [
+                s for s in exercised
+                if by_script_verdict[s].get(transp) != "PASS"
+            ]
             print(
-                f"\n  {transp}: {len(native_ok) - len(broke)}/{len(native_ok)} "
-                f"native-PASS scripts also pass under {transp}"
+                f"\n  {transp}: "
+                f"{len(exercised) - len(broke)}/{len(exercised)} "
+                f"native-PASS scripts that exercised the transpiler "
+                f"also pass under {transp}"
             )
             if broke:
                 for s in sorted(broke):
-                    print(f"    - {os.path.basename(s)} "
-                          f"({by_script[s].get(transp, '—')})")
+                    r = by_script_result[s][transp]
+                    print(
+                        f"    - {os.path.basename(s)} "
+                        f"({by_script_verdict[s].get(transp, '—')}, "
+                        f"{r.transpile_events} events)"
+                    )
 
 
 # -- CLI --------------------------------------------------------------------
@@ -1732,10 +2055,13 @@ def main() -> int:
              "building on a machine without the target GPU.",
     )
     ap.add_argument(
-        "--strict-tolerance", type=float, default=0.01,
+        "--strict-tolerance", type=float, default=0.05,
         help="checkAllclose mismatch percent above which the patched "
-             "wrapper raises (default 0.01, matching AITER's own "
-             "warning-vs-failed cutoff)",
+             "wrapper raises (default 0.05 — matches AITER's own "
+             "``tol_err_ratio=0.05`` cutoff inside ``checkAllclose`` "
+             "at test_common.py:429; set lower, e.g. 0.0, to catch "
+             "the slightest salmon-vs-native numerical divergence "
+             "when hunting silent transpilation miscompiles)",
     )
     ap.add_argument(
         "--perftest-iters", type=int, default=1,
@@ -1745,10 +2071,30 @@ def main() -> int:
              "informational",
     )
     ap.add_argument(
-        "--timeout", type=float, default=600.0,
-        help="per-child wall-clock timeout in seconds (default 600 — "
-             "first run includes hipcc compile time for AITER's CK "
-             "side, subsequent runs are much faster from --jit-cache)",
+        "--idle-timeout", type=float, default=30.0,
+        help="kill the child after this many seconds of zero "
+             "stdout/stderr activity (default 30).  AITER + hipcc "
+             "emit continuous progress chatter during JIT compile, "
+             "so a compiling child stays alive; a child stuck in a "
+             "GPU kernel or a deadlocked JIT baton goes silent on "
+             "both pipes and is killed here.  This replaces the "
+             "old wall-clock --timeout (still accepted as an alias "
+             "for --max-wallclock).",
+    )
+    ap.add_argument(
+        "--max-wallclock", type=float, default=900.0,
+        help="hard upper bound on per-child wall-clock time, even "
+             "when the child is still emitting output (default 900). "
+             "Belt-and-braces against a chatty infinite loop that "
+             "never actually progresses.  Should be > --idle-timeout.",
+    )
+    ap.add_argument(
+        "--timeout", dest="legacy_timeout", type=float, default=None,
+        help="DEPRECATED alias for --max-wallclock; old behaviour "
+             "(kill regardless of activity after this many seconds) "
+             "is no longer available — use --idle-timeout for the "
+             "activity-based kill and --max-wallclock for the hard "
+             "cap.  Passing --timeout N sets --max-wallclock=N.",
     )
     ap.add_argument(
         "--triton-venv", default=DEFAULT_TRITON_VENV,
@@ -1766,9 +2112,19 @@ def main() -> int:
     )
     ap.add_argument(
         "--libamdhip", default=DEFAULT_LIBAMDHIP,
-        help="optional system libamdhip64.so.* to LD_PRELOAD ahead of "
-             "the venv's bundled HIP.  Empty (default) means trust the "
-             "venv's HIP — correct for the rocm-7 nightly torch wheel.",
+        help="system libamdhip64.so.7 to LD_PRELOAD ahead of the venv's "
+             "bundled HIP, in every mode (native, legacy, salmon).  "
+             "Defaults to the sibling libamdhip of the system hipcc "
+             f"(autodetected to {DEFAULT_LIBAMDHIP!r}).  Required in "
+             "practice when the venv torch wheel bundles a different "
+             "HIP version than /opt/rocm's hipcc, because AITER JIT-"
+             "compiles its .so files with /opt/rocm's headers and ROCm "
+             "periodically shifts enum values between versions "
+             "(concretely: ``hipDeviceAttributePciChipId`` was 10019 in "
+             "HIP 7.0 and is 10020 in HIP 7.2.1 — the HIP 7.0 runtime "
+             "aborts if AITER's .so asks for 10020).  Pass an empty "
+             "string to force-disable the preload (useful only if the "
+             "venv HIP and /opt/rocm hipcc are the same ROCm version).",
     )
     ap.add_argument(
         "--libarch-spoof", default=DEFAULT_LIBARCH_SPOOF,
@@ -1877,6 +2233,42 @@ def main() -> int:
              "AITER_CORPUS_* env set.",
     )
     args = ap.parse_args()
+
+    # Back-compat: the old ``--timeout N`` was a plain wall-clock
+    # limit.  It now maps to ``--max-wallclock N`` because the
+    # activity-aware idle cutoff has its own knob (``--idle-timeout``)
+    # and mixing them into one flag would be ambiguous.  We deliberately
+    # refuse to silently promote ``--timeout`` into ``--idle-timeout``
+    # — that would cut short any compile that takes longer than N,
+    # which is the exact bug we're removing.  Warn so scripts/CI that
+    # still pass ``--timeout`` learn about the new flags.
+    if args.legacy_timeout is not None:
+        args.max_wallclock = args.legacy_timeout
+        print(
+            f"[aiter_corpus_runner] --timeout is DEPRECATED; treating "
+            f"--timeout {args.legacy_timeout} as "
+            f"--max-wallclock {args.legacy_timeout}.  Set "
+            f"--idle-timeout explicitly to override the default of "
+            f"{args.idle_timeout}s.",
+            file=sys.stderr,
+        )
+    if args.idle_timeout <= 0:
+        print("[aiter_corpus_runner] --idle-timeout must be > 0",
+              file=sys.stderr)
+        return 2
+    if args.max_wallclock <= 0:
+        print("[aiter_corpus_runner] --max-wallclock must be > 0",
+              file=sys.stderr)
+        return 2
+    if args.max_wallclock < args.idle_timeout:
+        print(
+            f"[aiter_corpus_runner] --max-wallclock "
+            f"({args.max_wallclock}) < --idle-timeout "
+            f"({args.idle_timeout}); the wall-clock cap would fire "
+            f"first and make the idle cutoff meaningless",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.setup:
         try:
@@ -2028,7 +2420,9 @@ def main() -> int:
         f"spoof_arch={spoof_arch!r} (legacy/salmon only), "
         f"strict_tol={args.strict_tolerance}, "
         f"rng_seed={args.rng_seed!r}, "
-        f"timeout={args.timeout:.0f}s, jit_cache={args.jit_cache}, "
+        f"idle_timeout={args.idle_timeout:.0f}s, "
+        f"max_wallclock={args.max_wallclock:.0f}s, "
+        f"jit_cache={args.jit_cache}, "
         f"tee_stderr={args.tee_stderr}, "
         f"log_dir={log_dir or '<off>'}, "
         f"{parallel_banner}",
@@ -2079,7 +2473,8 @@ def main() -> int:
                 strict_tol=args.strict_tolerance,
                 perftest_iters=args.perftest_iters,
                 jit_cache=args.jit_cache,
-                timeout_s=args.timeout,
+                idle_timeout_s=args.idle_timeout,
+                max_wallclock_s=args.max_wallclock,
                 visible_devices=args.gpu,
                 script_args=args.script_arg,
                 rng_seed=args.rng_seed,
@@ -2123,7 +2518,8 @@ def main() -> int:
                     "spoof_arch": spoof_arch,
                     "strict_tolerance": args.strict_tolerance,
                     "rng_seed": args.rng_seed,
-                    "timeout_s": args.timeout,
+                    "idle_timeout_s": args.idle_timeout,
+                    "max_wallclock_s": args.max_wallclock,
                     "aiter_root": args.aiter_root,
                     "jobs": jobs,
                     "gpu_pool": gpu_pool[:jobs],

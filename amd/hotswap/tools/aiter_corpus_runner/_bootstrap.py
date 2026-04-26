@@ -57,9 +57,15 @@ Environment knobs the parent sets:
   AITER_CORPUS_STRICT_TOL    Float in ``[0.0, 1.0]``; mismatches
                              whose elementwise-fail-percent is
                              *strictly greater* than this raise
-                             ``AssertionError``.  Default ``"0.01"``
-                             matches AITER's own "warning vs failed"
-                             cutoff (test_common.py:290).
+                             ``AssertionError``.  Default ``"0.05"``
+                             matches AITER's own ``tol_err_ratio=0.05``
+                             cutoff inside ``checkAllclose``
+                             (test_common.py:429 where AITER logs the
+                             ``failed!`` banner iff
+                             ``percent > tol_err_ratio``).  Set lower
+                             (e.g. ``"0.0"``) to catch the slightest
+                             salmon-vs-native divergence when hunting
+                             silent transpilation miscompiles.
 
   AITER_CORPUS_PERFTEST_ITERS  Integer; ignored on the correctness
                              path because we always run the kernel
@@ -221,15 +227,21 @@ def _patch_check_allclose(strict_tol: float) -> None:
     )
     state = {"first_failure": None}
 
-    def wrapper(a, b, rtol=1e-2, atol=1e-2, msg="",
-                printNum=8, printLog=True):
+    def wrapper(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="",
+                printNum=8, printLog=True, **extra):
+        # Match upstream's full keyword signature verbatim (see
+        # aiter/test_common.py:399) and accept **extra so future
+        # upstream additions don't surface as TypeError during the
+        # sweep — an unknown kwarg will simply be forwarded to
+        # ``original`` which is the right place to fail loudly if the
+        # upstream signature actually changed.
         percent = original(
-            a, b, rtol=rtol, atol=atol, msg=msg,
-            printNum=printNum, printLog=printLog,
+            a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio,
+            msg=msg, printNum=printNum, printLog=printLog, **extra,
         )
         # The upstream returns either ``0`` (allclose) or the float
-        # percent of mismatched elements.  Anything > strict_tol is
-        # a real failure under our contract.
+        # percent of mismatched elements.  Anything above our effective
+        # threshold is a real failure under our contract.
         #
         # We deliberately do NOT coerce odd return shapes (``None``,
         # strings, tuples) into a "pass".  If upstream ever changes
@@ -249,15 +261,27 @@ def _patch_check_allclose(strict_tol: float) -> None:
             )
         pct = float(percent)
 
+        # Strictest-wins composition: respect whichever of
+        # ``--strict-tolerance`` and the test author's ``tol_err_ratio``
+        # is tighter.  This keeps ``--strict-tolerance 0.0`` as a
+        # universal "flag every numerical deviation" knob for hunting
+        # salmon miscompiles, while still honoring a per-call
+        # ``tol_err_ratio=0.01`` when the test author knew the kernel
+        # was expected to be tight even though our global default is
+        # AITER's own 0.05.
+        effective_thresh = min(strict_tol, float(tol_err_ratio))
         label = _label_key(msg)
-        if pct > strict_tol:
+        if pct > effective_thresh:
             counts[label]["fail"] += 1
             if state["first_failure"] is None:
                 state["first_failure"] = (label, pct, atol, rtol)
             raise AssertionError(
                 f"[aiter_corpus_runner] checkAllclose label={label!r} "
                 f"failed: {pct:.4%} of elements mismatched "
-                f"(atol={atol}, rtol={rtol}, threshold={strict_tol})"
+                f"(atol={atol}, rtol={rtol}, "
+                f"threshold={effective_thresh} "
+                f"[min(--strict-tolerance={strict_tol}, "
+                f"caller_tol_err_ratio={tol_err_ratio})])"
             )
         counts[label]["pass"] += 1
         return percent
@@ -318,6 +342,162 @@ def _patch_check_allclose(strict_tol: float) -> None:
 # which is correct: we ran the kernel exactly once, no perf signal
 # was collected.
 _PERFTEST_FAKE_AVG_US = 1.0
+
+
+def _patch_aiter_config_dir() -> None:
+    """Redirect AITER's hardcoded ``/tmp/aiter_configs/`` config-merge
+    directory to a per-user path so the runner works on shared hosts.
+
+    Why this is needed: AITER's ``AITER_CONFIG.update_config_files``
+    (aiter/jit/core.py) does ``Path("/tmp/aiter_configs/")`` with no
+    env override and then writes merged tuned-config CSVs + FileBaton
+    lockfiles into that directory.  On any multi-user box where a
+    different user ran AITER first, that directory already exists
+    owned by *them* with mode 0775 (group-writable, not
+    world-writable) — so any subsequent user's first tuned-config
+    merge dies with ``PermissionError: [Errno 13] Permission denied:
+    '/tmp/aiter_configs/<name>.csv.lock'`` the moment AITER's
+    ``FileBaton`` tries to ``os.open(..., O_CREAT | O_EXCL)`` the lock.
+
+    The fix is a minimal wrapper around ``update_config_files`` that
+    swaps ``pathlib.Path`` for a constructor that redirects exactly
+    the hardcoded ``/tmp/aiter_configs/`` literal to a user-writable
+    directory, leaving all other ``Path(...)`` calls untouched.  We
+    don't modify the upstream AITER source — this is an import-time
+    monkey-patch of a single method on the ``AITER_CONFIG`` class.
+
+    The target directory comes from ``AITER_CORPUS_CONFIG_DIR`` (set
+    by the runner); fallback is ``~/.cache/aiter_corpus_runner/``.
+    Several AITER tests (test_gemm_a16w16, test_gemm_a8w8,
+    test_gemm_a8w8_blockscale, ...) hit this path on first run and
+    without the redirect every one of them fails native with a
+    runner-induced ``PermissionError``, completely hiding any real
+    AITER-on-gfx942 signal.
+    """
+    import pathlib
+    import aiter.jit.core as core
+
+    env_override = os.environ.get("AITER_CORPUS_CONFIG_DIR", "").strip()
+    user_cfg_dir = env_override or os.path.expanduser(
+        "~/.cache/aiter_corpus_runner/aiter_configs"
+    )
+    os.makedirs(user_cfg_dir, exist_ok=True)
+
+    original_method = core.AITER_CONFIG.update_config_files
+    real_Path = pathlib.Path
+
+    # The target literal in aiter/jit/core.py.  Spelled with the
+    # trailing slash because that's what AITER writes — we match
+    # byte-identically to minimize the redirect surface.
+    TARGET_LITERAL = "/tmp/aiter_configs/"
+
+    def _redirecting_path(*args, **kwargs):
+        if args and str(args[0]) == TARGET_LITERAL:
+            return real_Path(user_cfg_dir, *args[1:], **kwargs)
+        return real_Path(*args, **kwargs)
+
+    def _wrapped(self, tuned_files, merge_name):
+        pathlib.Path = _redirecting_path
+        try:
+            return original_method(self, tuned_files, merge_name)
+        finally:
+            pathlib.Path = real_Path
+
+    core.AITER_CONFIG.update_config_files = _wrapped
+
+    print(
+        f"[aiter_corpus_runner] redirected AITER's hardcoded "
+        f"{TARGET_LITERAL!r} -> {user_cfg_dir!r} "
+        f"(AITER_CORPUS_CONFIG_DIR)",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _start_heartbeat_thread() -> None:
+    """Spawn a daemon thread that writes a heartbeat line to stderr
+    every ``_HEARTBEAT_SEC`` seconds for the lifetime of the child.
+
+    Why this is needed: AITER's JIT pipeline has *several* silent
+    phases the runner's idle-output watchdog (``--idle-timeout``)
+    would otherwise SIGKILL prematurely under parallel ``--jobs N``:
+      * ``FileBaton.wait()`` (serialises concurrent builds of the
+        same module) spins in ``while os.path.exists(lock):
+        time.sleep(0.2)`` with no output at all until the peer
+        releases the lock.
+      * ``_jit_compile`` → ``ninja`` / ``hipcc`` can spend tens of
+        seconds linking large CK ops after the last compile-unit
+        print lands, again with nothing on our stderr pipe.
+      * ``dlopen`` of a freshly-built 100+ MB .so on a cold NFS /
+        ext4 page cache can take many seconds with no Python-level
+        activity.
+    A heartbeat thread is the simplest way to make all three visible
+    to the runner's watchdog without monkey-patching every silent
+    call site individually.
+    It also serves as a liveness probe: if the child is genuinely
+    wedged at the process level (hard deadlock, GPU reset,
+    ``SIGSTOP``), the Python interpreter stops running threads and
+    the heartbeats stop — which is exactly when the runner's
+    ``--idle-timeout`` should fire.  The thread is the shortest
+    possible path to "quiet in our stderr == no Python progress".
+
+    Principled choice: this is a detection aid, not a lock-bypass
+    shim.  We do NOT touch the baton semantics, we do NOT pretend a
+    lock is released, we do NOT catch any exception from the worker
+    thread.  We just emit periodic breadcrumbs so the watchdog
+    classifies "waiting for a peer" distinctly from "genuinely
+    dead".
+    """
+    import threading
+    import time
+
+    _HEARTBEAT_SEC = 5.0
+
+    start = time.monotonic()
+    stop_event = threading.Event()
+
+    def _beat():
+        # Use direct ``os.write`` to fd 2 rather than ``print(...,
+        # file=sys.stderr)`` because some AITER / ROCm helpers install
+        # their own stderr wrappers and we want the heartbeat to
+        # survive those unchanged.  fd 2 is the same fd the runner's
+        # pump thread is reading from, so a write here directly
+        # advances ``last_activity`` in the parent.
+        while not stop_event.wait(_HEARTBEAT_SEC):
+            msg = (
+                f"[aiter_corpus_runner] heartbeat "
+                f"(+{time.monotonic() - start:.0f}s)\n"
+            )
+            try:
+                os.write(2, msg.encode())
+            except OSError:
+                # Parent closed its end of the pipe — we're being
+                # torn down.  Let the thread exit naturally on the
+                # next iteration when ``stop_event`` is set; until
+                # then, there's nothing useful we can do on a
+                # broken fd 2.
+                return
+
+    t = threading.Thread(
+        target=_beat, name="aiter_corpus_runner-heartbeat",
+        daemon=True,
+    )
+    t.start()
+
+    # Expose the stop event so an orderly shutdown (e.g. atexit) can
+    # silence the thread cleanly.  We don't register the stop here —
+    # the heartbeat running until process exit is fine and the
+    # daemon=True thread is reaped at interpreter shutdown.
+    globals()["_HEARTBEAT_STOP_EVENT"] = stop_event
+
+    print(
+        f"[aiter_corpus_runner] heartbeat thread started "
+        f"({_HEARTBEAT_SEC:.0f}s interval) so the parent's "
+        f"--idle-timeout doesn't kill us during silent JIT "
+        f"compile / baton-wait / dlopen phases",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _patch_perftest() -> None:
@@ -467,7 +647,7 @@ def main() -> int:
 
     script = _require_env("AITER_CORPUS_SCRIPT")
 
-    strict_tol = float(os.environ.get("AITER_CORPUS_STRICT_TOL", "0.01"))
+    strict_tol = float(os.environ.get("AITER_CORPUS_STRICT_TOL", "0.05"))
 
     # Import + patch must happen *before* runpy fires the user
     # script.  Importing aiter at this point also gives the user a
@@ -476,6 +656,8 @@ def main() -> int:
     try:
         _patch_check_allclose(strict_tol)
         _patch_perftest()
+        _patch_aiter_config_dir()
+        _start_heartbeat_thread()
     except BaseException:
         traceback.print_exc()
         print(
