@@ -2,7 +2,7 @@
 ; RUN:     --target-isa=gfx1250 --emit-ir=global_load_async_to_lds_kernel 2>&1 \
 ; RUN:   | %FileCheck %s --check-prefix=IR
 ;
-; Lift fixture for FLAT `global_load_async_to_lds_b{32,64,128}` —
+; Lift fixture for FLAT `global_load_async_to_lds_b{8,32,64,128}` —
 ; the same-target (gfx1250 → gfx1250) intrinsic-emit path. Pins
 ; the principled lift in transpiler/handle_flat.cpp under
 ; `SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B{8,32,64,128}` when
@@ -15,7 +15,7 @@
 ; (vdst:VGPR_32, vaddr:VGPR_64, off:imm, cpol:imm) and SADDR
 ; (vdst:VGPR_32, saddr:SGPR_64, vaddr:VGPR_32, off:imm, cpol:imm)
 ; for each width. The fixture's HIP source uses the clang
-; builtins `__builtin_amdgcn_global_load_async_to_lds_b{32,64,128}`
+; builtins `__builtin_amdgcn_global_load_async_to_lds_b{8,32,64,128}`
 ; which compile to the plain VFLAT 0x60-0x62 reals (vdst=v1,
 ; vaddr=v0, saddr=s[0:1]/s[6:7]/s[4:5] — the kernel-arg pointers
 ; landed in the SGPR base + per-lane VGPR offset shape, which the
@@ -76,6 +76,14 @@
 ; b128: same shape, b128 intrinsic.
 ; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
 ; IR: call void @llvm.amdgcn.global.load.async.to.lds.b128(
+; IR-SAME: ptr addrspace(1)
+; IR-SAME: ptr addrspace(3) %lds_ptr
+; IR-SAME: i32 0
+; IR-SAME: i32 {{-?[0-9]+}}
+
+; b8: same shape, b8 intrinsic.
+; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; IR: call void @llvm.amdgcn.global.load.async.to.lds.b8(
 ; IR-SAME: ptr addrspace(1)
 ; IR-SAME: ptr addrspace(3) %lds_ptr
 ; IR-SAME: i32 0

@@ -801,11 +801,10 @@ config.fixtures = {
     #     same-target (gfx1250 → gfx1250) intrinsic-emit shape:
     #     `inttoptr i32 → ptr addrspace(3)` for the per-lane VGPR_32
     #     LDS base, and the canonical
-    #     `call void @llvm.amdgcn.global.load.async.to.lds.b{32,64,128}`
+    #     `call void @llvm.amdgcn.global.load.async.to.lds.b{8,32,64,128}`
     #     with the FLAT `offset` and `cpol` immediates threaded
-    #     through. The b8 sibling shares the identical handler shape
-    #     (only the trailing intrinsic ID differs) and is covered
-    #     transitively by the SemOp-keyed switch arm.
+    #     through.  The b8 sibling is pinned directly here as the
+    #     scalar-byte member of the same width switch.
     "global_load_async_to_lds":
         r"@LIT_FIXTURE_GLOBAL_LOAD_ASYNC_TO_LDS_CO@",
     # Non-zero flat_offset companion for the FLAT async-copy cross-target

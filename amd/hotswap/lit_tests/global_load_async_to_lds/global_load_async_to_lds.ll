@@ -64,14 +64,18 @@
 ;
 ; === Per-width emission ===
 ;
-; The HIP fixture compiles the three clang builtins
-; `__builtin_amdgcn_global_load_async_to_lds_b{32,64,128}` into
-; three SADDR-form instructions with `scale_offset` enabled (the
+; The HIP fixture compiles the four clang builtins
+; `__builtin_amdgcn_global_load_async_to_lds_b{8,32,64,128}` into
+; SADDR-form instructions with `scale_offset` enabled (the
 ; assembler emits `scale_offset` because the per-lane VGPR offset
 ; is the thread-id times the access element size).  The emulation
 ; materialises `scale_offset` as `mul i64 %voff_zext, N` for
-; N = 4 / 8 / 16 respectively (see `decode.cpp::decodeScaleOffset`
-; for how the cpol bit becomes `DecodedInst::hasScaleOffset`).
+; N = 1 / 4 / 8 / 16 respectively (see
+; `decode.cpp::decodeScaleOffset` for how the cpol bit becomes
+; `DecodedInst::hasScaleOffset`).  For b8, accessBytes = 1 makes
+; scaled and unscaled offsets identical; the assembler / decoder
+; emits the plain `saddr + voff` shape, so the b8 section pins the
+; byte-width load/store rather than a no-op multiply.
 ;
 ; The LDS-base VGPR holds the per-lane i32 address (lds_base +
 ; tid*elemBytes on this fixture); the emulation casts it to
@@ -90,6 +94,7 @@
 ;   b32  : i32
 ;   b64  : <2 x i32>
 ;   b128 : <4 x i32>
+;   b8   : i8
 ;
 ; The natural alignment (accessBytes = 4 / 8 / 16) is attached to
 ; both the load and store so the backend's memop-alignment-derived
@@ -124,6 +129,15 @@
 ; IR: %{{[0-9]+}} = inttoptr i64 %saddr_vaddr{{[0-9]*}} to ptr addrspace(1)
 ; IR: %async_gload{{[0-9]*}} = load <4 x i32>, ptr addrspace(1) %{{[0-9]+}}, align 16
 ; IR: store <4 x i32> %async_gload{{[0-9]*}}, ptr addrspace(3) %lds_ptr{{[0-9]*}}, align 16
+
+; ----- b8 ----- (fourth load)
+
+; IR: %lds_ptr{{[0-9]*}} = inttoptr i32 {{.*}} to ptr addrspace(3)
+; IR: %voff_zext{{[0-9]*}} = zext i32 {{.*}} to i64
+; IR: %saddr_vaddr{{[0-9]*}} = add i64 {{.*}}, %voff_zext{{[0-9]*}}
+; IR: %{{[0-9]+}} = inttoptr i64 %saddr_vaddr{{[0-9]*}} to ptr addrspace(1)
+; IR: %async_gload{{[0-9]*}} = load i8, ptr addrspace(1) %{{[0-9]+}}, align 1
+; IR: store i8 %async_gload{{[0-9]*}}, ptr addrspace(3) %lds_ptr{{[0-9]*}}, align 1
 
 ; ----- Negative assertions -----
 ;
