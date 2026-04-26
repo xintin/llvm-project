@@ -2,9 +2,10 @@
 
 This directory holds FileCheck-style lit tests for the AMDGPU binary
 transpiler (Salmon). Unlike the gtest suite under `../tests/`, these
-tests exercise the raiser at the IR level: they run `raise_cli
---emit-ir` on a small HSA code object and check either the emitted LLVM
-IR on stdout or the raiser's diagnostic output on stderr.
+tests exercise the raiser at the IR level: they assemble a small
+AMDGPU fixture with `llvm-mc` + `ld.lld`, feed the resulting hsaco to
+`raise_cli --emit-ir`, and FileCheck either the emitted LLVM IR on
+stdout or the raiser's diagnostic output on stderr.
 
 Lit is well-suited for the kinds of properties we want to assert here:
 
@@ -28,78 +29,82 @@ hardware mismatches.
 
 ## Layout
 
-Each test lives in its own subdirectory so that fixtures, CHECK
-scripts, and expected outputs stay together:
+Every test is a single self-contained `.s` file. The top of the file
+carries the lit `RUN:` / `CHECK:` directives as AMDGPU-assembly
+comments (`;`); the rest is the kernel body plus its `.amdhsa_kernel`
+and `.amdgpu_metadata` blocks — exactly what `llvm-mc` needs to
+assemble an amdhsa code object. No sidecar `.hip` or `.ll` files, no
+build-time tool invocations, no fixture catalogues wired through
+CMake: `lit.cfg.py` globs `*.s` under this directory and each test
+drives its own assembly.
 
 ```
 lit_tests/
-├── abort_gate/          — SPE allow-list abort gate fires on unknown EXEC-writer
-├── cross_wave_warn/     — cross-wave translation emits modulo-replication warning
-├── divergent_vgpr_ir/   — raised IR has the expected SPE diamond shape
-├── allow_list_audit/    — each allow-listed SemOp routes its EXEC write
-│                         through storeExec
-├── CMakeLists.txt       — wiring (written by the harness, not by the test author)
-├── lit.cfg.py           — lit configuration (substitutions, tool discovery)
-├── lit.site.cfg.py.in   — CMake-generated site configuration
-└── README.md            — this file
+├── <name>.s                — fixture + RUN + CHECK, one file per test
+├── CMakeLists.txt          — harness (discovers FileCheck / llvm-mc / ld.lld)
+├── lit.cfg.py              — lit configuration (substitutions, suite name)
+├── lit.site.cfg.py.in      — CMake-generated site configuration
+└── README.md               — this file
 ```
 
-A test directory typically contains:
+## RUN-line template
 
-*   `<name>.hip` — a small HIP source that, when compiled with `hipcc
-    --genco`, produces the code object the test feeds to the raiser.
-    The `.hip` source uses `asm volatile(...)` blocks to pin down the
-    exact AMDGPU instructions we want the raiser to see; we do *not*
-    rely on hipcc's codegen for anything the test asserts against.
-*   `<name>.ll` — the lit test itself. `.ll` is the LLVM-idiomatic
-    extension for tests that FileCheck-match raised IR. Each test
-    starts with `RUN:` lines and `CHECK:` directives.
+The canonical RUN block assembles, raises, and FileChecks in one
+pipeline. Replace the arch / kernel name as needed; everything else
+copies verbatim:
 
-Where a test only reads IR (e.g. `divergent_vgpr_ir`), the `.ll`
-file's RUN line invokes `%raise_cli --emit-ir=<kernel>` and pipes the
-output into FileCheck. Where a test reads the raiser's diagnostics
-(e.g. `abort_gate`, `cross_wave_warn`), the RUN line redirects stderr
-and optionally asserts a non-zero exit code via `not`.
+```
+; RUN: %llvm_mc -mcpu=gfx942 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco --emit-ir=<kernel-name> 2>/dev/null | %FileCheck %s
+```
+
+*   `%llvm_mc` assembles the fixture against the declared ISA; the
+    `.amdgcn_target` directive inside the source must match `-mcpu=`
+    (llvm-mc will diagnose a mismatch).
+*   `%ld_lld -shared` links the relocatable ELF into the DYN ELF that
+    the amdhsa loader — and `raise_cli` — consume.
+*   `%raise_cli ... --emit-ir[=<kernel>] 2>/dev/null` dumps the raised
+    IR for a single kernel on stdout. Drop the `=<kernel>` when the
+    fixture has one kernel (raise_cli picks it automatically). Redirect
+    stderr to `/dev/null` for success-path tests; use `2>&1` plus `%not`
+    for diagnostic/negative-path tests.
+
+Cross-ISA tests add `--target-isa=<arch>` to the raise_cli invocation
+so the raiser lowers for a different target than the source ISA (see
+`wmma_scale_f32_16x16x128_f8f6f4.s` for the canonical two-RUN pattern:
+one cross-arch refusal and one same-arch lift).
 
 ## Substitutions provided by the harness
 
 Tests should only reference the substitutions below. Do not hard-code
 absolute paths or tool names.
 
-| Substitution     | Meaning                                                                       |
-|------------------|-------------------------------------------------------------------------------|
-| `%raise_cli`     | Path to the built `raise_cli` binary.                                         |
-| `%FileCheck`     | Path to `FileCheck` (LLVM).                                                   |
-| `%not`           | Path to `not` (LLVM; runs its command and inverts the exit code).             |
-| `%S`             | Source directory of the current lit test (the per-test subdirectory).         |
-| `%t`             | Per-test temp dir (used to hold the built `.co`).                             |
-| `%hip_genco`     | Command fragment that invokes `hipcc --genco --offload-arch=<arch>` with      |
-|                  | the appropriate offload arch; see below.                                      |
-| `%<name>_co`     | Absolute path to the built `.co` file for `<name>.hip` in the current test    |
-|                  | directory. The harness compiles each `.hip` to `.co` at CMake configure /     |
-|                  | build time and exposes it as a path substitution, so the lit test itself      |
-|                  | does not need to invoke hipcc.                                                |
+| Substitution | Meaning |
+|---|---|
+| `%raise_cli` | Path to the built `raise_cli` binary. |
+| `%llvm_mc`   | `llvm-mc -triple=amdgcn-amd-amdhsa -filetype=obj` (tool + fixed flags). |
+| `%ld_lld`    | Path to `ld.lld` (pass `-shared` explicitly so the hsaco shape stays visible). |
+| `%FileCheck` | Path to `FileCheck` (LLVM). |
+| `%not`       | Path to `not` (LLVM; runs its command and inverts the exit code). |
+| `%s`         | Path to the current fixture. |
+| `%t`         | Per-test scratch path prefix (e.g. `%t.o`, `%t.hsaco`). |
 
-The harness is responsible for:
-
-*   Discovering `hipcc` and the raiser tools.
-*   Compiling each `<name>.hip` in each test directory to
-    `<name>_gfx<arch>_unbundled.co` via `hipcc --genco
-    --offload-arch=<arch>` followed by `clang-offload-bundler` to
-    extract the unbundled code object (same flow as `tests/test_common.hpp`).
-    The target arch for each fixture is declared in the test's
-    `<name>.hip` as a comment on the first line, `// ARCH: gfx942`.
-    If no `ARCH:` comment is present, `gfx942` is assumed.
-*   Setting the `hipcc` feature in `config.available_features` iff
-    hipcc is on `$PATH`. Tests requiring hipcc-built fixtures must
-    declare `REQUIRES: hipcc`.
+`llvm-mc`, `ld.lld`, `FileCheck`, `not`, and `llvm-lit` are all
+resolved at CMake configure time from the LLVM build tree the parent
+project links against; there is no runtime tool discovery.
 
 ## Writing style
 
-*   Keep `.hip` fixtures small. One kernel per file. Inline-assembly
-    blocks with explicit `"exec"`, `"memory"`, and scalar-register
-    clobbers are the recommended way to force the raiser to see a
-    specific instruction sequence.
+*   Keep fixtures small. One kernel per file. Inline-assembly blocks
+    (`;;#ASMSTART` / `;;#ASMEND` as emitted by clang for `asm volatile(...)`)
+    are the recommended way to force the raiser to see a specific
+    instruction sequence the rest of the surrounding kernel body does
+    not already produce.
+*   Keep the `.amdhsa_kernel` / `.amdgpu_metadata` blocks minimal —
+    only values that differ from the LLVM defaults need to be listed
+    (see `MCKernelDescriptor::getDefaultAmdhsaKernelDescriptor` for the
+    per-subtarget defaults, and `AMDGPUMetadataVerifier.cpp` for which
+    metadata fields are required vs. optional).
 *   CHECK lines should match *SSA patterns*, not exact SSA names —
     the SSA numbering is not stable across LLVM versions. Use
     `CHECK:`, `CHECK-NEXT:`, `CHECK-SAME:`, and variable bindings
@@ -109,21 +114,24 @@ The harness is responsible for:
     the message — "`pre-translation abort`", "`modulo-replication`",
     etc. — rather than pinning to the exact sentence, so future
     rewordings don't break the test.
-*   Prefer `not %raise_cli ... 2>&1 | FileCheck` over
-    `%raise_cli ... 2>&1 | FileCheck` when asserting an abort; this
+*   Prefer `%not %raise_cli ... 2>&1 | %FileCheck` over
+    `%raise_cli ... 2>&1 | %FileCheck` when asserting an abort; this
     catches regressions where the abort silently degrades into a
     warning.
 
 ## Adding a new test
 
-1.  Create `lit_tests/<name>/` with a `<name>.hip` fixture and a
-    `<name>.ll` lit test.
-2.  In `<name>.hip`, put an `// ARCH: gfx<arch>` comment on line 1 if
-    the fixture needs something other than `gfx942`.
-3.  In `<name>.ll`, use only the substitutions listed above.
-4.  Run the test locally with `ninja check-salmon-lit` (name TBD by
-    the harness) to confirm it passes.
-5.  Commit the `.hip`, the `.ll`, and (if applicable) an `AGENTS.md`
-    update if you're introducing a new audit protocol.
+1.  Create `lit_tests/<name>.s`.
+2.  Write the RUN block at the top using the template above (adjust
+    the `-mcpu=` arch and the `--emit-ir=` kernel name).
+3.  Add `CHECK:` / `CHECK-LABEL:` / `CHECK-NOT:` / `CHECK-DAG:` lines
+    pinning the invariant the test is guarding.
+4.  Paste the kernel body — `.amdgcn_target`, `.text`, `.globl`,
+    kernel code, `.rodata` with `.amdhsa_kernel`, and
+    `.amdgpu_metadata` — after the CHECK block.
+5.  Run `ctest -R transpiler-lit --output-on-failure` (or
+    `llvm-lit -sv lit_tests/<name>.s` for a single test) and confirm
+    it passes.
 
-Do not commit built `.co` files. They are derived artifacts.
+Do not commit built `.o`, `.hsaco`, or `Output/` artefacts. They are
+produced per-test by lit and live in the build tree.

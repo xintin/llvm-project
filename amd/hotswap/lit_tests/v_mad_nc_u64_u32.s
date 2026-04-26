@@ -1,0 +1,171 @@
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
+; RUN:     --emit-ir=v_mad_nc_u64_u32_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s
+;
+; Lift test for v_mad_nc_u64_u32. Unsigned sibling of
+; `v_mad_nc_i64_i32.ll` — differs only in the widening direction
+; (zext i32 → i64 rather than sext).  See that fixture for the full
+; handler / decoder cross-reference; the handler body lives in
+; transpiler/handle_valu.cpp under
+;   `if (sop == SemOp::V_MAD_NC_U64_U32) { ... }`.
+
+; CHECK-LABEL: define amdgpu_kernel void @v_mad_nc_u64_u32_kernel(
+
+; Two zero-widenings of the 32-bit factors (NOT sext — that would
+; mean we accidentally routed through the signed handler arm).
+; CHECK: zext i32 %{{[^ ]+}} to i64
+; CHECK: zext i32 %{{[^ ]+}} to i64
+
+; Widening multiply.
+; CHECK: mul {{.*}}i64 %{{[^,]+}}, %{{[^,]+}}
+
+; Canonical accumulator add with the unsigned sibling's breadcrumb
+; (`vmad_nc_u64`, mirroring `vmad_co64` from V_MAD_CO_U64_U32).
+; CHECK: %vmad_nc_u64 = add {{.*}}i64
+
+; Negative: no accidental routing through the signed arm.
+; CHECK-NOT: %vmad_nc_i64 = add {{.*}}i64
+
+; Negative: no with-overflow intrinsic CALL-site (same rationale as
+; the signed fixture — "nc" = no carry, so deliberately plain add).
+; The `call` keyword pins this to actual use-sites rather than
+; module-level `declare` lines the LLVM textual writer emits even
+; for unused intrinsics pulled in transitively by other passes.
+; CHECK-NOT: call {{.*}}@llvm.umul.with.overflow
+; CHECK-NOT: call {{.*}}@llvm.uadd.with.overflow
+
+; Negative: no saturating-add — this fixture's inline `asm volatile`
+; encodes `clamp = 0`, so the handler must take the plain `add i64`
+; fast-path.  The `clamp = 1` encoding is a raise-time refusal
+; today (see `handle_valu.cpp`'s V_MAD_NC_* block comment for the
+; `llvm.uadd.sat.i64` upgrade path when a corpus producer
+; surfaces); any appearance of the saturating intrinsic here
+; would mean the handler silently promoted without us noticing.
+; CHECK-NOT: call {{.*}}@llvm.uadd.sat.i64
+
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+	.amdhsa_code_object_version 6
+	.text
+	.globl	v_mad_nc_u64_u32_kernel
+	.p2align	8
+	.type	v_mad_nc_u64_u32_kernel,@function
+v_mad_nc_u64_u32_kernel:                ; @v_mad_nc_u64_u32_kernel
+; %bb.0:
+	s_load_b32 s2, s[0:1], 0x2c
+	s_bfe_u32 s3, ttmp6, 0x4000c
+	s_load_b256 s[4:11], s[0:1], 0x0
+	s_add_co_i32 s3, s3, 1
+	s_and_b32 s12, ttmp6, 15
+	s_wait_xcnt 0x0
+	s_mul_i32 s0, ttmp9, s3
+	s_getreg_b32 s1, hwreg(HW_REG_IB_STS2, 6, 4)
+	s_add_co_i32 s12, s12, s0
+	s_wait_kmcnt 0x0
+	s_and_b32 s0, s2, 0xffff
+	s_cmp_eq_u32 s1, 0
+	s_cselect_b32 s1, ttmp9, s12
+	s_delay_alu instid0(SALU_CYCLE_1)
+	v_mad_u32 v2, s1, s0, v0
+	s_clause 0x2
+	global_load_b32 v3, v2, s[6:7] scale_offset
+	global_load_b32 v4, v2, s[8:9] scale_offset
+	global_load_b64 v[0:1], v2, s[10:11] scale_offset
+	s_wait_loadcnt 0x0
+	;;#ASMSTART
+	v_mad_nc_u64_u32 v[0:1], v3, v4, v[0:1]
+	
+	;;#ASMEND
+	global_store_b64 v2, v[0:1], s[4:5] scale_offset
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel v_mad_nc_u64_u32_kernel
+		.amdhsa_kernarg_size 288
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_wavefront_size32 1
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_next_free_vgpr 5
+		.amdhsa_next_free_sgpr 13
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 2
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+	.text
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         36
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         44
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         46
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         48
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         50
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         72
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         96
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 288
+    .max_flat_workgroup_size: 1024
+    .name:           v_mad_nc_u64_u32_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     13
+    .symbol:         v_mad_nc_u64_u32_kernel.kd
+    .vgpr_count:     5
+    .wavefront_size: 32
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version: [1, 2]
+...
+
+	.end_amdgpu_metadata

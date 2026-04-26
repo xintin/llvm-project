@@ -1,0 +1,169 @@
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 \
+; RUN:     --emit-ir=global_store_short_d16_hi_kernel 2>/dev/null \
+; RUN:   | %FileCheck %s
+;
+; Lift test for the `global_store_short_d16_hi` /
+; `global_store_d16_hi_b16` half-register store.  Companion to
+; `ds_store_b16_d16_hi/ds_store_b16_d16_hi.ll` — same "upper 16
+; bits of the source VGPR" semantics, different address space
+; (addrspace(1) here, addrspace(3) for the DS sibling).
+;
+; INVARIANTS PINNED:
+;
+;   1. The lift surfaces the UPPER 16 bits of the source VGPR
+;      (bits [31:16]) via `lshr i32 %src, 16` followed by
+;      `trunc i32 ... to i16`.  The handler's value-name
+;      `d16hi_shift` is the canonical breadcrumb on the lshr.
+;
+;   2. The 16-bit value is stored to global memory
+;      (addrspace(1)).
+;
+;   3. The store is `i16`-wide (NOT i32).  A regression that
+;      collapsed the lift to a full-dword store would still
+;      compile but would clobber 16 bits of unrelated global
+;      state beyond the target half-word.
+;
+; NEGATIVE PINS:
+;
+;   * NO `trunc i32 %{{.*}} to i16` against the source VGPR
+;     without a preceding `lshr 16` — the pre-fix regression
+;     shape.  The positive pin below requires `lshr 16` to
+;     come first, and the negative pin below explicitly forbids
+;     the no-shift form against the raw source.
+;
+;   * NO `store i32` or `store i8` to addrspace(1) — width
+;     regressions.
+
+; CHECK-LABEL: define amdgpu_kernel void @global_store_short_d16_hi_kernel(
+
+; The defining lift pattern: lshr-16 then trunc-to-i16 with the
+; canonical breadcrumb value-names `d16hi_shift` on the lshr and
+; `d16hi_trunc` on the trunc (both set by the shared
+; `emitD16HiHalfTruncI16` helper in handle_flat.cpp, which both
+; `GLOBAL_STORE_SHORT_D16_HI` and `FLAT_STORE_SHORT_D16_HI` route
+; through).  Depending on them pins the helper's shape end-to-end.
+; CHECK-DAG: %d16hi_shift = lshr i32 %{{.+}}, 16
+; CHECK-DAG: %d16hi_trunc = trunc i32 %d16hi_shift to i16
+
+; The store is i16-wide and lands in addrspace(1) (global).
+; CHECK: store i16 %d16hi_trunc, ptr addrspace(1) %{{[^,]+}}
+
+; No full-dword or byte store to global for this instruction.
+; CHECK-NOT: store i32 %d16hi_trunc, ptr addrspace(1) %
+; CHECK-NOT: store i8 %d16hi_trunc, ptr addrspace(1) %
+
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+	.amdhsa_code_object_version 6
+	.text
+	.globl	global_store_short_d16_hi_kernel
+	.p2align	8
+	.type	global_store_short_d16_hi_kernel,@function
+global_store_short_d16_hi_kernel:       ; @global_store_short_d16_hi_kernel
+; %bb.0:
+	s_load_b32 s3, s[0:1], 0x1c
+	s_bfe_u32 s4, ttmp6, 0x4000c
+	s_and_b32 s5, ttmp6, 15
+	s_add_co_i32 s4, s4, 1
+	s_getreg_b32 s6, hwreg(HW_REG_IB_STS2, 6, 4)
+	s_mul_i32 s4, ttmp9, s4
+	s_wait_xcnt 0x0
+	s_load_b96 s[0:2], s[0:1], 0x0
+	s_add_co_i32 s5, s5, s4
+	s_wait_kmcnt 0x0
+	s_and_b32 s3, s3, 0xffff
+	s_cmp_eq_u32 s6, 0
+	s_cselect_b32 s4, ttmp9, s5
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(NEXT) | instid1(VALU_DEP_1)
+	v_mad_u32 v0, s4, s3, v0
+	v_dual_mov_b32 v2, s2 :: v_dual_ashrrev_i32 v1, 31, v0
+	s_delay_alu instid0(VALU_DEP_1)
+	v_lshl_add_u64 v[0:1], v[0:1], 1, s[0:1]
+	;;#ASMSTART
+	global_store_d16_hi_b16 v[0:1], v2, off
+	
+	;;#ASMEND
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel global_store_short_d16_hi_kernel
+		.amdhsa_kernarg_size 272
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_wavefront_size32 1
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_next_free_vgpr 3
+		.amdhsa_next_free_sgpr 7
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 1
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+	.text
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         8
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         16
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         20
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         24
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         28
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         30
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         32
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         34
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         36
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         38
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         56
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         64
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         72
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         80
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 272
+    .max_flat_workgroup_size: 1024
+    .name:           global_store_short_d16_hi_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     7
+    .symbol:         global_store_short_d16_hi_kernel.kd
+    .vgpr_count:     3
+    .wavefront_size: 32
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version: [1, 2]
+...
+
+	.end_amdgpu_metadata
