@@ -248,6 +248,153 @@ python3 runner.py --script ./gpt_oss_attention_operator.py --modes native,salmon
 default `/data/gpt-oss/src`) and compares it against `attention_ref` in
 the same module via `torch.testing.assert_close`.
 
+## GPT-OSS scope-discovery stage coverage
+
+`gpt_oss_scope_runner.py` is the lower-level operator coverage wrapper
+for the actual GPT-OSS Triton surface captured by
+`scope_discovery/capture/run_gpt_oss.py`: attention, `topk`,
+bitmatrix/compaction, MXFP down/upcast, `matmul_ogs`, SwiGLU, and
+reductions. It reports per-stage pass/fail and can emit JSON:
+
+```bash
+./.venv-rocm7/bin/python ./gpt_oss_scope_runner.py \
+  --json /tmp/gpt_oss_scope_native.json
+```
+
+To run the whole scope-discovery driver through the real Triton-JIT +
+Salmon path, launch it via this runner:
+
+```bash
+SCOPE_DISCOVERY_REPORT_DIR=/tmp/gpt_oss_scope_reports \
+python3 runner.py \
+  --script ./gpt_oss_scope_runner.py \
+  --modes native,salmon \
+  --timeout 300 \
+  --json /tmp/gpt_oss_scope_runner.json
+```
+
+Use the `gpt_oss_scope_runner.py` JSON for stage-level status and the runner JSON
+for native-vs-Salmon process verdicts. If a stage fails under Salmon,
+or if you want a fast smoke subset, set `GPT_OSS_SCOPE_STAGES` to a
+comma-separated list such as `topk,attention`. To rerun a single stage
+with dumps enabled:
+
+```bash
+SCOPE_DISCOVERY_REPORT_DIR=/tmp/gpt_oss_scope_reports \
+GPT_OSS_SCOPE_STAGES=attention \
+HSA_SALMON_DUMP_DIR=/tmp/gpt_oss_stage_dump \
+python3 runner.py \
+  --script ./gpt_oss_scope_runner.py \
+  --modes salmon \
+  --timeout 300
+```
+
+## SGLang GPT-OSS smoke
+
+`sglang_gpt_oss_smoke.py` is the top-of-stack acceptance smoke. It uses
+SGLang's offline engine to issue one deterministic GPT-OSS request; this
+is intentionally less diagnostic than the operator probes above, but it
+answers whether the serving stack can run through Salmon at all.
+
+```bash
+GPT_OSS_MODEL_PATH=/path/to/gpt-oss-model \
+python3 runner.py \
+  --script ./sglang_gpt_oss_smoke.py \
+  --modes native,salmon \
+  --timeout 900 \
+  --json /tmp/gpt_oss_sglang_runner.json
+```
+
+Useful environment knobs:
+
+- `GPT_OSS_MODEL_PATH` or `SGLANG_MODEL_PATH`: required model path.
+- `GPT_OSS_SGLANG_PROMPT`: prompt text; defaults to a one-word response.
+- `GPT_OSS_SGLANG_TP_SIZE`: tensor-parallel size; default `1`.
+- `GPT_OSS_SGLANG_DTYPE`: default `bfloat16`.
+- `GPT_OSS_SGLANG_ATTENTION_BACKEND`: default `triton` for AMD.
+- `GPT_OSS_SGLANG_SAMPLING_BACKEND`: default `pytorch` for AMD.
+- `GPT_OSS_SGLANG_MOE_RUNNER_BACKEND`: optional explicit MoE backend
+  such as `triton_kernel`.
+- `GPT_OSS_SGLANG_MAX_NEW_TOKENS`: default `8`.
+
+On shared machines, keep the storage boundary clear: large GPT-OSS model
+weights and Hugging Face cache entries belong under `/data/gpt-oss` (for
+example `/data/gpt-oss/hf-cache`) when they need to be present locally.
+Runner-generated reports, JSON, Triton caches, SGLang logs, and Salmon dump
+artifacts do not belong under `/data/gpt-oss`; put those under `/tmp` or an
+explicit scratch path.
+
+### GPT-OSS comparison harness
+
+`compare_gpt_oss_sglang.py` runs native SGLang and Salmon SGLang back to
+back, writes a detailed JSON report, and writes a concise Markdown summary.
+It is proof-gated: the Salmon side is not considered valid unless the
+structured proof log contains all of:
+
+- a `triton_forced_target` event from a spawned SGLang child process for
+  `gfx1250:32`;
+- a loader `transpile_decision` event from original `gfx1250` to target
+  `gfx942`;
+- at least one successful `salmon_result`;
+- zero failed `salmon_result` events.
+
+The proof log is JSONL at `<out-dir>/salmon_proof.jsonl`, emitted by
+`sitecustomize.py` for Python child-process target forcing and by the ROCR
+loader for Salmon transpile decisions/results. This is deliberately stronger
+than grepping stderr; a report can no longer pass merely because the
+intercept shim patched e_flags.
+
+Native-MXFP4 vs forced-gfx1250 Salmon-MXFP4 comparison:
+
+```bash
+GPT_OSS_SGLANG_RETURN_HIDDEN_STATES=0 \
+python3 compare_gpt_oss_sglang.py \
+  --native-mxfp4 \
+  --out-dir /tmp/gpt_oss_sglang_compare_mxfp4_native \
+  --timeout 900
+```
+
+Current real Salmon status: the proof gate reaches the loader-side Salmon
+path, then fails before generation on SGLang helper kernels:
+
+- with CUDA graph capture: `create_flashinfer_kv_indices_triton` fails on
+  `s_load_b32`;
+- with CUDA graph disabled: `write_req_to_token_pool_triton` fails on
+  `s_load_b64`.
+
+This is a valid GPT-OSS end-to-end finding, not a comparison pass.
+
+### External SGLang/AITER setup used for investigation
+
+The repo-owned runner code intentionally does not vendor SGLang, AITER, or
+model weights. The local investigation used:
+
+- SGLang venv: `./.venv-sglang-rocm720`
+- SGLang source overlay: `/home/mluecke/sglang-gpt-oss`
+- pinned AITER checkout: `/home/mluecke/aiter-sglang-v0.1.12.post1`
+- canonical MXFP4 model cache:
+  `/data/gpt-oss/hf-cache/models--openai--gpt-oss-20b`
+- BF16 comparison cache:
+  `/data/gpt-oss/hf-cache/models--lmsys--gpt-oss-20b-bf16`
+
+Local SGLang compatibility patches needed for this environment:
+
+- accept `mxfp4` when `TRITON_CORPUS_FORCE_TARGET=gfx1250:32`, because the
+  physical MI300X is `gfx942` but the source kernel target for Salmon is
+  gfx1250;
+- use robust GPT-OSS RoPE config access for checkpoints that expose
+  `rope_theta` / `rope_scaling` instead of `rope_parameters`;
+- adapt SGLang's `triton_kernel` MoE runner to the older
+  `/home/nithin/triton/python/triton_kernels` API (`matmul_ogs` dataclasses
+  instead of `triton_kernels.routing`, two-dimensional output buffers, and
+  `FnSpecs(..., reduction_n=2)`);
+- point AITER imports at the pinned checkout and redirect AITER's hardcoded
+  `/tmp/aiter_configs` merge directory through `AITER_CORPUS_CONFIG_DIR`.
+
+These external patches are not part of the ROCR commit. They should either
+be upstreamed to SGLang/AITER or replaced by pinned upstream versions before
+claiming the setup is portable.
+
 ## How the salmon hook actually engages
 
 For Triton-issued module loads to flow through the Salmon ELF

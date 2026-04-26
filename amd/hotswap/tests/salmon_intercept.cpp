@@ -123,7 +123,7 @@ static hipFuncGetAttribute_t g_real_hipFuncGetAttribute = nullptr;
 static hipFuncGetAttribute_t g_proc_hipFuncGetAttribute = nullptr;
 
 static rocr_salmon_patch_elf_t g_patch_elf = nullptr;
-static const char* g_target_isa = nullptr;
+static std::string g_target_isa;
 
 // Target wavefront width in threads, derived once at init() from
 // `g_target_isa` and cached here.  `0` means "unknown" (no refusal);
@@ -234,12 +234,13 @@ static void init() {
     std::abort();
   }
 
-  g_target_isa = std::getenv("HSA_HOTSWAP_ISA_OVERRIDE");
-  if (!g_target_isa || !g_target_isa[0]) {
+  const char* target_isa = std::getenv("HSA_HOTSWAP_ISA_OVERRIDE");
+  if (!target_isa || !target_isa[0]) {
     fprintf(stderr,
             "salmon_intercept: HSA_HOTSWAP_ISA_OVERRIDE not set — aborting\n");
     std::abort();
   }
+  g_target_isa = target_isa;
 
   // Derive the target wavefront width from `HSA_HOTSWAP_ISA_OVERRIDE`.
   // AMDGPU ISA convention: RDNA (gfx10xx+) subtargets default to
@@ -253,8 +254,9 @@ static void init() {
   // don't refuse a launch when we can't confidently derive the target
   // wave width).
   g_target_wave_size = 0;
-  if (std::strncmp(g_target_isa, "gfx", 3) == 0 && g_target_isa[3] != 0) {
-    const char* digits = g_target_isa + 3;
+  const char* target_cstr = g_target_isa.c_str();
+  if (std::strncmp(target_cstr, "gfx", 3) == 0 && target_cstr[3] != 0) {
+    const char* digits = target_cstr + 3;
     // Largest currently-modelled gfx numbering is gfx12xx — 4 digits.
     // Any future gfx13xx+ will land on this same wave32 branch; any
     // gfx9xx / gfx8xx / gfx7xx / gfx6xx number is <1000 and hits
@@ -321,7 +323,7 @@ static void init() {
   fprintf(stderr,
           "salmon_intercept: active, target=%s (wave_size=%u, "
           "ir_raiser=%s)%s\n",
-          g_target_isa, g_target_wave_size,
+          g_target_isa.c_str(), g_target_wave_size,
           g_ir_raiser_active ? "on" : "off",
           g_allow_partial_wave_launch
               ? ", partial-wave launches ALLOWED via "
@@ -373,7 +375,7 @@ static size_t elf_size(const void* data) {
 // as a "load success" would silently bypass the hotswap path and yield
 // meaningless runtime errors elsewhere.
 static uint8_t* patch_image(const void* image, size_t* out_size) {
-  if (!g_patch_elf || !g_target_isa || !is_elf(image)) {
+  if (!g_patch_elf || g_target_isa.empty() || !is_elf(image)) {
     return nullptr;
   }
   size_t sz = elf_size(image);
@@ -402,14 +404,14 @@ static uint8_t* patch_image(const void* image, size_t* out_size) {
     fprintf(stderr,
             "salmon_intercept: PatchElfIsa failed (rc=%d) for target=%s; "
             "aborting\n",
-            rc, g_target_isa);
+            rc, g_target_isa.c_str());
     std::free(buf);
     std::abort();
   }
   fprintf(stderr,
           "salmon_intercept: patched e_flags for %s (%zu bytes, "
           "orig_mach=0x%02x)\n",
-          g_target_isa, sz, orig_mach);
+          g_target_isa.c_str(), sz, orig_mach);
   *out_size = sz;
   return buf;
 }
@@ -659,7 +661,7 @@ extern "C" hipError_t hipModuleLaunchKernel(
               "provably cross-lane-free (pure per-lane VALU work).  "
               "Returning hipErrorInvalidConfiguration (=%d).\n",
               blockDimX, blockDimY, blockDimZ,
-              static_cast<unsigned long long>(block_threads), g_target_isa,
+              static_cast<unsigned long long>(block_threads), g_target_isa.c_str(),
               g_target_wave_size, g_target_wave_size,
               static_cast<unsigned long long>(block_threads),
               kHipErrorInvalidConfiguration);
