@@ -1188,4 +1188,117 @@ TEST_F(TdmGpu, SourceWaveLocalDescriptors) {
   (void)hipFree(d_desc1);
   EXPECT_EQ(mism, 0) << "source-wave-local TDM canary mismatches";
 }
+
+TEST_F(TdmGpu, SourceWaveDivergentFixture) {
+  if (!transpiler::tdmRuntimeAvailable())
+    GTEST_SKIP() << "TDM runtime bitcode not embedded "
+                    "(transpiler built without hipcc).";
+  if (!kGfx1250DataDir)
+    GTEST_SKIP() << "No GFX1250_TEST_DATA_DIR configured.";
+
+  std::string path = std::string(kGfx1250DataDir) +
+                     "/tdm_source_wave_load_gfx1250.hsaco";
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0)
+    GTEST_SKIP() << "missing fixture: " << path
+                 << " (regenerate via the recipe in "
+                    "test_data/gfx1250/tdm_source_wave_load_kernel.hip)";
+
+  auto bytes = transpiler::readFile(path);
+  ASSERT_FALSE(bytes.empty()) << "cannot read " << path;
+  auto r = transpiler::runPipeline(bytes, "gfx1250", "gfx942",
+                                   "tdm_source_wave_load_kernel");
+  ASSERT_TRUE(r.success)
+      << "raise failed for tdm_source_wave_load_kernel"
+      << " (mnemonic=" << r.failMnemonic << ")";
+  EXPECT_NE(r.irText.find("salmon_tdm_load_to_lds"), std::string::npos)
+      << "raised IR does not call salmon_tdm_load_to_lds";
+
+  constexpr uint32_t kHalf = 32;
+  constexpr uint32_t kTotal = 64;
+  uint32_t *d_in0 = nullptr;
+  uint32_t *d_in1 = nullptr;
+  uint32_t *d_out = nullptr;
+  TDMDescriptor *d_desc0 = nullptr;
+  TDMDescriptor *d_desc1 = nullptr;
+  HIP_ASSERT(hipMalloc(&d_in0, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_in1, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_out, kTotal * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_desc0, sizeof(TDMDescriptor)));
+  HIP_ASSERT(hipMalloc(&d_desc1, sizeof(TDMDescriptor)));
+
+  std::vector<uint32_t> host_in0(kHalf);
+  std::vector<uint32_t> host_in1(kHalf);
+  for (uint32_t i = 0; i < kHalf; ++i) {
+    host_in0[i] = 0x55000000u + i;
+    host_in1[i] = 0x66000000u + i;
+  }
+  HIP_ASSERT(hipMemcpy(d_in0, host_in0.data(), kHalf * sizeof(uint32_t),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemcpy(d_in1, host_in1.data(), kHalf * sizeof(uint32_t),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemset(d_out, 0xcd, kTotal * sizeof(uint32_t)));
+
+  const uint32_t tile[5] = {kHalf, 0, 0, 0, 0};
+  TDMDescriptor desc0 =
+      buildDescriptor((uint64_t)(uintptr_t)d_in0, /*rank=*/1, tile);
+  TDMDescriptor desc1 =
+      buildDescriptor((uint64_t)(uintptr_t)d_in1, /*rank=*/1, tile);
+  desc0.g0[1] = 0;
+  desc1.g0[1] = kHalf * sizeof(uint32_t);
+  HIP_ASSERT(hipMemcpy(d_desc0, &desc0, sizeof(desc0),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemcpy(d_desc1, &desc1, sizeof(desc1),
+                       hipMemcpyHostToDevice));
+
+  hipModule_t mod;
+  HIP_ASSERT(hipModuleLoadData(&mod, r.hsaco.data()));
+  hipFunction_t fn;
+  HIP_ASSERT(hipModuleGetFunction(&fn, mod, "tdm_source_wave_load_kernel"));
+
+  struct Args {
+    TDMDescriptor *desc0;
+    TDMDescriptor *desc1;
+    uint32_t *out;
+  } args{d_desc0, d_desc1, d_out};
+  size_t argSize = sizeof(args);
+  void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                    HIP_LAUNCH_PARAM_END};
+  HIP_ASSERT(hipModuleLaunchKernel(fn, 1, 1, 1, kTotal, 1, 1, 0,
+                                   nullptr, nullptr, config));
+  HIP_ASSERT(hipDeviceSynchronize());
+
+  std::vector<uint32_t> host_out(kTotal);
+  HIP_ASSERT(hipMemcpy(host_out.data(), d_out, kTotal * sizeof(uint32_t),
+                       hipMemcpyDeviceToHost));
+
+  int mism = 0;
+  for (uint32_t i = 0; i < kHalf; ++i) {
+    if (host_out[i] != host_in0[i]) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave fixture] lower mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                i, host_out[i], host_in0[i]);
+      ++mism;
+    }
+    if (host_out[kHalf + i] != host_in1[i]) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave fixture] upper mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                kHalf + i, host_out[kHalf + i], host_in1[i]);
+      ++mism;
+    }
+  }
+
+  (void)hipModuleUnload(mod);
+  (void)hipFree(d_in0);
+  (void)hipFree(d_in1);
+  (void)hipFree(d_out);
+  (void)hipFree(d_desc0);
+  (void)hipFree(d_desc1);
+  EXPECT_EQ(mism, 0) << "source-wave divergent TDM fixture mismatches";
+}
 #endif // __HIP_PLATFORM_AMD__
