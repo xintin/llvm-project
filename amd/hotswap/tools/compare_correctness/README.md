@@ -127,10 +127,11 @@ child, which is useful when you only need native gold plus Salmon.
 
 For Triton recipes, the native gfx942 output is the gold.  The harness
 caches those native outputs in `.baseline_cache/` (or
-`COMPARE_CORRECTNESS_BASELINE_CACHE_DIR`) keyed by recipe, shape, and the
-native code object's size/mtime, so repeated Salmon-focused runs do not
-have to relaunch the reference kernel.  Use `--refresh-baseline` when you
-want to force native to rerun and replace the cached output.
+`COMPARE_CORRECTNESS_BASELINE_CACHE_DIR`) keyed by recipe, shape, native
+code-object contents, sidecar contents, and deterministic input bytes, so
+repeated Salmon-focused runs do not have to relaunch the reference kernel.
+Cached output size is validated before use.  Use `--refresh-baseline`
+when you want to force native to rerun and replace the cached output.
 
 The parent sets `HSA_HOTSWAP_ISA_OVERRIDE=gfx942` and
 `HSA_HOTSWAP_RULES=/dev/null` if not already set; these are inherited by

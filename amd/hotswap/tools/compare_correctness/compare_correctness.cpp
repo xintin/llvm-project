@@ -187,6 +187,29 @@ std::string sanitizeForPath(const std::string &s) {
   return out;
 }
 
+uint64_t fnv1aUpdate(uint64_t h, const void *data, size_t n) {
+  const auto *p = static_cast<const unsigned char *>(data);
+  for (size_t i = 0; i < n; ++i) {
+    h ^= static_cast<uint64_t>(p[i]);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+uint64_t fnv1aUpdateString(uint64_t h, const std::string &s) {
+  return fnv1aUpdate(h, s.data(), s.size());
+}
+
+uint64_t fnv1aUpdateBytes(uint64_t h, const std::vector<uint8_t> &v) {
+  return fnv1aUpdate(h, v.data(), v.size());
+}
+
+std::string hex64(uint64_t x) {
+  char b[17];
+  std::snprintf(b, sizeof(b), "%016llx", static_cast<unsigned long long>(x));
+  return b;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Recipe type
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +251,11 @@ struct Recipe {
   // Size (in bytes) of one output element (for memcpy/allocation).
   int outputElemBytes;
 
+  // Exact output byte count for the flattened output blob.  Defaults to
+  // outputElems * outputElemBytes; Triton recipes with heterogeneous output
+  // dtypes override it.
+  std::function<size_t(int N, int blockSize)> outputBytes;
+
   // CPU reference: inputs + (N, blockSize) → expected output bytes of
   // size outputElems(N, blockSize) * outputElemBytes.  Must be set when
   // goldSource == CpuReference; ignored (may be empty) when goldSource ==
@@ -266,16 +294,34 @@ struct Recipe {
   std::function<std::optional<std::string>(int N, int blockSize)> validate;
 };
 
-std::string baselineCachePath(const Recipe &r, int N, int blockSize) {
-  struct stat st;
+size_t expectedOutputBytes(const Recipe &r, int N, int blockSize) {
+  if (r.outputBytes) return r.outputBytes(N, blockSize);
+  return static_cast<size_t>(r.outputElems(N, blockSize)) *
+         static_cast<size_t>(r.outputElemBytes);
+}
+
+std::string baselineCachePath(const Recipe &r, int N, int blockSize,
+                              const std::vector<uint8_t> &input) {
+  constexpr const char *kCacheVersion = "compare_correctness_baseline_v2";
+  uint64_t h = 1469598103934665603ull;
+  h = fnv1aUpdateString(h, kCacheVersion);
+  h = fnv1aUpdateString(h, r.name);
+  h = fnv1aUpdate(h, &N, sizeof(N));
+  h = fnv1aUpdate(h, &blockSize, sizeof(blockSize));
+
   std::string nativeCo = coPathFor(r.name, "gfx942");
-  if (stat(nativeCo.c_str(), &st) != 0)
-    die("stat %s failed: %s", nativeCo.c_str(), std::strerror(errno));
+  h = fnv1aUpdateBytes(h, readFile(nativeCo));
+
+  std::string sidecar = kernelDir() + "/" + r.name + ".sidecar.json";
+  if (auto sidecarBytes = tryReadFile(sidecar))
+    h = fnv1aUpdateBytes(h, *sidecarBytes);
+
+  h = fnv1aUpdateBytes(h, input);
+
   char buf[512];
-  std::snprintf(buf, sizeof(buf), "%s_N%d_B%d_size%lld_mtime%lld.bin",
+  std::snprintf(buf, sizeof(buf), "%s_N%d_B%d_%s.bin",
                 sanitizeForPath(r.name).c_str(), N, blockSize,
-                static_cast<long long>(st.st_size),
-                static_cast<long long>(st.st_mtime));
+                hex64(h).c_str());
   return baselineCacheDir() + "/" + buf;
 }
 
@@ -5256,6 +5302,10 @@ Recipe tritonToRecipe(const TritonRecipe &t) {
     return static_cast<int>(tritonOutputBytes(*tp, v) /
                             dtypeBytes(tp->outputs.front().dtype));
   };
+  r.outputBytes = [tp](int N, int) -> size_t {
+    int v = tp->defaultShapeValues.at(static_cast<size_t>(N));
+    return tritonOutputBytes(*tp, v);
+  };
   r.makeInput = [tp](int N) {
     int v = tp->defaultShapeValues.at(static_cast<size_t>(N));
     return tritonMakeInput(*tp, v);
@@ -5683,9 +5733,15 @@ RunResult runOne(const std::string &exe, const Recipe &r, int N, int blockSize,
     // itself (by definition it matches itself).  If native didn't produce
     // output we can't judge legacy/salmon, so we flag the row as
     // gold-missing and skip their spawns.
-    std::string cachePath = baselineCachePath(r, N, blockSize);
+    std::string cachePath = baselineCachePath(r, N, blockSize, input);
     if (!refreshBaseline) {
       if (auto cached = tryReadFile(cachePath)) {
+        size_t want = expectedOutputBytes(r, N, blockSize);
+        if (cached->size() != want) {
+          die("baseline cache %s has %zu bytes, expected %zu. "
+              "Delete it or rerun with --refresh-baseline.",
+              cachePath.c_str(), cached->size(), want);
+        }
         rr.native.output = std::move(*cached);
         rr.native.baselineCached = true;
         rr.native.mismatches = 0;
