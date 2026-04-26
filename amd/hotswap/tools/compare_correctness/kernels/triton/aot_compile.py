@@ -298,6 +298,34 @@ def validate_recipe(recipe: dict, path: str) -> None:
         raise RuntimeError(f"{path}: at least one output is required")
 
 
+def _emit_input_entry(b: dict) -> dict:
+    """Emit a sidecar input record, validating the optional `init` field.
+
+    Input `init` is only "zero" today: a deterministic hipMemset-to-0
+    override of the default full-bit-range RNG fill.  Used by
+    bitmatrix_metadata_stage2 (NonzeroIndx) where full-range random
+    bytes would make the kernel compute out-of-bounds store
+    addresses on BOTH native and salmon — the HIP-700 would be a
+    harness-input issue masquerading as a kernel bug.  Any other
+    value is rejected loudly at AOT time so a typo doesn't sneak
+    through into a silently wrong-init probe.
+    """
+    VALID_INPUT_INIT_MODES = ("zero",)
+    out = {"name": b["name"], "dtype": b["dtype"], "elems": str(b["elems"])}
+    if "init" in b:
+        if b["init"] not in VALID_INPUT_INIT_MODES:
+            raise RuntimeError(
+                f"input {b['name']!r} has init={b['init']!r}; "
+                f"must be one of {VALID_INPUT_INIT_MODES}"
+            )
+        out["init"] = b["init"]
+    if "range_lo" in b:
+        out["range_lo"] = float(b["range_lo"])
+    if "range_hi" in b:
+        out["range_hi"] = float(b["range_hi"])
+    return out
+
+
 def _emit_output_entry(b: dict) -> dict:
     """Emit a sidecar output record, validating the optional `init` field.
 
@@ -380,7 +408,14 @@ def build_recipe(recipe: dict, out_dir: str, kernel_file: str) -> None:
         },
         "grid": {k: str(v) for k, v in recipe["grid"].items()},
         "inputs": [
-            {"name": b["name"], "dtype": b["dtype"], "elems": str(b["elems"])}
+            # Passes through optional `init` (only "zero" recognised
+            # so far) so recipes that need a bounded / specific input
+            # distribution can force a deterministic zero-fill instead
+            # of the default full-bit-range RNG.  Used by kernels that
+            # index via the input (e.g. `ColSortedIndx + load(NonzeroIndx)`)
+            # where full-range input bits would produce out-of-bounds
+            # stores on BOTH native and salmon runs.
+            _emit_input_entry(b)
             for b in recipe["inputs"]
         ],
         "outputs": [
@@ -392,6 +427,17 @@ def build_recipe(recipe: dict, out_dir: str, kernel_file: str) -> None:
         },
         "metadata": metadata,
     }
+    # Optional: pass through recipe-declared harness_constants and
+    # scalar_args. The C++ harness reads these out of the sidecar and
+    # uses them to evaluate `elems` / `grid` / `scalar_args`
+    # expressions against a scope that is the union of
+    # (constexprs, harness_constants, shape_dim).
+    if "harness_constants" in recipe:
+        sidecar["harness_constants"] = dict(recipe["harness_constants"])
+    if "scalar_args" in recipe:
+        sidecar["scalar_args"] = {
+            k: str(v) for k, v in recipe["scalar_args"].items()
+        }
     sidecar_path = os.path.join(out_dir, f"{name}.sidecar.json")
     with open(sidecar_path, "w") as f:
         json.dump(sidecar, f, indent=2)

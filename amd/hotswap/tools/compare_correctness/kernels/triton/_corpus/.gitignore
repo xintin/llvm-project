@@ -1,0 +1,7 @@
+# Cached upstream files and extracted @jit kernels.  Both are produced
+# by pull.py from the (committed) MANIFEST + sha256 pins, so reproducing
+# them on a fresh clone is one command.  Checking them in would create
+# accidental drift between the pinned hashes and the on-disk bytes.
+upstream/
+extracted/
+INDEX.json

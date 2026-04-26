@@ -283,18 +283,19 @@ Committed canaries (confirmed-emitted instruction counts from
 
 | recipe                              | C-class       | instruction forced on gfx1250 | `§5.3` item | covers |
 |-------------------------------------|---------------|-------------------------------|-------------|--------|
-| `canary_bpermute_scan_fp32`         | C2-bpermute   | `ds_bpermute_b32` × 20        | P1 (landed at `d9bfd99626`) | `_masked_compaction`, `_bitmatrix_metadata_compute_{stage1,stage2}`, 53 of 147 hipBLASLt GEMMs — WRONG under salmon, but NOT from a missing P1 lift; see finding #1 below |
+| `canary_bpermute_scan_fp32`         | C2-bpermute   | `ds_bpermute_b32` × 20        | P1 (landed at `d9bfd99626`) | `_masked_compaction`, `_bitmatrix_metadata_compute_{stage1,stage2}`, 53 of 147 hipBLASLt GEMMs — historically WRONG under MODREP, now match by default / loud-refuse under forced MODREP; see finding #1 below |
 | `canary_dpp_reduce_fp32`            | C2-DPP        | `v_mov_b32_dpp` × 4           | P5          | all five GPT-OSS DPP-using kernels emit `v_mov_b32_dpp` as their dominant DPP opcode |
 | `canary_dpp_compound_add_fp32`      | C2-DPP        | `v_add_f32_dpp` × 4 + `v_permlanex16_b32` × 1 | P5   | `_bitmatrix_metadata_compute_stage1`'s `v_add_nc_u32_dpp` pattern (the second of the two DPP handler paths) |
 | `canary_permlanex16_rowmax_fp32`    | — (see note)  | `v_permlanex16_b32` × 1 + `v_dual_max_num_f32` × 2 | — | see attribution update in verdict table: the failure is `v_dual_max_num_f32`, not `permlanex16` |
 
 Current salmon verdicts (gfx942 host, gfx1250 build through the
-salmon IR raiser, four-shape sweep each — snapshot, rerun from the
-Makefile directory for a fresh picture):
+salmon IR raiser, four-shape sweep each — updated to the latest
+checked-in WaveNative-default evidence; rerun from the Makefile
+directory for a fresh picture):
 
 | recipe                              | native   | legacy                   | salmon                          |
 |-------------------------------------|----------|--------------------------|---------------------------------|
-| `canary_bpermute_scan_fp32`         | 4 / 4    | 4 / 4 crash (MCContext UNREACHABLE, same signature as every `triton_corpus_runner` legacy failure) | **4 / 4 refused** (loud `cross-wave-predicate-chain` + `WorkitemIdPredicateChain (Class 5)` diagnostic from the narrow-O1 classifier in `transpiler/c5_predicate_chain_classifier.{hpp,cpp}` — landed 2026-04-21 per `hotswap/docs/modrep-predicate-chain.md §5 O1`). Pre-landing was **4 / 4 WRONG** (max\|err\| 4.2 → 21.9, growing roughly as `sqrt(N/BLOCK_SIZE)`). The classifier catches the Kogge-Stone scan-stage guards (`icmp ult i32 K, tid` with K ∈ {1, 3, 7, 15}, all ≤ W_s-1); see finding #1 below for the full attribution chain. |
+| `canary_bpermute_scan_fp32`         | 4 / 4    | 4 / 4 crash (MCContext UNREACHABLE, same signature as every `triton_corpus_runner` legacy failure) | **4 / 4 match** under default WaveNative; **4 / 4 refused** under `--disable-wave-native` (MODREP + narrow-O1 `CrossWavePredicateChain`). Pre-landing was **4 / 4 WRONG**. |
 | `canary_dpp_reduce_fp32`            | 4 / 4    | 4 / 4 crash (same MCContext UNREACHABLE)                    | **4 / 4 match** |
 | `canary_dpp_compound_add_fp32`      | 4 / 4    | 4 / 4 crash (same MCContext UNREACHABLE)                    | **4 / 4 match** |
 | `canary_permlanex16_rowmax_fp32`    | 4 / 4    | 4 / 4 crash (same MCContext UNREACHABLE)                    | **4 / 4 match** (was CRASH until `handle_vopd.cpp` gained a `ttmp<N>` source branch; see `lit_tests/vopd_extra_subops` for the regression guard) |
@@ -321,26 +322,22 @@ Three findings the canary set forced into the open:
      its `if (tid >= n) return;` bounds check (a C4 obstruction),
      not because of bpermute.  Graduated from "silent miscompile"
      to "principled refusal" per the §8 fail-loudly contract.
-   - `canary_bpermute_scan_fp32` raises cleanly and emits 20×
-     `ds_bpermute_b32` (one per per-lane-element × per-scan-stage)
-     on the gfx942 output HSACO.  Yet the numerical output differs
-     from the Triton-native-compiled gfx942 gold with `max|err|`
-     in the range 4.2 → 21.9, climbing with N.
+   - Historically, `canary_bpermute_scan_fp32` raised cleanly,
+     emitted 20× `ds_bpermute_b32`, and still produced wrong output
+     under MODREP. Current default WaveNative evidence now matches
+     4/4; the same kernel is loud-refused only when forcing MODREP.
 
-   The residual miscompile is therefore not in the P1 lift but
-   somewhere else — specifically in the **interaction between
-   Triton's kernel-emitted predicate chains and modulo-replication
-   on cross-widened wave64**.  Triton's gfx1250 cumsum lowering
-   uses scan predicates computed on `workitem.id.x()` (`tid`)
-   rather than the source-wave `mbcnt` lane id; under cross-
-   widening the target's `tid` ranges `[0, W_t)` rather than
-   `[0, W_s)`, so replica lanes evaluate the scan-stage guards
-   on a larger set than the source kernel was written for.  Full
-   diagnosis, evidence table, and four fix options in
+   The historical MODREP miscompile was therefore not in the P1 lift
+   but in the **interaction between Triton's kernel-emitted predicate
+   chains and modulo-replication on cross-widened wave64**. Triton's
+   gfx1250 cumsum lowering uses scan predicates computed on
+   `workitem.id.x()` (`tid`) rather than the source-wave `mbcnt` lane
+   id; under MODREP, replica lanes evaluate the scan-stage guards on a
+   larger set than the source kernel was written for. Full diagnosis,
+   evidence table, and fix options are in
    [`hotswap/docs/modrep-predicate-chain.md`](../../../../../docs/modrep-predicate-chain.md)
-   — the class also covers the `rmsnorm_fp32` / `swiglu_fp32` /
-   `corpus_layernorm_fp32` sentinel-leak failures (finding #4
-   below).
+   — the current default WaveNative evidence has those examples
+   matching rather than silently wrong.
 
 2. **`§7.3`'s "P5 is the largest risk" is narrower than stated.**
    Both `v_mov_b32_dpp` and the compound `v_add_f32_dpp` path pass
@@ -402,11 +399,11 @@ Three findings the canary set forced into the open:
      `minnum(7.0, maxnum(-7.0, x))` for `tl.clamp(x, -7.0, 7.0)`),
      so the "num" handler is semantically correct.
 
-   The silent miscompiles therefore live **in the IR semantics, not
-   in opcode coverage**.  The four salmon-WRONG Triton recipes
+   Historical conclusion from the MODREP-era failures: the silent
+   miscompiles lived **in the IR semantics, not in opcode coverage**.
+   At that point, the four salmon-WRONG Triton recipes
    (`canary_bpermute_scan_fp32`, `rmsnorm_fp32`, `swiglu_fp32`,
-   `corpus_layernorm_fp32`) have been narrowed to a single shared
-   class:
+   `corpus_layernorm_fp32`) were narrowed to a single shared class:
 
    > **Kernel-emitted predicate chains that read
    > `llvm.amdgcn.workitem.id.x()` without an AND-mask by
@@ -426,35 +423,23 @@ Three findings the canary set forced into the open:
    for the per-class falsification), passes G1, and needed a new
    design surface.
 
-   **Status update (2026-04-21).** `modrep-predicate-chain.md §5 O1`
-   has landed as a narrow classifier — the first principled outcome
-   from that doc's four-option table. The "four salmon-WRONG
-   Triton recipes" framing above no longer matches reality:
+   **Status update.** `modrep-predicate-chain.md §5 O1` landed as a
+   narrow MODREP classifier, and WaveNative is now the default
+   wave32→wave64 projection. The old "four salmon-WRONG Triton
+   recipes" framing no longer matches reality:
 
-   - `canary_bpermute_scan_fp32`: silent-WRONG → **loud-refused**
-     under the new `CrossWavePredicateChain` / C5 diagnostic. Its
-     Kogge-Stone scan-stage guards match the narrow-O1 signature
-     (compile-time K ∈ {1, 3, 7, 15}, all ≤ W_s-1). One
-     silent-miscompile → principled refusal.
-   - `rmsnorm_fp32`: now **4 / 4 match** (orthogonal commit — most
-     likely `v_div_scale_f32` / `v_rsq_f32` handler tightening —
-     fixed it between the original evidence collection and the
-     narrow-O1 landing; unrelated to the C5 classifier).
-   - `swiglu_fp32`, `corpus_layernorm_fp32`: stay **4 / 4 WRONG**.
-     Their bug class is NOT predicate-chain (their icmps compare
-     `tid` against a dynamic kernarg, not a compile-time constant;
-     structurally identical to the passing `vecadd_f16` shape).
-     Tracked in `modrep-predicate-chain.md §4.3 / §6.4` as
-     orthogonal classes pending a single-element mechanism trace.
+   - `canary_bpermute_scan_fp32`: **4 / 4 match** by default;
+     **loud-refused** when MODREP is forced. Its Kogge-Stone
+     scan-stage guards match the narrow-O1 signature (compile-time
+     K ∈ {1, 3, 7, 15}, all ≤ W_s-1).
+   - `rmsnorm_fp32`, `swiglu_fp32`, `corpus_layernorm_fp32`: **4 / 4
+     match** in the current WaveNative evidence.
 
-   The post-landing compare_correctness sweep confirms the narrow-
-   O1 classifier refuses exactly `canary_bpermute_scan_fp32`,
-   leaves every currently-passing baseline green
-   (`canary_dpp_compound_add_fp32`, `rope_fp32`, `vecadd_f16`,
-   `corpus_add_fp32`, `corpus_asin_fp32`, `canary_dpp_reduce_fp32`,
-   `canary_permlanex16_rowmax_fp32`), and does not affect the
-   recipes whose miscompile is outside its scope. Net: +1
-   principled refusal, 0 regressions.
+   Current interpretation: the narrow-O1 classifier is the MODREP
+   fail-loud gate; default WaveNative makes the named examples match.
+   Keep the classifier as regression protection for explicit MODREP
+   runs, but do not read this as an active four-recipe silent-miscompile
+   class.
 
    §5 O2 (mask rewrite) from the design doc is explicitly deferred
    — IR inspection (`modrep-predicate-chain.md §5 O1 narrowing`)
@@ -463,27 +448,22 @@ Three findings the canary set forced into the open:
    if a single-element mechanism trace produces a principled
    rewrite shape.
 
-   Other non-matching recipes that are NOT in this class:
+   Other recipes that were non-matching in the same historical
+   snapshot and are NOT in this class:
 
    | site                                | verdict | attribution |
    |-------------------------------------|---------|-------------|
    | `canary_permlanex16_rowmax_fp32`    | ~~CRASH~~ match | **fixed** — `handle_vopd.cpp` now recognises `ttmp<N>` and `vcc_lo` sources in the VOPD sub-op parser (previously `v_dual_mov_b32 v0, ttmp9 :: v_dual_mov_b32 v1, s0` failed decomposition because `ttmp9` didn't match any parse branch).  Regression guard in `lit_tests/vopd_extra_subops` pins both new source shapes. |
-   | `corpus_softmax_fp32`               | CRASH   | originally framed as "same MODREP-predicate-chain class as the four WRONG recipes", but *already* refused loudly via the §5.6.3 writelane/readlane safety net (graduated to default-on in `transpiler: graduate writelane/readlane cross-lane rewrite to default-on`). The narrow-O1 classifier that landed does NOT additionally match softmax (its kernel-level icmps compare `tid` against dynamic kernargs, not compile-time K ≤ W_s-1); the refusal attribution therefore stays on the existing writelane-safety-net diagnostic, not the new C5 path. |
-   | `matmul_fp16*`                      | WRONG   | WMMA accumulator lowering — issue #3; distinct bug from the MODREP-predicate-chain class. |
+   | `corpus_softmax_fp32`               | historical CRASH / later loud-fail or wrong-output variants | originally framed as "same MODREP-predicate-chain class as the four WRONG recipes", but *already* refused loudly via the §5.6.3 writelane/readlane safety net in one later path. The narrow-O1 classifier does NOT additionally match softmax (its kernel-level icmps compare `tid` against dynamic kernargs, not compile-time K ≤ W_s-1). Rerun before quoting a single current status. |
+   | `matmul_fp16*`                      | ~~WRONG~~ match | historical WMMA accumulator lowering issue; fixed by the later WMMA / permlane semantic work in `docs/matrix-translation.md`. |
 
-5. **WMMA lowering is broken — distinct from the "num" opcode gap.**
+5. **Historical WMMA lowering failure — fixed later.**
    Both `matmul_fp16` (`BM=BN=BK=32`) and `matmul_fp16_16x16`
-   (`BM=BN=BK=16`) produce the same WRONG output signature under
-   salmon: the accumulator is pinned to a per-shape constant (e.g.
-   `actual = −0.022049` at M=128+ in both recipes) instead of
-   accumulating across K iterations.  The two recipes emit *different*
-   C2-hard cross-lane primitives (permlane16_swap vs ds_swizzle)
-   for the WMMA-fragment shuffle, yet exhibit identical failure
-   shape, which points at the WMMA → MFMA translation in
-   `wmma_lowering.cpp` itself rather than at either cross-lane
-   primitive.  This is **Issue #3 (WMMA translation completeness)**
-   from the project tracker, now with a Triton-side repro pair that
-   isolates WMMA from the shuffle operands.  Fix scope: the MFMA
+   (`BM=BN=BK=16`) used to produce the same WRONG output signature
+   under salmon: the accumulator was pinned to a per-shape constant
+   instead of accumulating across K iterations. Later WMMA / permlane
+   work fixed both recipes to 5/5 match. The notes below remain useful
+   as the pre-fix diagnosis trail. Fix scope at the time was the MFMA
    destination layout when reading back from the accumulator
    fragment, most likely the specific
    `v_wmma_f32_16x16x32_f16 → v_mfma_f32_16x16x16_f16`
@@ -511,19 +491,19 @@ Deliberately **not** a canary today:
 - **C2 `permlane16_swap`** — now covered by `matmul_fp16` (see
   GPT-OSS primitives section below), which emits
   `v_permlane16_swap_b32 × 8` at `BM = BN = BK = 32` / num_warps=1 /
-  num_stages=1.  Still WRONG under salmon, but the attribution is
-  now cleanly separated: the matmul WMMA accumulator is what's
-  broken (finding #5 below), not the `permlane*` lift path — which
-  the passing `canary_dpp_compound_add_fp32` (emits
+  num_stages=1. It now matches under salmon after the WMMA /
+  permlane semantic fixes; historically, its WRONG result was
+  attributed to the matmul WMMA accumulator rather than the
+  `permlane*` lift path — which the passing `canary_dpp_compound_add_fp32` (emits
   `v_permlanex16_b32 × 1`) already demonstrates is handled.
 - **C2 `permlane64` / `permlane32_swap`** — zero uses across the
   entire 170-kernel corpus (`gpt-oss-derisking.md §§4, 7.2`).  Not a
   canary because there is no class-reach to canary against.
 - **C2 `ds_swizzle_b32`** — now covered by `matmul_fp16_16x16`,
   which emits `ds_swizzle_b32 × 2` at `BM = BN = BK = 16` /
-  num_warps=1 / num_stages=1.  Same salmon verdict (WRONG) and
-  same signature as `matmul_fp16`, attribution-wise pointing at the
-  WMMA itself rather than the shuffle primitive (finding #5 below).
+  num_warps=1 / num_stages=1. It now matches under salmon; the older
+  WRONG signature matched `matmul_fp16` and pointed at WMMA itself
+  rather than the shuffle primitive.
 - **gfx11+ dual-issue VOP3 decode gaps** (e.g.
   `v_dual_max_num_f32`, surfaced by `canary_permlanex16_rowmax_fp32`
   above) — **not** one of the `§1` obstruction classes (it's an ISA
@@ -580,10 +560,10 @@ and current salmon verdicts — rerun the Makefile from
 | recipe                    | primitive                                           | key gfx1250 cross-lane / WMMA / "num" opcodes                                                        | native | legacy               | salmon                                                                                                                      |
 |---------------------------|-----------------------------------------------------|-------------------------------------------------------------------------------------------------------|--------|----------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | `rmsnorm_fp32`            | RMSNorm                                             | `v_add_f32_dpp × 4`, `v_permlanex16 × 1`, `v_sqrt_f32 × 1`, `v_min_num_f64 × 7`                      | 4 / 4  | 4 / 4 crash (legacy) | **4 / 4 match** (fixed by an orthogonal commit between finding #4's original framing and the 2026-04-21 narrow-O1 landing; the `actual / ref ≈ 0.55` signature no longer reproduces. See modrep-predicate-chain.md §5 / §6 for the current status.) |
-| `swiglu_fp32`             | SwiGLU (α=1.702, limit=7.0)                         | `v_exp_f32 × 8`, `v_rcp_f32 × 8`, `v_fma_f32 × 15`, `v_dual_max_num_f32 × 8`, `v_med3_num_f32 × 8`    | 4 / 4  | 4 / 4 crash (legacy) | **4 / 4 WRONG** (`max\|err\| ≈ 56 ≈ limit × 8`) — see finding #4 below                                                      |
+| `swiglu_fp32`             | SwiGLU (α=1.702, limit=7.0)                         | `v_exp_f32 × 8`, `v_rcp_f32 × 8`, `v_fma_f32 × 15`, `v_dual_max_num_f32 × 8`, `v_med3_num_f32 × 8`    | 4 / 4  | 4 / 4 crash (legacy) | **4 / 4 match** in the current WaveNative evidence; older WRONG rows are historical finding #4 context |
 | `rope_fp32`               | RoPE (half-rotation, precomputed cos/sin)           | purely elementwise (fma / mul / strided load)                                                          | 4 / 4  | 4 / 4 crash (legacy) | **4 / 4 match**                                                                                                             |
-| `matmul_fp16`             | fp16 × fp16 → fp16 GEMM (fp32 acc), 32×32×32 tiles   | `v_wmma × 4`, `v_permlane16_swap_b32 × 8`                                                              | 5 / 5  | 5 / 5 crash (legacy, "8 unsupported") | **5 / 5 WRONG** (accumulator pinned to a per-shape constant — consistent with broken WMMA → MFMA translation) — see finding #5 below |
-| `matmul_fp16_16x16`       | fp16 × fp16 → fp16 GEMM (fp32 acc), 16×16×16 tiles   | `v_wmma × 1`, `ds_swizzle_b32 × 2`                                                                     | 5 / 5  | 5 / 5 crash (legacy) | **5 / 5 WRONG** (same signature as matmul_fp16 — `actual = −0.022049` constant)                                             |
+| `matmul_fp16`             | fp16 × fp16 → fp16 GEMM (fp32 acc), 32×32×32 tiles   | `v_wmma × 4`, `v_permlane16_swap_b32 × 8`                                                              | 5 / 5  | 5 / 5 crash (legacy, "8 unsupported") | **5 / 5 match** after the Session 8 WMMA / permlane semantic fix; see `docs/matrix-translation.md` |
+| `matmul_fp16_16x16`       | fp16 × fp16 → fp16 GEMM (fp32 acc), 16×16×16 tiles   | `v_wmma × 1`, `ds_swizzle_b32 × 2`                                                                     | 5 / 5  | 5 / 5 crash (legacy) | **5 / 5 match** |
 
 Triage value of the mixed-verdict set:
 
@@ -591,29 +571,19 @@ Triage value of the mixed-verdict set:
   strided-load lowering is clean end-to-end.  Anything that fails
   on an elementwise-math-only kernel would be a broader regression
   this recipe surfaces.
-- `rmsnorm_fp32` and `swiglu_fp32` failing was predicted by
-  `gpt-oss-derisking.md §9.2`'s P5-class concern.  Disassembly
-  narrows the blocker to the gfx11+ `v_*_num_*` opcode family
-  (finding #4 below), not to wave-size translation per se.
-- `matmul_fp16*` failing re-opens **Issue #3 (WMMA translation
-  completeness)** from the project tracker — the current
-  `wmma_lowering.cpp` path handles `v_wmma_f32_16x16x32_f16` at a
-  structural level, but both of our square-GEMM configs produce a
-  constant accumulator under salmon, with the same `−0.022049`
-  signature regardless of tile size.  The `ds_swizzle` vs
-  `permlane16_swap` delta between the two matmul recipes cleanly
-  separates the two C2-hard primitives: neither is a crash, both
-  produce the same wrong-output shape, which points at the WMMA
-  lowering itself as the unified fix target (not the cross-lane
-  shuffle each emits).
+- `rmsnorm_fp32` and `swiglu_fp32` are now green in the current
+  WaveNative evidence; the older failing analysis below is retained as
+  historical context for the P5 / `v_*_num_*` investigation.
+- `matmul_fp16*` are now green after the WMMA / permlane semantic work
+  documented in `docs/matrix-translation.md`; the older Issue #3
+  discussion below is retained as the pre-fix investigation trail.
 
 For the two existing corpus reduction recipes (in the next section),
-the same pattern holds: `corpus_softmax_fp32` and
-`corpus_layernorm_fp32` both emit the `permlanex16 + DPP` pair
-(same as the passing `canary_dpp_compound_add_fp32`) yet fail under
-salmon — consistent with the `v_*_num_*` gap (softmax via
-`v_exp_f32`'s canonicalisation; layernorm via the rsqrt path, same
-site as rmsnorm) rather than any cross-lane primitive.
+the old "shared `v_*_num_*` gap" story is now obsolete for layernorm:
+`corpus_layernorm_fp32` matches in the current WaveNative evidence.
+`corpus_softmax_fp32` remains a separate failing path and should be
+read through the current `modrep-predicate-chain.md` / `xfail.cmake`
+notes rather than this older reduction-pair attribution.
 
 Currently missing from this section (Tier-1 roadmap):
 
@@ -735,26 +705,26 @@ The `salmon` column distinguishes:
 - `NOT_BUILT` / `NOT_WIRED` / `SKIPPED` — administrative states (no
   sidecar yet, no shim recipe yet, or `--run` was not passed).
 
-### Current corpus status
+### Historical corpus status
 
-This is the snapshot from `python3 status.py --run` on gfx942 with
-the in-tree salmon at the time of writing.  Run the script yourself
-for an up-to-date view; the table is committed only as a starting
-point and will rot quickly as salmon gains lowerings.
+This is an older snapshot from `python3 status.py --run` on gfx942 with
+the in-tree salmon at the time of writing. It is kept as a wiring
+record, not as the current Salmon result table. For current results,
+prefer the dated `compare_correctness` reports plus
+`hotswap/docs/learnings.md`, then rerun the script yourself for a fresh
+view.
 
 | entry                                | function                | wrapper                 | salmon       | one-liner                                                                 |
 |--------------------------------------|-------------------------|-------------------------|--------------|---------------------------------------------------------------------------|
 | triton-tutorial-01-vector-add        | `add_kernel`            | `corpus_add_fp32`       | `ALL_MATCH`  | elementwise fp32 add — clean baseline                                     |
-| triton-tutorial-02-fused-softmax     | `softmax_kernel`        | `corpus_softmax_fp32`   | `CRASH`      | row-wise softmax with masking; salmon segfaults inside the reduction      |
-| triton-tutorial-05-layer-norm        | `_layer_norm_fwd_fused` | `corpus_layernorm_fp32` | `CRASH`      | salmon hangs (harness `SIGKILL` after `COMPARE_CORRECTNESS_CHILD_TIMEOUT_S`) |
-| triton-tutorial-07-extern-functions  | `asin_kernel`           | `corpus_asin_fp32`      | `CRASH`      | salmon trips on `v_bfi_b32` from libdevice asin (real coverage gap)       |
+| triton-tutorial-02-fused-softmax     | `softmax_kernel`        | `corpus_softmax_fp32`   | historical `CRASH` | later notes report loud-failure / wrong-output variants; rerun before quoting a single current status |
+| triton-tutorial-05-layer-norm        | `_layer_norm_fwd_fused` | `corpus_layernorm_fp32` | historical `CRASH` | later meeting sweep records a salmon timeout / hang for this wrapper |
+| triton-tutorial-07-extern-functions  | `asin_kernel`           | `corpus_asin_fp32`      | historical `CRASH` | `v_bfi_b32` was fixed; later sweep exposes a wrong-output libdevice/sign-stitch class instead |
 
-All four upstream tutorials are now wired through to `compare_correctness`
-end-to-end.  The harness's plumbing is no longer the limiting factor:
-softmax / layer-norm / asin all reach native gold and then expose
-genuine salmon coverage gaps (segfault, hang, missing instruction
-lowering) — exactly the kind of breadth the corpus is meant to
-surface.  The shims for softmax and layer-norm exercised the schema
+All four upstream tutorials were wired through to `compare_correctness`
+end-to-end in this snapshot. The harness's plumbing is no longer the
+limiting factor, but the exact Salmon failure mode has changed as
+handlers landed. The shims for softmax and layer-norm exercised the schema
 work that landed alongside this status update: `harness_constants`
 for non-kernel-arg sizing values (e.g. layer-norm's `M`), and
 `scalar_args` for runtime-derived integer scalars (strides) and

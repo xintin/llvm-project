@@ -3947,6 +3947,23 @@ TritonRecipe parseTritonSidecar(const std::string &path) {
           die("triton sidecar: input %s has invalid range [%g, %g) "
               "(rangeLo must be strictly less than rangeHi)",
               d.name.c_str(), d.rangeLo, d.rangeHi);
+        // Optional `init: zero` on inputs.  Default: deterministic
+        // RNG fill (see makeInput).  "zero" forces a deterministic
+        // all-zero pre-launch fill instead — required for kernels
+        // that index via the input value and would otherwise
+        // compute out-of-bounds store addresses on both native and
+        // salmon (not a salmon bug, a harness-input issue).  Only
+        // "zero" is recognised; anything else is a hard error.
+        if (const auto *ini = b.find("init")) {
+          const std::string &s = ini->asString();
+          if (s == "zero") {
+            d.init = TritonOutputInit::Zero;
+          } else {
+            die("triton sidecar: input %s has init=%s "
+                "(only 'zero' is recognised on inputs)",
+                d.name.c_str(), s.c_str());
+          }
+        }
       } else {
         if (const auto *c = b.find("comparator")) {
           d.hasComparator    = true;
@@ -4270,6 +4287,16 @@ tritonMakeInput(const TritonRecipe &t, int shapeValue) {
     const auto &b = t.inputs[bi];
     size_t off = L.offsets[bi];
     size_t sz  = L.sizes[bi];
+    // `init: zero` is honoured BEFORE the per-dtype RNG fill: the
+    // slot is already zeroed by the `std::vector<uint8_t> buf(...,
+    // 0)` construction above, so we just skip the RNG pass.
+    // Rationale: some kernels index via the input value itself (e.g.
+    // `ColSortedIndx + load(NonzeroIndx)` in bitmatrix_metadata_stage2)
+    // and need a bounded distribution to avoid OOB stores on BOTH
+    // native and salmon — that's a harness-input issue, not a
+    // backend bug.
+    if (b.init == TritonOutputInit::Zero)
+      continue;
     // Per-buffer seed: stable across runs, distinct across (recipe, shape,
     // buffer) so different slots don't alias.
     uint64_t seed = std::hash<std::string>{}(t.name + "|" + b.name) ^
@@ -4318,6 +4345,20 @@ tritonMakeInput(const TritonRecipe &t, int shapeValue) {
       size_t n = sz / 8;
       std::uniform_real_distribution<double> dist(b.rangeLo, b.rangeHi);
       for (size_t i = 0; i < n; ++i) out[i] = dist(rng);
+    } else if (b.dtype == "i16" || b.dtype == "u16") {
+      // i16/u16: same full-bit-range memcpy shape as i32/u32 below.
+      // Used by recipes that exercise kernels with `*i16` signatures
+      // (e.g. the GPT-OSS bitmatrix-metadata stage-2 NonzeroIndx
+      // input — i16 column indices the kernel zext's to u32 before
+      // `tl.sort`). Bit-copying the low 16 bits of the RNG output
+      // keeps the dtype-interpretation contract identical to i32/u32
+      // (kernel re-interprets per its declared sig type).
+      auto *out = reinterpret_cast<int16_t *>(buf.data() + off);
+      size_t n = sz / 2;
+      for (size_t i = 0; i < n; ++i) {
+        uint16_t u = static_cast<uint16_t>(rng());
+        std::memcpy(&out[i], &u, sizeof(uint16_t));
+      }
     } else if (b.dtype == "i32" || b.dtype == "u32") {
       auto *out = reinterpret_cast<int32_t *>(buf.data() + off);
       size_t n = sz / 4;
