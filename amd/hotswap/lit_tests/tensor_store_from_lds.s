@@ -13,6 +13,7 @@
 ; IR-SAME: <8 x i32> %td_grp1
 ; IR-SAME: <4 x i32> zeroinitializer
 ; IR-SAME: <4 x i32> zeroinitializer
+; IR-SAME: i32 32
 ; IR-SAME: )
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"

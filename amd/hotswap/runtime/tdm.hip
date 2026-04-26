@@ -3,8 +3,8 @@
 // Cross-target lift of gfx1250 TENSOR_LOAD_TO_LDS / TENSOR_STORE_FROM_LDS
 // onto gfx942. Two C-linkage entry points are emitted by the bitcode and
 // link-merged into the kernel module by `linkTDMRuntime` (see
-// `tdm_runtime.cpp` and `handle_vimage.cpp`); their signatures mirror the
-// gfx1250 intrinsic operand bank.
+// `tdm_runtime.cpp` and `handle_vimage.cpp`); their signatures carry the
+// gfx1250 D# operand bank plus an explicit source-wave size.
 //
 // Strategy:
 //   * X-axis OOB (and multi-dim row OOB folded onto num_records=0) is
@@ -14,10 +14,13 @@
 //   * `data_size` (1/2/4/8) is dispatched once per call in the entry
 //     point; the rest of the walk is templated on `<bool IsLoad,
 //     unsigned DS>` so per-element switching disappears entirely.
-//   * Lane L of the hardware wave handles X = L, W, 2W, ... where W is
-//     `__builtin_amdgcn_wavefrontsize()`. Unique X per lane, so the
-//     stripe is race-free on both the global and LDS sides.
-//   * Atomic-barrier emit is gated to lane 0.
+//   * Lane L of the source wave handles X = L, W_src, 2W_src, ... where
+//     W_src is passed explicitly by the raiser. Under wave32 -> wave64
+//     WaveNativeProjection the helper splits the target wave into two
+//     divergent regions (lanes 0..31 and 32..63), so descriptor
+//     readfirstlane and X striping are source-wave-local rather than
+//     target-wave-global.
+//   * Atomic-barrier emit is gated to source-local lane 0.
 //
 // Field offsets follow the MI450 SPG Tensor DMA Resource Descriptor
 // tables (79–84).
@@ -55,7 +58,9 @@ __device__ __forceinline__ uint32_t bits(uint32_t w, unsigned lo, unsigned n) {
 // the optimiser that all four vectors are uniform; everything derived
 // (V#, tile/tensor dims, strides, padding, lds_byte_off, ...) then
 // stays in SGPRs, and the X loop collapses to one buffer op + one DS
-// op per iteration.
+// op per iteration. The caller must enter this walk from a source-wave-
+// scoped divergent region when a target wave contains multiple source
+// waves; otherwise `readfirstlane` would collapse distinct descriptors.
 __device__ __forceinline__ v4i rfl_v4(v4i v) {
   v4i r;
   r[0] = __builtin_amdgcn_readfirstlane((int)v[0]);
@@ -189,14 +194,23 @@ __device__ __forceinline__ void copy_one(__amdgpu_buffer_rsrc_t rsrc,
   else                  buf_store_t(*ldsP, rsrc, voffset);
 }
 
+__device__ __forceinline__ unsigned lane_id() {
+  return __builtin_amdgcn_mbcnt_hi(~0u,
+             __builtin_amdgcn_mbcnt_lo(~0u, 0u));
+}
+
 // Common body shared by load and store. Templated on direction AND
 // data-size: every per-element switch collapses to typed loads/stores,
 // every `* DS` multiply folds to a constant or shift.
 template <bool IsLoad, unsigned DS>
-__device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3) {
+__device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
+                                      unsigned group_base,
+                                      unsigned source_wave_size) {
   // Coerce the wave-uniform descriptor into SGPRs so all derived
   // computations (V#, dims, strides, padding, lds_byte_off) stay in
-  // the scalar pipe. See the comment on rfl_v4/rfl_v8.
+  // the scalar pipe. The caller has already restricted hardware EXEC
+  // to one source-wave group when source_wave_size < target wave size.
+  // See the comment on rfl_v4/rfl_v8.
   g0 = rfl_v4(g0);
   g1 = rfl_v8(g1);
   g2 = rfl_v4(g2);
@@ -206,9 +220,7 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3) {
   if (count(g0) == 0)
     return;
 
-  const unsigned lane = __builtin_amdgcn_mbcnt_hi(~0u,
-                            __builtin_amdgcn_mbcnt_lo(~0u, 0u));
-  const unsigned wave = __builtin_amdgcn_wavefrontsize();
+  const unsigned local_lane = lane_id() - group_base;
 
   const bool gm      = gather_mode(g0);
   const bool itr     = iterate_en(g1) && !gm;
@@ -286,9 +298,9 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3) {
                            (a  >= Td3) || (b >= Td4);
       auto rsrc = make_rsrc(row_base, row_oob ? 0u : Td0 * DS);
 
-      // Stripe X across all hardware wave lanes; HW bounds-check on
+      // Stripe X across the source wave. HW bounds-check on
       // `voffset >= num_records` covers the X-axis OOB rule.
-      for (uint32_t x = lane; x < T0; x += wave)
+      for (uint32_t x = local_lane; x < T0; x += source_wave_size)
         copy_one<IsLoad, DS>(rsrc, x * DS, lds_byte_off + x * DS);
 
       // Per-row LDS advance + padding accounting (uniform across lanes).
@@ -305,7 +317,7 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3) {
 
   // Atomic barrier: the field stores bits [18:3] of a 64-bit-aligned
   // LDS pointer, low 3 bits implied zero.
-  if (atomic_barrier_en(g1) && lane == 0) {
+  if (atomic_barrier_en(g1) && local_lane == 0) {
     auto *bar = (__attribute__((address_space(3))) uint32_t *)
                 (uintptr_t)(atomic_barrier_addr(g1) << 3);
     __atomic_fetch_add(bar, 1u, __ATOMIC_RELEASE);
@@ -316,24 +328,51 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3) {
 // 2-bit field statically covers {1,2,4,8}; the default arm is
 // unreachable so the optimiser drops it.
 template <bool IsLoad>
-__device__ __forceinline__ void dispatch(v4i g0, v8i g1, v4i g2, v4i g3) {
+__device__ __forceinline__ void dispatch_group(v4i g0, v8i g1, v4i g2, v4i g3,
+                                                unsigned group_base,
+                                                unsigned source_wave_size) {
   switch (((unsigned)g1[0] >> 16) & 3u) {
-  case 0: walk<IsLoad, 1>(g0, g1, g2, g3); return;
-  case 1: walk<IsLoad, 2>(g0, g1, g2, g3); return;
-  case 2: walk<IsLoad, 4>(g0, g1, g2, g3); return;
-  case 3: walk<IsLoad, 8>(g0, g1, g2, g3); return;
+  case 0: walk<IsLoad, 1>(g0, g1, g2, g3, group_base, source_wave_size); return;
+  case 1: walk<IsLoad, 2>(g0, g1, g2, g3, group_base, source_wave_size); return;
+  case 2: walk<IsLoad, 4>(g0, g1, g2, g3, group_base, source_wave_size); return;
+  case 3: walk<IsLoad, 8>(g0, g1, g2, g3, group_base, source_wave_size); return;
   }
   __builtin_unreachable();
+}
+
+template <bool IsLoad>
+__device__ __forceinline__ void dispatch(v4i g0, v8i g1, v4i g2, v4i g3,
+                                          unsigned source_wave_size) {
+  const unsigned target_wave_size = __builtin_amdgcn_wavefrontsize();
+  if (source_wave_size == target_wave_size) {
+    dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, source_wave_size);
+    return;
+  }
+
+  // The landed cross-target route is gfx1250 wave32 -> gfx942 wave64.
+  // Split the target wave into two divergent regions before uniformising
+  // the descriptor so `readfirstlane` sees one source wave at a time.
+  if (source_wave_size == 32u && target_wave_size == 64u) {
+    if (lane_id() < 32u)
+      dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, 32u);
+    else
+      dispatch_group<IsLoad>(g0, g1, g2, g3, 32u, 32u);
+    return;
+  }
+
+  __builtin_trap();
 }
 
 } // namespace
 
 extern "C" __device__ __attribute__((used))
-void salmon_tdm_load_to_lds(v4i g0, v8i g1, v4i g2, v4i g3) {
-  dispatch</*IsLoad=*/true>(g0, g1, g2, g3);
+void salmon_tdm_load_to_lds(v4i g0, v8i g1, v4i g2, v4i g3,
+                            unsigned source_wave_size) {
+  dispatch</*IsLoad=*/true>(g0, g1, g2, g3, source_wave_size);
 }
 
 extern "C" __device__ __attribute__((used))
-void salmon_tdm_store_from_lds(v4i g0, v8i g1, v4i g2, v4i g3) {
-  dispatch</*IsLoad=*/false>(g0, g1, g2, g3);
+void salmon_tdm_store_from_lds(v4i g0, v8i g1, v4i g2, v4i g3,
+                               unsigned source_wave_size) {
+  dispatch</*IsLoad=*/false>(g0, g1, g2, g3, source_wave_size);
 }

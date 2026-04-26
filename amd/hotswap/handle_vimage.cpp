@@ -58,11 +58,11 @@
 // runtime (`runtime/tdm.hip`) into the raised IR module. The handler
 // emits a call to `salmon_tdm_load_to_lds` / `salmon_tdm_store_from_lds`
 // with the same operand vectors the same-target intrinsic emit
-// produces; the link merge happens in `raiseToIR` (see `tdm_runtime.hpp`
-// and `raiser.cpp`). The helper stripes the descriptor's innermost X
-// dimension across the target hardware wave lanes and implements the
-// full D# walk (4D/5D loops, OOB rules, padding, iteration, gather
-// mode, atomic-barrier side effect).
+// produces, plus the source wave size; the link merge happens in
+// `raiseToIR` (see `tdm_runtime.hpp` and `raiser.cpp`). The helper
+// stripes the descriptor's innermost X dimension across source-wave-local
+// lanes and implements the full D# walk (4D/5D loops, OOB rules, padding,
+// iteration, gather mode, atomic-barrier side effect).
 //
 // When the transpiler was built without hipcc, `tdmRuntimeAvailable()`
 // is false and this handler keeps the pre-existing loud refusal path
@@ -272,18 +272,37 @@ HandlerResult handleVIMAGE(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
 
+  const unsigned sourceWaveSize = ctx.isa.waveSize;
+  const unsigned targetWaveSize = ctx.targetIsa.waveSize;
+  const bool supportedWaveShape =
+      sourceWaveSize == targetWaveSize ||
+      (sourceWaveSize == 32 && targetWaveSize == 64);
+  if (!supportedWaveShape) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VIMAGE",
+        Twine("TDM emulation supports only source-wave-local same-wave "
+              "execution or wave32 source -> wave64 target cross-widening "
+              "(got source wave ") +
+            Twine(sourceWaveSize) + ", target wave " + Twine(targetWaveSize) +
+            ")");
+    return hr;
+  }
+
   FunctionCallee helper = (sop == SemOp::TENSOR_LOAD_TO_LDS)
                               ? declareTDMLoad(ctx.M)
                               : declareTDMStore(ctx.M);
-  // The runtime helper's signature is the four D# groups only. It
-  // deliberately does NOT take the intrinsic's trailing `<8 x i32>
-  // grp4` because that group is reserved by the gfx1250 intrinsic
-  // contract, and it does not take `i32 cpol` because the cross-target
-  // helper has no target cache-policy encoding to preserve. The
-  // descriptor-visible side effects, including atomic-barrier updates,
-  // live in the D# groups that are forwarded.
+  // The runtime helper's signature is the four D# groups plus the source
+  // wave size. It deliberately does NOT take the intrinsic's trailing
+  // `<8 x i32> grp4` because that group is reserved by the gfx1250
+  // intrinsic contract, and it does not take `i32 cpol` because the
+  // cross-target helper has no target cache-policy encoding to preserve.
+  // The descriptor-visible side effects, including atomic-barrier updates,
+  // live in the D# groups that are forwarded. `sourceWaveSize` keeps the
+  // helper's descriptor readfirstlane / X stripe source-wave-local when
+  // WaveNativeProjection packs two source wave32s into one target wave64.
   ctx.emitUnderExec([&] {
-    ctx.B.CreateCall(helper, {args.grp0, args.grp1, args.grp2, args.grp3});
+    ctx.B.CreateCall(helper, {args.grp0, args.grp1, args.grp2, args.grp3,
+                              ctx.B.getInt32(sourceWaveSize)});
   });
   hr.handled = true;
   return hr;

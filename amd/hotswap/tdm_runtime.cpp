@@ -39,12 +39,12 @@ llvm::FunctionType *tdmHelperFnTy(llvm::LLVMContext &C) {
   auto *i32 = Type::getInt32Ty(C);
   auto *v4i = FixedVectorType::get(i32, 4);
   auto *v8i = FixedVectorType::get(i32, 8);
-  // Helper takes only the four D# groups the walker consumes. The
-  // LLVM intrinsic's trailing <8 x i32> `grp4` is reserved, and `i32
-  // cpol` is a cache-policy immediate with no target-side encoding in
-  // the helper path. See `tdm_runtime.hpp` and the matching
-  // handler-side elision in `handle_vimage.cpp`.
-  return FunctionType::get(Type::getVoidTy(C), {v4i, v8i, v4i, v4i},
+  // Helper takes the four D# groups the walker consumes plus the source
+  // wave size. The LLVM intrinsic's trailing <8 x i32> `grp4` is reserved,
+  // and `i32 cpol` is a cache-policy immediate with no target-side encoding
+  // in the helper path. See `tdm_runtime.hpp` and the matching handler-side
+  // elision in `handle_vimage.cpp`.
+  return FunctionType::get(Type::getVoidTy(C), {v4i, v8i, v4i, v4i, i32},
                            /*isVarArg=*/false);
 }
 

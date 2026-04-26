@@ -49,6 +49,14 @@
 //      A single-wave dispatch would hide a bug where the kernel
 //      elides that barrier.
 //
+//   5. `TdmGpu.SourceWaveLocalDescriptors` — direct runtime canary.
+//      A synthetic gfx942 IR kernel link-merges the embedded helper and
+//      passes different D# groups to lanes 0..31 and 32..63 of one target
+//      wave. The lower and upper source-wave halves must copy distinct
+//      input/output buffers through distinct LDS ranges; target-wave-global
+//      `readfirstlane`, `wavefrontsize()` striping, or lane-0 atomic-barrier
+//      gating fails this test.
+//
 // All tests `GTEST_SKIP` cleanly when their preconditions are missing —
 // no test data, no hipcc at build time, no GPU — so a developer running
 // the suite without all the pieces in place gets clear feedback without
@@ -57,13 +65,25 @@
 #include "test_common.hpp"
 
 #include "../code_object_utils.hpp"
+#include "../mc_state.hpp"
 #include "../pipeline.hpp"
 #include "../tdm_runtime.hpp"
 
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
 
 #include <algorithm>
@@ -386,6 +406,269 @@ uint32_t patternValue(uint32_t i) { return 0xa5c30000u ^ (i * 0x01010101u); }
       return -1;                                                               \
     }                                                                          \
   } while (0)
+
+struct TempDir {
+  llvm::SmallString<128> path;
+  bool valid = false;
+
+  TempDir() {
+    std::error_code ec =
+        llvm::sys::fs::createUniqueDirectory("tdm_source_wave", path);
+    if (!ec)
+      valid = true;
+  }
+
+  ~TempDir() {
+    if (valid)
+      llvm::sys::fs::remove_directories(path);
+  }
+
+  std::string file(const char *name) const {
+    llvm::SmallString<256> p(path);
+    llvm::sys::path::append(p, name);
+    return std::string(p);
+  }
+};
+
+int runTool(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args) {
+  auto exeOrErr = llvm::sys::findProgramByName(program);
+  if (!exeOrErr) {
+    ADD_FAILURE() << "tool not found: " << program.str();
+    return -1;
+  }
+  std::string errMsg;
+  int rc = llvm::sys::ExecuteAndWait(*exeOrErr, args, std::nullopt,
+                                     /*Redirects=*/{}, /*SecondsToWait=*/120,
+                                     /*MemoryLimit=*/0, &errMsg);
+  if (rc != 0) {
+    ADD_FAILURE() << program.str() << " failed with exit " << rc
+                  << (errMsg.empty() ? "" : (": " + errMsg));
+  }
+  return rc;
+}
+
+std::vector<uint8_t> compileModuleToHsaco(llvm::Module &M) {
+  TempDir tmp;
+  if (!tmp.valid) {
+    ADD_FAILURE() << "failed to create temporary directory for TDM canary";
+    return {};
+  }
+
+  std::string llPath = tmp.file("canary.ll");
+  std::string asmPath = tmp.file("canary.s");
+  std::string objPath = tmp.file("canary.o");
+  std::string hsacoPath = tmp.file("canary.hsaco");
+
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(llPath, ec);
+    if (ec) {
+      ADD_FAILURE() << "cannot write " << llPath << ": " << ec.message();
+      return {};
+    }
+    M.print(os, nullptr);
+  }
+
+  std::string llc = std::string(LLVM_TOOLS_DIR) + "/llc";
+  std::string llvmMc = std::string(LLVM_TOOLS_DIR) + "/llvm-mc";
+  std::string lld = std::string(LLVM_TOOLS_DIR) + "/ld.lld";
+  std::string mcpu = "-mcpu=gfx942";
+
+  if (runTool(llc, {llc, "-march=amdgcn", mcpu, "-filetype=asm", "-o",
+                    asmPath, llPath}) != 0)
+    return {};
+  if (runTool(llvmMc, {llvmMc, "-triple=amdgcn-amd-amdhsa", mcpu,
+                       "-filetype=obj", "-o", objPath, asmPath}) != 0)
+    return {};
+  if (runTool(lld, {lld, "-shared", objPath, "-o", hsacoPath}) != 0)
+    return {};
+  return transpiler::readFile(hsacoPath);
+}
+
+bool configureGfx942Module(llvm::Module &M) {
+  using namespace llvm;
+
+  transpiler::MCState mc;
+  if (!transpiler::initMCState(mc, "gfx942")) {
+    ADD_FAILURE() << "failed to initialize AMDGPU MC state for gfx942";
+    return false;
+  }
+
+  TargetOptions opts;
+  std::unique_ptr<TargetMachine> tm(mc.target->createTargetMachine(
+      Triple(transpiler::kAMDGPUTriple), "gfx942", "", opts, Reloc::PIC_));
+  if (!tm) {
+    ADD_FAILURE() << "failed to create gfx942 TargetMachine";
+    return false;
+  }
+
+  M.setTargetTriple(Triple(transpiler::kAMDGPUTriple));
+  M.setDataLayout(tm->createDataLayout());
+  return true;
+}
+
+std::vector<uint8_t> buildSourceWaveLocalCanaryHsaco() {
+  using namespace llvm;
+
+  LLVMContext C;
+  Module M("tdm_source_wave_local_canary", C);
+  if (!configureGfx942Module(M))
+    return {};
+
+  Type *voidTy = Type::getVoidTy(C);
+  Type *i32Ty = Type::getInt32Ty(C);
+  PointerType *globalPtrTy = PointerType::get(C, 1);
+  ArrayType *ldsTy = ArrayType::get(i32Ty, 65);
+  auto *lds = new GlobalVariable(
+      M, ldsTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
+      PoisonValue::get(ldsTy), "tdm_canary_lds", nullptr,
+      GlobalValue::NotThreadLocal, /*AddressSpace=*/3);
+  lds->setAlignment(Align(4));
+
+  FunctionType *loadKernelTy =
+      FunctionType::get(voidTy, {globalPtrTy, globalPtrTy, globalPtrTy},
+                        /*isVarArg=*/false);
+  Function *loadF = Function::Create(
+      loadKernelTy, GlobalValue::ExternalLinkage,
+      "tdm_source_wave_local_load_canary", M);
+  loadF->setCallingConv(CallingConv::AMDGPU_KERNEL);
+  loadF->addFnAttr("amdgpu-flat-work-group-size", "64,64");
+
+  auto argIt = loadF->arg_begin();
+  Value *desc0 = &*argIt++;
+  desc0->setName("desc0");
+  Value *desc1 = &*argIt++;
+  desc1->setName("desc1");
+  Value *out = &*argIt++;
+  out->setName("out");
+
+  BasicBlock *entry = BasicBlock::Create(C, "entry", loadF);
+  IRBuilder<> B(entry);
+  Function *mbcntLo =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_mbcnt_lo);
+  Function *mbcntHi =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_mbcnt_hi);
+  Function *barrier =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_s_barrier);
+
+  Value *laneLo =
+      B.CreateCall(mbcntLo, {B.getInt32(-1), B.getInt32(0)}, "lane_lo");
+  Value *lane =
+      B.CreateCall(mbcntHi, {B.getInt32(-1), laneLo}, "lane");
+  Value *isUpper = B.CreateICmpUGE(lane, B.getInt32(32), "is_upper_half");
+  Value *descBase = B.CreateSelect(isUpper, desc1, desc0, "desc_base");
+
+  auto buildVecFromDesc = [&](Value *base, unsigned first, unsigned count,
+                              const char *name) {
+    auto *vecTy = FixedVectorType::get(i32Ty, count);
+    Value *vec = PoisonValue::get(vecTy);
+    for (unsigned i = 0; i < count; ++i) {
+      Value *gep = B.CreateInBoundsGEP(i32Ty, base, B.getInt32(first + i),
+                                       "desc_gep");
+      Value *dword = B.CreateLoad(i32Ty, gep, "desc_dw");
+      vec = B.CreateInsertElement(vec, dword, B.getInt32(i), name);
+    }
+    return vec;
+  };
+
+  Value *ldsPtr =
+      B.CreateInBoundsGEP(ldsTy, lds, {B.getInt32(0), lane}, "lds_lane");
+  B.CreateStore(B.getInt32(0xcdcdcdcdu), ldsPtr);
+  Value *barPtr =
+      B.CreateInBoundsGEP(ldsTy, lds, {B.getInt32(0), B.getInt32(64)},
+                          "lds_barrier_count");
+  Value *isLane0 = B.CreateICmpEQ(lane, B.getInt32(0), "is_lane0");
+  BasicBlock *initBarBB =
+      BasicBlock::Create(C, "init_barrier_count", loadF);
+  BasicBlock *afterInitBarBB =
+      BasicBlock::Create(C, "after_init_barrier_count", loadF);
+  B.CreateCondBr(isLane0, initBarBB, afterInitBarBB);
+
+  B.SetInsertPoint(initBarBB);
+  B.CreateStore(B.getInt32(0), barPtr);
+  B.CreateBr(afterInitBarBB);
+
+  B.SetInsertPoint(afterInitBarBB);
+  B.CreateCall(barrier, {});
+
+  Value *g0 = buildVecFromDesc(descBase, 0, 4, "g0");
+  Value *g1 = buildVecFromDesc(descBase, 4, 8, "g1");
+  Value *g2 = buildVecFromDesc(descBase, 12, 4, "g2");
+  Value *g3 = buildVecFromDesc(descBase, 16, 4, "g3");
+  FunctionCallee helper = transpiler::declareTDMLoad(M);
+  B.CreateCall(helper, {g0, g1, g2, g3, B.getInt32(32)});
+  B.CreateCall(barrier, {});
+
+  Value *loaded = B.CreateLoad(i32Ty, ldsPtr, "loaded");
+  Value *outPtr =
+      B.CreateInBoundsGEP(i32Ty, out, lane, "out_lane");
+  B.CreateStore(loaded, outPtr);
+
+  BasicBlock *barrierOutBB =
+      BasicBlock::Create(C, "store_barrier_count", loadF);
+  BasicBlock *loadRetBB = BasicBlock::Create(C, "load_ret", loadF);
+  B.CreateCondBr(isLane0, barrierOutBB, loadRetBB);
+
+  B.SetInsertPoint(barrierOutBB);
+  Value *barrierCount = B.CreateLoad(i32Ty, barPtr, "barrier_count");
+  Value *barrierOutPtr =
+      B.CreateInBoundsGEP(i32Ty, out, B.getInt32(64), "out_barrier_count");
+  B.CreateStore(barrierCount, barrierOutPtr);
+  B.CreateBr(loadRetBB);
+
+  B.SetInsertPoint(loadRetBB);
+  B.CreateRetVoid();
+
+  FunctionType *storeKernelTy =
+      FunctionType::get(voidTy, {globalPtrTy, globalPtrTy},
+                        /*isVarArg=*/false);
+  Function *storeF = Function::Create(
+      storeKernelTy, GlobalValue::ExternalLinkage,
+      "tdm_source_wave_local_store_canary", M);
+  storeF->setCallingConv(CallingConv::AMDGPU_KERNEL);
+  storeF->addFnAttr("amdgpu-flat-work-group-size", "64,64");
+
+  auto storeArgIt = storeF->arg_begin();
+  Value *storeDesc0 = &*storeArgIt++;
+  storeDesc0->setName("desc0");
+  Value *storeDesc1 = &*storeArgIt++;
+  storeDesc1->setName("desc1");
+
+  BasicBlock *storeEntry = BasicBlock::Create(C, "entry", storeF);
+  B.SetInsertPoint(storeEntry);
+  laneLo = B.CreateCall(mbcntLo, {B.getInt32(-1), B.getInt32(0)}, "lane_lo");
+  lane = B.CreateCall(mbcntHi, {B.getInt32(-1), laneLo}, "lane");
+  isUpper = B.CreateICmpUGE(lane, B.getInt32(32), "is_upper_half");
+  Value *localLane = B.CreateAnd(lane, B.getInt32(31), "local_lane");
+  Value *lowerPattern = B.CreateAdd(B.getInt32(0x33000000u), localLane,
+                                    "lower_pattern");
+  Value *upperPattern = B.CreateAdd(B.getInt32(0x44000000u), localLane,
+                                    "upper_pattern");
+  Value *storePattern =
+      B.CreateSelect(isUpper, upperPattern, lowerPattern, "store_pattern");
+  ldsPtr = B.CreateInBoundsGEP(ldsTy, lds, {B.getInt32(0), lane}, "lds_lane");
+  B.CreateStore(storePattern, ldsPtr);
+  B.CreateCall(barrier, {});
+
+  descBase = B.CreateSelect(isUpper, storeDesc1, storeDesc0, "desc_base");
+  g0 = buildVecFromDesc(descBase, 0, 4, "g0");
+  g1 = buildVecFromDesc(descBase, 4, 8, "g1");
+  g2 = buildVecFromDesc(descBase, 12, 4, "g2");
+  g3 = buildVecFromDesc(descBase, 16, 4, "g3");
+  FunctionCallee storeHelper = transpiler::declareTDMStore(M);
+  B.CreateCall(storeHelper, {g0, g1, g2, g3, B.getInt32(32)});
+  B.CreateRetVoid();
+
+  if (!transpiler::linkTDMRuntime(M, "gfx942")) {
+    ADD_FAILURE() << "linkTDMRuntime failed for source-wave canary";
+    return {};
+  }
+  if (verifyModule(M, &errs())) {
+    ADD_FAILURE() << "source-wave canary module failed LLVM verification";
+    return {};
+  }
+  return compileModuleToHsaco(M);
+}
 
 // Run one parameter point through the full raise -> dispatch ->
 // compare cycle. Returns the number of mismatches (0 == pass),
@@ -734,5 +1017,175 @@ TEST_F(TdmGpu, LoadStoreRoundtrip5D) {
   for (int i = 0; i < 5; ++i) total *= tile[i];
   EXPECT_EQ(mism, 0) << "LoadStoreRoundtrip5D: " << mism << " / " << total
                      << " mismatches";
+}
+
+TEST_F(TdmGpu, SourceWaveLocalDescriptors) {
+  if (!transpiler::tdmRuntimeAvailable())
+    GTEST_SKIP() << "TDM runtime bitcode not embedded "
+                    "(transpiler built without hipcc).";
+
+  std::vector<uint8_t> hsaco = buildSourceWaveLocalCanaryHsaco();
+  ASSERT_FALSE(hsaco.empty()) << "failed to build source-wave-local TDM canary";
+
+  constexpr uint32_t kHalf = 32;
+  constexpr uint32_t kTotal = 64;
+  uint32_t *d_in0 = nullptr;
+  uint32_t *d_in1 = nullptr;
+  uint32_t *d_out = nullptr;
+  uint32_t *d_store0 = nullptr;
+  uint32_t *d_store1 = nullptr;
+  TDMDescriptor *d_desc0 = nullptr;
+  TDMDescriptor *d_desc1 = nullptr;
+  HIP_ASSERT(hipMalloc(&d_in0, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_in1, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_out, (kTotal + 1) * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_store0, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_store1, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_desc0, sizeof(TDMDescriptor)));
+  HIP_ASSERT(hipMalloc(&d_desc1, sizeof(TDMDescriptor)));
+
+  std::vector<uint32_t> host_in0(kHalf);
+  std::vector<uint32_t> host_in1(kHalf);
+  for (uint32_t i = 0; i < kHalf; ++i) {
+    host_in0[i] = 0x11000000u + i;
+    host_in1[i] = 0x22000000u + i;
+  }
+  HIP_ASSERT(hipMemcpy(d_in0, host_in0.data(), kHalf * sizeof(uint32_t),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemcpy(d_in1, host_in1.data(), kHalf * sizeof(uint32_t),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemset(d_out, 0xcd, (kTotal + 1) * sizeof(uint32_t)));
+  HIP_ASSERT(hipMemset(d_store0, 0xcd, kHalf * sizeof(uint32_t)));
+  HIP_ASSERT(hipMemset(d_store1, 0xcd, kHalf * sizeof(uint32_t)));
+
+  const uint32_t tile[5] = {kHalf, 0, 0, 0, 0};
+  TDMDescriptor desc0 =
+      buildDescriptor((uint64_t)(uintptr_t)d_in0, /*rank=*/1, tile);
+  TDMDescriptor desc1 =
+      buildDescriptor((uint64_t)(uintptr_t)d_in1, /*rank=*/1, tile);
+  desc0.g0[1] = 0;                         // LDS slots 0..31
+  desc1.g0[1] = kHalf * sizeof(uint32_t);  // LDS slots 32..63
+  // Both source waves increment the same LDS barrier counter. A target-wave-
+  // global lane-0 implementation would report 1; source-wave-local lane 0
+  // reports 2.
+  desc0.g1[0] |= 1u << 18;
+  desc1.g1[0] |= 1u << 18;
+  desc0.g1[1] = (desc0.g1[1] & 0xffff0000u) | 32u; // byte 256 >> 3
+  desc1.g1[1] = (desc1.g1[1] & 0xffff0000u) | 32u;
+  HIP_ASSERT(hipMemcpy(d_desc0, &desc0, sizeof(desc0),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemcpy(d_desc1, &desc1, sizeof(desc1),
+                       hipMemcpyHostToDevice));
+
+  hipModule_t mod;
+  HIP_ASSERT(hipModuleLoadData(&mod, hsaco.data()));
+  hipFunction_t fn;
+  HIP_ASSERT(hipModuleGetFunction(
+      &fn, mod, "tdm_source_wave_local_load_canary"));
+
+  struct Args {
+    TDMDescriptor *desc0;
+    TDMDescriptor *desc1;
+    uint32_t *out;
+  } args{d_desc0, d_desc1, d_out};
+  size_t argSize = sizeof(args);
+  void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                    HIP_LAUNCH_PARAM_END};
+  HIP_ASSERT(hipModuleLaunchKernel(fn, 1, 1, 1, kTotal, 1, 1, 0,
+                                   nullptr, nullptr, config));
+  HIP_ASSERT(hipDeviceSynchronize());
+
+  std::vector<uint32_t> host_out(kTotal + 1);
+  HIP_ASSERT(hipMemcpy(host_out.data(), d_out,
+                       (kTotal + 1) * sizeof(uint32_t),
+                       hipMemcpyDeviceToHost));
+
+  int mism = 0;
+  for (uint32_t i = 0; i < kHalf; ++i) {
+    if (host_out[i] != host_in0[i]) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave-local load] lower mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                i, host_out[i], host_in0[i]);
+      ++mism;
+    }
+    if (host_out[kHalf + i] != host_in1[i]) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave-local load] upper mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                kHalf + i, host_out[kHalf + i], host_in1[i]);
+      ++mism;
+    }
+  }
+  if (host_out[kTotal] != 2u) {
+    fprintf(stderr,
+            "  [source-wave-local load] atomic barrier count: "
+            "got %u expected 2\n",
+            host_out[kTotal]);
+    ++mism;
+  }
+
+  desc0 = buildDescriptor((uint64_t)(uintptr_t)d_store0, /*rank=*/1, tile);
+  desc1 = buildDescriptor((uint64_t)(uintptr_t)d_store1, /*rank=*/1, tile);
+  desc0.g0[1] = 0;
+  desc1.g0[1] = kHalf * sizeof(uint32_t);
+  HIP_ASSERT(hipMemcpy(d_desc0, &desc0, sizeof(desc0),
+                       hipMemcpyHostToDevice));
+  HIP_ASSERT(hipMemcpy(d_desc1, &desc1, sizeof(desc1),
+                       hipMemcpyHostToDevice));
+
+  HIP_ASSERT(hipModuleGetFunction(
+      &fn, mod, "tdm_source_wave_local_store_canary"));
+  struct StoreArgs {
+    TDMDescriptor *desc0;
+    TDMDescriptor *desc1;
+  } storeArgs{d_desc0, d_desc1};
+  argSize = sizeof(storeArgs);
+  void *storeConfig[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &storeArgs,
+                         HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                         HIP_LAUNCH_PARAM_END};
+  HIP_ASSERT(hipModuleLaunchKernel(fn, 1, 1, 1, kTotal, 1, 1, 0,
+                                   nullptr, nullptr, storeConfig));
+  HIP_ASSERT(hipDeviceSynchronize());
+
+  std::vector<uint32_t> host_store0(kHalf);
+  std::vector<uint32_t> host_store1(kHalf);
+  HIP_ASSERT(hipMemcpy(host_store0.data(), d_store0,
+                       kHalf * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  HIP_ASSERT(hipMemcpy(host_store1.data(), d_store1,
+                       kHalf * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  for (uint32_t i = 0; i < kHalf; ++i) {
+    uint32_t expected0 = 0x33000000u + i;
+    uint32_t expected1 = 0x44000000u + i;
+    if (host_store0[i] != expected0) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave-local store] lower mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                i, host_store0[i], expected0);
+      ++mism;
+    }
+    if (host_store1[i] != expected1) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [source-wave-local store] upper mismatch at %u: "
+                "got 0x%08x expected 0x%08x\n",
+                i, host_store1[i], expected1);
+      ++mism;
+    }
+  }
+
+  (void)hipModuleUnload(mod);
+  (void)hipFree(d_in0);
+  (void)hipFree(d_in1);
+  (void)hipFree(d_out);
+  (void)hipFree(d_store0);
+  (void)hipFree(d_store1);
+  (void)hipFree(d_desc0);
+  (void)hipFree(d_desc1);
+  EXPECT_EQ(mism, 0) << "source-wave-local TDM canary mismatches";
 }
 #endif // __HIP_PLATFORM_AMD__

@@ -14,13 +14,14 @@
 ; fixture is gated on `tdm-runtime`; no-runtime builds keep the
 ; handler's loud refusal path and skip this helper-call test.
 ;
-; Cross-target helper call: _d2 supplies groups 0/1 and zero-fills
-; groups 2/3 before calling the four-argument runtime helper.
+; Cross-target helper call: _d2 supplies groups 0/1, zero-fills
+; groups 2/3, and passes the source wave size to the runtime helper.
 ; IR-XT: call void @salmon_tdm_load_to_lds(
 ; IR-XT-SAME: <4 x i32> %td_grp0
 ; IR-XT-SAME: <8 x i32> %td_grp1
 ; IR-XT-SAME: <4 x i32> zeroinitializer
 ; IR-XT-SAME: <4 x i32> zeroinitializer
+; IR-XT-SAME: i32 32
 ; IR-XT-SAME: )
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \

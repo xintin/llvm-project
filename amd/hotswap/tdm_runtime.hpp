@@ -34,14 +34,18 @@ inline constexpr llvm::StringRef kTDMLoadSymbol  = "salmon_tdm_load_to_lds";
 inline constexpr llvm::StringRef kTDMStoreSymbol = "salmon_tdm_store_from_lds";
 
 // Declare (without body) the helper functions in `M`. Signature carries
-// the four D# groups the emulation walk actually reads:
-//   void(<4 x i32>, <8 x i32>, <4 x i32>, <4 x i32>)
+// the four D# groups the emulation walk actually reads plus the source
+// wave size used to scope descriptor uniformization and X striping:
+//   void(<4 x i32>, <8 x i32>, <4 x i32>, <4 x i32>, i32 sourceWaveSize)
 // The gfx1250 LLVM intrinsic's trailing `<8 x i32> grp4` (reserved) and
 // `i32 cpol` arguments are deliberately NOT forwarded. Group 4 has no
 // architectural meaning for gfx1250, and cpol is a cache-policy immediate
 // with no equivalent target encoding in the helper's MUBUF-based lowering.
 // The descriptor-visible semantics, including atomic-barrier updates, live
-// in the D# groups passed here.
+// in the D# groups passed here. `sourceWaveSize` is explicit because a
+// target wave64 can contain two wave32 source waves under WaveNativeProjection;
+// target-wave-local `readfirstlane` / lane-id striping would collapse those
+// source waves together.
 llvm::FunctionCallee declareTDMLoad(llvm::Module &M);
 llvm::FunctionCallee declareTDMStore(llvm::Module &M);
 
