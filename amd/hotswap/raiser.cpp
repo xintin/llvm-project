@@ -149,6 +149,54 @@ ThreadLoopDecisionResult decideThreadLoopFallback(unsigned sourceWaveSize,
           "eligible but graduation gate is off"};
 }
 
+static bool isSemOpInRange(SemOp op, SemOp first, SemOp last) {
+  auto v = static_cast<uint16_t>(op);
+  return v >= static_cast<uint16_t>(first) &&
+         v <= static_cast<uint16_t>(last);
+}
+
+static bool threadLoopUnsupportedWorkgroupMemoryOrBarrier(
+    ArrayRef<DecodedInst> insts, std::string &detail) {
+  for (const DecodedInst &di : insts) {
+    StringRef kind;
+    switch (di.semOp) {
+    case SemOp::S_BARRIER:
+    case SemOp::S_BARRIER_WAIT:
+    case SemOp::S_BARRIER_SIGNAL:
+      kind = "workgroup barrier";
+      break;
+    case SemOp::BUFFER_LOAD_DWORD_LDS:
+    case SemOp::BUFFER_LOAD_DWORDX4_LDS:
+    case SemOp::TENSOR_LOAD_TO_LDS:
+    case SemOp::TENSOR_STORE_FROM_LDS:
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B8:
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B32:
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B64:
+    case SemOp::GLOBAL_LOAD_ASYNC_TO_LDS_B128:
+      kind = "LDS access";
+      break;
+    default:
+      if (isSemOpInRange(di.semOp, SemOp::DS_LOAD_TR16_B128,
+                         SemOp::DS_SWIZZLE_B32))
+        kind = "LDS access";
+      break;
+    }
+
+    if (!kind.empty()) {
+      detail = (Twine("ThreadLoopProjection is not yet safe for kernels "
+                      "containing ") +
+                kind + " (" + semOpName(di.semOp) + " at offset 0x" +
+                Twine::utohexstr(di.offset) +
+                "); barrier hoisting and LDS aliasing checks are still "
+                "unimplemented, so refusing is safer than launching a "
+                "translated kernel that can fault or miscompile.")
+                   .str();
+      return true;
+    }
+  }
+  return false;
+}
+
 // Tracks one narrow question while raising a single instruction:
 //
 //   "Did this instruction prove that the source-ABI kernarg SGPR pair no
@@ -2158,6 +2206,19 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
           rewriteReport.sgprForcedThreadLoopEligible);
       if (!forceThreadLoopProjection &&
           tlDecision.decision == ThreadLoopDecision::EligibleAndGateOn) {
+        std::string threadLoopUnsupportedDetail;
+        if (threadLoopUnsupportedWorkgroupMemoryOrBarrier(
+                insts, threadLoopUnsupportedDetail)) {
+          errs() << "transpiler: thread-loop fallback not eligible for kernel '"
+                 << kernelName << "': " << threadLoopUnsupportedDetail
+                 << "\n";
+          RaiseFailure f = RaiseFailure::crossWaveRewriteOracleDisagreement(
+              kernelName, threadLoopUnsupportedDetail);
+          errs() << "transpiler: post-raise abort: " << f.format << " on '"
+                 << f.mnemonic << "' — " << f.detail << "\n";
+          result.failure = std::move(f);
+          return result;
+        }
         errs() << "transpiler: post-raise fallback: retrying kernel '"
                << kernelName
                << "' under ThreadLoopProjection after SGPR-forced cross-lane "
