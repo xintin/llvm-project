@@ -2049,6 +2049,34 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  if (sop == SemOp::V_MAX_I64 || sop == SemOp::V_MAX_U64 ||
+      sop == SemOp::V_MIN_I64 || sop == SemOp::V_MIN_U64) {
+    Value *s0 = op.src64(0), *s1 = op.src64(1);
+    if (s0->getType() != ctx.i64Ty)
+      s0 = ctx.B.CreateBitOrPointerCast(s0, ctx.i64Ty);
+    if (s1->getType() != ctx.i64Ty)
+      s1 = ctx.B.CreateBitOrPointerCast(s1, ctx.i64Ty);
+    Value *cmp = nullptr;
+    switch (sop) {
+    case SemOp::V_MAX_I64:
+      cmp = ctx.B.CreateICmpSGT(s0, s1);
+      break;
+    case SemOp::V_MAX_U64:
+      cmp = ctx.B.CreateICmpUGT(s0, s1);
+      break;
+    case SemOp::V_MIN_I64:
+      cmp = ctx.B.CreateICmpSLT(s0, s1);
+      break;
+    case SemOp::V_MIN_U64:
+      cmp = ctx.B.CreateICmpULT(s0, s1);
+      break;
+    default:
+      llvm_unreachable("not a 64-bit integer min/max SemOp");
+    }
+    ctx.writeReg64(op.dst(), ctx.B.CreateSelect(cmp, s0, s1, "vminmax64"));
+    hr.handled = true;
+    return hr;
+  }
   // gfx1250 V_MUL_U64: VOP2 64-bit unsigned multiply producing the low
   // 64 bits of (s0 * s1). Mirrors the V_ADD_NC_U64 shape.
   if (sop == SemOp::V_MUL_U64) {

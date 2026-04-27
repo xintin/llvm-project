@@ -281,6 +281,7 @@ set(TEST_SOURCES
   tests/kernarg_layout_test.cpp
   tests/mc_context_inline_srcmgr_test.cpp
   tests/mxfp4_dequant_test.cpp
+  tests/opcode_map_test.cpp
   tests/tdm_gpu_test.cpp
   tests/translation_cache_test.cpp
   tests/wave_projection_test.cpp

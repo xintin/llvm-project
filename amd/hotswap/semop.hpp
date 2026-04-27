@@ -578,6 +578,11 @@ enum class SemOp : uint16_t {
   // immediate or a producer that already masks).
   V_LSHRREV_B64, V_ASHRREV_I64,
   V_LSHL_ADD_U64, V_ADD_NC_U64,
+  // gfx1250 VOP3 64-bit integer min/max.  These are pure per-lane
+  // compare-and-select operations: signed forms use i64 ordering, unsigned
+  // forms use u64 ordering.  They do not consult MODE and have no NaN,
+  // signed-zero, denorm/FTZ, or rounding behaviour.
+  V_MAX_I64, V_MAX_U64, V_MIN_I64, V_MIN_U64,
   // gfx1250 VOP2 64-bit unsigned multiply (low 64 bits of s0 * s1).
   V_MUL_U64,
   V_MAD_U64_U32, V_MAD_CO_U64_U32,

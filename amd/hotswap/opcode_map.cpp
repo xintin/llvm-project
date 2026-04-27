@@ -608,6 +608,13 @@ static const Entry kCanonTable[] = {
     E(V_LSHL_ADD_U64_e64, V_LSHL_ADD_U64),
     // LLVM's 64-bit no-carry add pseudo is simply `V_ADD_U64_e64`.
     E(V_ADD_U64_e64, V_ADD_NC_U64),
+    // gfx1250 VOP3 64-bit integer min/max.  VOP3Instructions.td attaches
+    // smax/umax/smin/umin patterns respectively; the handler mirrors the
+    // manual's compare-and-select semantics on the full i64 lane value.
+    E(V_MAX_I64_e64, V_MAX_I64),
+    E(V_MAX_U64_e64, V_MAX_U64),
+    E(V_MIN_I64_e64, V_MIN_I64),
+    E(V_MIN_U64_e64, V_MIN_U64),
     // gfx1250 VOP2 V_MUL_U64; canonicalizer collapses `_gfx1250` suffix
     // onto the bare `V_MUL_U64_e64` pseudo.
     E(V_MUL_U64_e64, V_MUL_U64),
