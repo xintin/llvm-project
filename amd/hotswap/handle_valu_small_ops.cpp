@@ -3,15 +3,59 @@
 #include "semop.hpp"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "Utils/AMDGPUBaseInfo.h"
 
 using namespace llvm;
 
 namespace transpiler {
+
+namespace {
+
+bool readNamedImm(const DecodedInst &di, AMDGPU::OpName name, int64_t &out) {
+  int idx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(), name);
+  if (idx < 0 || static_cast<unsigned>(idx) >= di.inst.getNumOperands())
+    return false;
+  const MCOperand &op = di.inst.getOperand(static_cast<unsigned>(idx));
+  if (!op.isImm())
+    return false;
+  out = op.getImm();
+  return true;
+}
+
+bool requireDefaultPseudoScalarOutputMods(const DecodedInst &di,
+                                          HandlerResult &hr) {
+  int64_t clamp = 0;
+  int64_t omod = 0;
+  if (!readNamedImm(di, AMDGPU::OpName::clamp, clamp) ||
+      !readNamedImm(di, AMDGPU::OpName::omod, omod)) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOP3",
+        (Twine(semOpName(di.semOp)) +
+         " missing immediate clamp/omod operands; operand table layout does "
+         "not match the gfx12 VOP3 pseudo-scalar profile")
+            .str());
+    return false;
+  }
+  if (clamp != 0 || omod != 0) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOP3",
+        (Twine(semOpName(di.semOp)) +
+         " with non-default clamp/omod is not yet lifted; the base "
+         "instruction is supported through an AMDGPU hardware intrinsic, but "
+         "output modifier semantics must not be silently dropped")
+            .str());
+    return false;
+  }
+  return true;
+}
+
+} // namespace
 
 // "Small ops": conversions (F32↔{U,I}32, F16↔F32, F16↔{U,I}16, byte
 // extract), F16 two-src arith (add/sub/mul/min/max/mac/fmac), packed
@@ -353,28 +397,57 @@ HandlerResult handleVALU_SmallOps(RaiseContext &ctx, const DecodedInst &di,
   }
 
   // ---- F32 single-src transcendentals / rounding ----
-  case SemOp::V_RCP_IFLAG_F32:
-  case SemOp::V_RCP_F32: {
+  case SemOp::V_RCP_IFLAG_F32: {
     Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
     Value *r = ctx.B.CreateFDiv(ConstantFP::get(ctx.f32Ty, 1.0), s, "rcp");
     ctx.writeReg32(op.dst(), ctx.B.CreateBitCast(r, ctx.i32Ty));
     hr.handled = true;
     return hr;
   }
+  case SemOp::V_RCP_F32:
+  case SemOp::V_S_RCP_F32: {
+    if (di.semOp == SemOp::V_S_RCP_F32 &&
+        !requireDefaultPseudoScalarOutputMods(di, hr))
+      return hr;
+    Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
+    Function *rcpFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::amdgcn_rcp, {ctx.f32Ty});
+    ctx.writeReg32(op.dst(),
+                   ctx.B.CreateBitCast(
+                       ctx.B.CreateCall(rcpFn, {s}, "rcp"), ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
   case SemOp::V_EXP_F32: {
     Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
     Function *exp2Fn = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::exp2, {ctx.f32Ty});
+        &ctx.M, Intrinsic::amdgcn_exp2, {ctx.f32Ty});
     ctx.writeReg32(op.dst(),
                    ctx.B.CreateBitCast(
                        ctx.B.CreateCall(exp2Fn, {s}, "exp"), ctx.i32Ty));
     hr.handled = true;
     return hr;
   }
-  case SemOp::V_LOG_F32: {
+  case SemOp::V_S_EXP_F32: {
+    if (!requireDefaultPseudoScalarOutputMods(di, hr))
+      return hr;
+    Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
+    Function *exp2Fn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::amdgcn_exp2, {ctx.f32Ty});
+    ctx.writeReg32(op.dst(),
+                   ctx.B.CreateBitCast(
+                       ctx.B.CreateCall(exp2Fn, {s}, "s_exp"), ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
+  case SemOp::V_LOG_F32:
+  case SemOp::V_S_LOG_F32: {
+    if (di.semOp == SemOp::V_S_LOG_F32 &&
+        !requireDefaultPseudoScalarOutputMods(di, hr))
+      return hr;
     Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
     Function *log2Fn = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::log2, {ctx.f32Ty});
+        &ctx.M, Intrinsic::amdgcn_log, {ctx.f32Ty});
     ctx.writeReg32(op.dst(),
                    ctx.B.CreateBitCast(
                        ctx.B.CreateCall(log2Fn, {s}, "log"), ctx.i32Ty));
@@ -393,26 +466,31 @@ HandlerResult handleVALU_SmallOps(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
-  case SemOp::V_SQRT_F32: {
+  case SemOp::V_SQRT_F32:
+  case SemOp::V_S_SQRT_F32: {
+    if (di.semOp == SemOp::V_S_SQRT_F32 &&
+        !requireDefaultPseudoScalarOutputMods(di, hr))
+      return hr;
     Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
     Function *sqrtFn = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::sqrt, {ctx.f32Ty});
+        &ctx.M, Intrinsic::amdgcn_sqrt, {ctx.f32Ty});
     ctx.writeReg32(op.dst(),
                    ctx.B.CreateBitCast(
                        ctx.B.CreateCall(sqrtFn, {s}, "sqrt"), ctx.i32Ty));
     hr.handled = true;
     return hr;
   }
-  case SemOp::V_RSQ_F32: {
+  case SemOp::V_RSQ_F32:
+  case SemOp::V_S_RSQ_F32: {
+    if (di.semOp == SemOp::V_S_RSQ_F32 &&
+        !requireDefaultPseudoScalarOutputMods(di, hr))
+      return hr;
     Value *s = ctx.B.CreateBitCast(op.srcF(0), ctx.f32Ty);
-    Function *sqrtFn = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::sqrt, {ctx.f32Ty});
-    Value *sq = ctx.B.CreateCall(sqrtFn, {s}, "sqrt");
+    Function *rsqFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::amdgcn_rsq, {ctx.f32Ty});
     ctx.writeReg32(op.dst(),
                    ctx.B.CreateBitCast(
-                       ctx.B.CreateFDiv(ConstantFP::get(ctx.f32Ty, 1.0),
-                                        sq, "rsq"),
-                       ctx.i32Ty));
+                       ctx.B.CreateCall(rsqFn, {s}, "rsq"), ctx.i32Ty));
     hr.handled = true;
     return hr;
   }

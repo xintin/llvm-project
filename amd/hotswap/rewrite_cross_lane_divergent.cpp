@@ -122,10 +122,14 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   case Intrinsic::amdgcn_cvt_scale_pk8_bf16_fp4:
   case Intrinsic::amdgcn_class:
   case Intrinsic::amdgcn_rcp:
+  case Intrinsic::amdgcn_rsq:
+  case Intrinsic::amdgcn_sqrt:
   case Intrinsic::amdgcn_sffbh:
   case Intrinsic::amdgcn_div_fixup:
   case Intrinsic::amdgcn_div_fmas:
   case Intrinsic::amdgcn_div_scale:
+  case Intrinsic::amdgcn_exp2:
+  case Intrinsic::amdgcn_log:
   // Cross-lane primitives the rewrite also rewrites in this same
   // pass: their post-rewrite shape is `select` / `ds_bpermute`, both
   // VGPR-safe. We can treat them as VGPR-safe propagators pre-
@@ -177,10 +181,10 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   //     see AMDGPUCombinerHelper.cpp).  Per-lane, all-VGPR.  Shows
   //     up in Triton's reduction prologues when the source is the
   //     absolute-value form of a norm.
-  //   * `@llvm.exp2.f32` / `@llvm.log2.f32` → `v_exp_f32` /
-  //     `v_log_f32` (VOP1).  Softmax's exponentiation and the
-  //     `pow` / `log` decomposition both route here.  Per-lane,
-  //     all-VGPR.
+  //   * `@llvm.exp2.f32` / `@llvm.log2.f32` and the hardware-specialized
+  //     `@llvm.amdgcn.exp2.f32` / `@llvm.amdgcn.log.f32` → `v_exp_f32` /
+  //     `v_log_f32` (VOP1).  Softmax's exponentiation and the `pow` / `log`
+  //     decomposition both route here.  Per-lane, all-VGPR.
   //   * `@llvm.floor.f32` / `@llvm.ceil.f32` / `@llvm.trunc.f32` /
   //     `@llvm.rint.f32` / `@llvm.round.f32` / `@llvm.nearbyint.f32`
   //     → `v_floor_f32` / `v_ceil_f32` / `v_trunc_f32` /
