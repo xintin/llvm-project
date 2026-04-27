@@ -361,6 +361,30 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // Scalar IEEE-754-2019 maximumNumber/minimumNumber. LLVM's canonical pseudo
+  // is `S_{MAX,MIN}_F32`; `instruction_manual.pdf` §4.5.39/§4.5.45 names the
+  // gfx12+ real mnemonics `s_max_num_f32` / `s_min_num_f32`, with `s_max_f32`
+  // / `s_min_f32` accepted as compatibility aliases. The manual's pseudocode
+  // favors a numeric operand over NaN (including signaling NaN after setting
+  // invalid), quiets all-NaN results, and orders signed zeros (+0 > -0 for
+  // max, -0 < +0 for min). LLVM's `maximumnum` / `minimumnum` intrinsics model
+  // that NUM family; the NaN-propagating
+  // `maximum` / `minimum` intrinsics are for the separate S_MAXIMUM_F32 /
+  // S_MINIMUM_F32 opcode family and must not be used here.
+  if (sop == SemOp::S_MAX_NUM_F32 || sop == SemOp::S_MIN_NUM_F32) {
+    Value *s0 = ctx.B.CreateBitCast(op.src(0), ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(op.src(1), ctx.f32Ty);
+    Intrinsic::ID iid = (sop == SemOp::S_MAX_NUM_F32) ? Intrinsic::maximumnum
+                                                      : Intrinsic::minimumnum;
+    const char *name = (sop == SemOp::S_MAX_NUM_F32) ? "s_fmax_num"
+                                                     : "s_fmin_num";
+    Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, iid, {ctx.f32Ty});
+    ctx.regs.writeReg32(ctx.B, op.dst(),
+                        ctx.B.CreateBitCast(ctx.B.CreateCall(fn, {s0, s1}, name),
+                                            ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
   // GFX12 scalar 64-bit ops
   if (sop == SemOp::S_MUL_U64) {
     ctx.regs.writeReg64(ctx.B, op.dst(),

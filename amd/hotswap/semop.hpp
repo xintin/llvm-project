@@ -285,6 +285,14 @@ enum class SemOp : uint16_t {
   S_ABSDIFF_I32,
   S_LSHL_B32, S_LSHL_B64, S_LSHR_B32, S_LSHR_B64, S_ASHR_I32, S_ASHR_I64,
   S_MUL_I32, S_MUL_HI_U32, S_MUL_HI_I32, S_MUL_U64, S_MUL_F32, S_ADD_F32, S_SUB_F32,
+  // Scalar IEEE-754-2019 maximumNumber/minimumNumber. LLVM's canonical pseudo
+  // is `S_{MAX,MIN}_F32`; gfx12+ manuals name the real mnemonics
+  // `s_{max,min}_num_f32` and keep `s_{max,min}_f32` as compatibility aliases.
+  // Semantics favor a numeric operand over NaN (including signaling NaN after
+  // raising invalid) and order signed zeros (+0 > -0 for max, -0 < +0 for min),
+  // matching LLVM's `maximumnum` / `minimumnum` intrinsic contract without
+  // fast-math flags.
+  S_MAX_NUM_F32, S_MIN_NUM_F32,
   S_BFE_U32, S_BFE_I32, S_BFM_B32, S_BFM_B64,
   S_CSELECT_B32, S_CSELECT_B64,
   S_MIN_I32, S_MIN_U32, S_MAX_I32, S_MAX_U32,
