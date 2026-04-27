@@ -1070,8 +1070,9 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // so as long as we emit the right type at the right cumulative
   // offset, the buffer layout matches the runtime's packing.
   //
-  // Three slot shapes are emitted:
+  // Slot shapes emitted:
   //   * `global_buffer` (size==8) → ptr addrspace(1).
+  //   * non-pointer `by_value` size==1/2 → i8/i16.
   //   * non-pointer `by_value` size==4 → i32.
   //   * non-pointer `by_value` size==8 → i64.
   //   * non-pointer `by_value` size > 8 (and divisible by 4, i.e. an
@@ -1084,9 +1085,9 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   //     per-dword split also makes SMEM kernarg loads against the
   //     interior of the struct addressable through `extractKernargDword`
   //     in handle_smem.cpp without needing any aggregate-aware extract
-  //     logic. Sizes that are not 4, 8, or a multiple of 4 are refused
-  //     loudly: they would require partial-dword extraction that no
-  //     current handler supports, and the no-fallback rule applies.
+  //     logic. Other odd sizes are refused loudly: they would require
+  //     aggregate extraction with a non-dword tail that no current
+  //     handler supports, and the no-fallback rule applies.
   //
   // Test back-reference: lit_tests/s_load_b96_kernarg/ pins the i32
   // slot signature this branch produces for a 16-byte by_value
@@ -1111,6 +1112,18 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
             Twine(arg.size) + " (expected 8)");
       paramTypes.push_back(ptrGlobalTy);
       kernargs.params.push_back({arg.offset, 8, paramIdx, true});
+      paramIdx++;
+      continue;
+    }
+    if (arg.size == 1) {
+      paramTypes.push_back(Type::getInt8Ty(C));
+      kernargs.params.push_back({arg.offset, 1, paramIdx, false});
+      paramIdx++;
+      continue;
+    }
+    if (arg.size == 2) {
+      paramTypes.push_back(Type::getInt16Ty(C));
+      kernargs.params.push_back({arg.offset, 2, paramIdx, false});
       paramIdx++;
       continue;
     }
@@ -1139,8 +1152,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     report_fatal_error(
         Twine("transpiler: kernel '") + kernelName + "' arg '" +
         arg.name + "' has unsupported by_value size=" + Twine(arg.size) +
-        " (expected 4, 8, or a positive multiple of 4); partial-dword "
-        "kernarg extraction is not modelled and silent rounding is "
+        " (expected 1, 2, 4, 8, or a positive multiple of 4); non-dword-tail "
+        "aggregate kernarg extraction is not modelled and silent rounding is "
         "rejected by the no-fallback rule.");
   }
   kernargs.implicitArgsBase = meta.implicitArgsBase();

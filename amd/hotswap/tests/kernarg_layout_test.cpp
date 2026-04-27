@@ -1,12 +1,22 @@
 #include "../kernarg_layout.hpp"
 
 #include "gtest/gtest.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
 
+#include <initializer_list>
+#include <string>
 #include <vector>
 
 using transpiler::KernelArgMeta;
+using transpiler::KernargLayout;
 using transpiler::PreloadedHiddenKernargDword;
 using transpiler::classifyPreloadedHiddenKernargDword;
+using transpiler::extractKernargDword;
 
 namespace {
 KernelArgMeta makeArg(const char *name, int offset, int size,
@@ -18,6 +28,25 @@ KernelArgMeta makeArg(const char *name, int offset, int size,
   arg.valueKind = valueKind;
   return arg;
 }
+
+struct KernargDwordFixture {
+  llvm::LLVMContext C;
+  llvm::Module M{"kernarg_layout_test", C};
+  llvm::IRBuilder<> B{C};
+  llvm::Function *F = nullptr;
+
+  KernargDwordFixture(std::initializer_list<unsigned> argWidths) {
+    std::vector<llvm::Type *> argTypes;
+    for (unsigned width : argWidths)
+      argTypes.push_back(llvm::Type::getIntNTy(C, width));
+    auto *fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(C), argTypes,
+                                         false);
+    F = llvm::Function::Create(fnTy, llvm::GlobalValue::ExternalLinkage,
+                               "kernel", M);
+    auto *bb = llvm::BasicBlock::Create(C, "entry", F);
+    B.SetInsertPoint(bb);
+  }
+};
 } // namespace
 
 TEST(KernargLayout, ClassifiesPreloadedHiddenBlockCounts) {
@@ -54,4 +83,56 @@ TEST(KernargLayout, NonHiddenAndMissingOffsetsAreNotHidden) {
             PreloadedHiddenKernargDword::NotHidden);
   EXPECT_EQ(classifyPreloadedHiddenKernargDword(args, 28),
             PreloadedHiddenKernargDword::NotHidden);
+}
+
+TEST(KernargLayout, ExtractsDwordFromI32SlotWithoutRepacking) {
+  KernargDwordFixture ir({32});
+  KernargLayout layout;
+  layout.params.push_back({0, 4, 0, false});
+  layout.kernargSegmentSize = 4;
+
+  std::string why;
+  llvm::Value *value = extractKernargDword(layout, ir.B, ir.F, 0, &why);
+
+  ASSERT_NE(value, nullptr) << why;
+  EXPECT_EQ(value, ir.F->getArg(0));
+}
+
+TEST(KernargLayout, ExtractsDwordContainingNarrowScalarAndPadding) {
+  KernargDwordFixture ir({8});
+  KernargLayout layout;
+  layout.params.push_back({0, 1, 0, false});
+  layout.kernargSegmentSize = 4;
+
+  std::string why;
+  llvm::Value *value = extractKernargDword(layout, ir.B, ir.F, 0, &why);
+
+  ASSERT_NE(value, nullptr) << why;
+  EXPECT_TRUE(value->getType()->isIntegerTy(32));
+  EXPECT_NE(llvm::dyn_cast<llvm::Argument>(value), ir.F->getArg(0));
+}
+
+TEST(KernargLayout, RefusesNarrowScalarCrossingDwordBoundary) {
+  KernargDwordFixture ir({16});
+  KernargLayout layout;
+  layout.params.push_back({3, 2, 0, false});
+  layout.kernargSegmentSize = 8;
+
+  std::string why;
+  llvm::Value *value = extractKernargDword(layout, ir.B, ir.F, 0, &why);
+
+  EXPECT_EQ(value, nullptr);
+  EXPECT_NE(why.find("cross-dword scalar extraction"), std::string::npos);
+}
+
+TEST(KernargLayout, TreatsVectorLoadDwordAtSegmentEndAsUndefPadding) {
+  KernargDwordFixture ir({});
+  KernargLayout layout;
+  layout.kernargSegmentSize = 36;
+
+  std::string why;
+  llvm::Value *value = extractKernargDword(layout, ir.B, ir.F, 36, &why);
+
+  ASSERT_NE(value, nullptr) << why;
+  EXPECT_TRUE(llvm::isa<llvm::UndefValue>(value));
 }

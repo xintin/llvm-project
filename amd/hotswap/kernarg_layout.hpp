@@ -14,9 +14,10 @@ namespace transpiler {
 struct KernargParam {
   // Byte offset within the kernarg segment.
   int byteOffset;
-  // Width of the slot in bytes. Always one of {4, 8}: pointer / i64 slots
-  // are 8 bytes, every other slot (including the per-dword decomposition
-  // of `by_value` aggregates with size > 8) is 4 bytes. The
+  // Width of the slot in bytes. Pointers / i64 slots are 8 bytes, narrow
+  // scalar `by_value` slots may be 1 or 2 bytes, and every other slot
+  // (including the per-dword decomposition of `by_value` aggregates with
+  // size > 8) is 4 bytes. The
   // raiser is responsible for splitting any larger `by_value` aggregate
   // into 4-byte i32 slots so the IR-level kernarg buffer layout matches
   // the source binary's byte layout. See raiser.cpp for the splitter.
@@ -63,9 +64,11 @@ struct KernargLayout {
 // Materialise the i32 dword that lives at `byteOffset` in the kernarg
 // segment, by extracting it from the matching IR-level Function arg.
 //
-// Handles the three slot shapes that `KernargLayout::params` records:
-//   * i32 slot at the requested offset → return the arg directly.
-//   * i64 / pointer slot covering [p.byteOffset, p.byteOffset+8) →
+// Handles the slot shapes that `KernargLayout::params` records:
+//   * i32 slot at the requested offset -> return the arg directly.
+//   * i8 / i16 slots inside the requested dword -> insert the known low
+//     bytes and leave padding/uncovered bytes undefined.
+//   * i64 / pointer slot covering [p.byteOffset, p.byteOffset+8) ->
 //     return either the low or high dword via lshr+trunc.
 //
 // Returns the materialised i32 Value on success.  On failure returns
