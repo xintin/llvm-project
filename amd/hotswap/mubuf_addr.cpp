@@ -45,6 +45,7 @@ struct MubufOps {
   bool haveSrsrc = false;
   bool haveVaddr = false;
   bool haveSoff = false;
+  bool hasSwz = false;
 };
 
 MubufOps classifyMubufOps(const DecodedInst &di, OpResolver &op,
@@ -62,6 +63,15 @@ MubufOps classifyMubufOps(const DecodedInst &di, OpResolver &op,
       static_cast<unsigned>(offIdx) < di.inst.getNumOperands() &&
       di.inst.getOperand(static_cast<unsigned>(offIdx)).isImm()) {
     out.immOff = di.inst.getOperand(static_cast<unsigned>(offIdx)).getImm();
+  }
+
+  int swzIdx =
+      llvm::AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                       llvm::AMDGPU::OpName::swz);
+  if (swzIdx >= 0 &&
+      static_cast<unsigned>(swzIdx) < di.inst.getNumOperands() &&
+      di.inst.getOperand(static_cast<unsigned>(swzIdx)).isImm()) {
+    out.hasSwz = di.inst.getOperand(static_cast<unsigned>(swzIdx)).getImm() != 0;
   }
 
   int vgprSrcCount = 0;
@@ -93,14 +103,9 @@ MubufOps classifyMubufOps(const DecodedInst &di, OpResolver &op,
   return out;
 }
 
-// Read the three consecutive SGPR dwords of a MUBUF/VBUFFER SRSRC
-// 128-bit tuple. The fourth word is always 0 (raw buffer, TYPE=0, no
-// format conversion) so we don't need to read it from the register
-// file.
-//
-// Returns the raw dwords (dw0 = base_lo, dw1 = base_hi bits plus
-// stride/flags, dw2 = num_records); callers that only need the
-// packaged raw-buffer descriptor should use `buildMubufSRD` below.
+// Read the four consecutive SGPR dwords of a MUBUF/VBUFFER SRSRC
+// 128-bit tuple. Returns the raw source dwords; callers that only need
+// the packaged raw-buffer descriptor should use `buildMubufSRD` below.
 //
 // No null-check on the returned Value*s: `AllocaRegFile::readReg32`
 // already fails loudly on unhandled ParsedReg kinds and out-of-range
@@ -110,26 +115,39 @@ struct SRSRCDwords {
   Value *dw0;
   Value *dw1;
   Value *dw2;
+  Value *dw3;
 };
 
 SRSRCDwords readSRSRCDwords(RaiseContext &ctx, ParsedReg srsrc) {
   Value *dw0 = ctx.regs.readReg32(ctx.B, srsrc);
   ParsedReg srsrc1 = srsrc; srsrc1.baseIdx = srsrc.baseIdx + 1;
   ParsedReg srsrc2 = srsrc; srsrc2.baseIdx = srsrc.baseIdx + 2;
+  ParsedReg srsrc3 = srsrc; srsrc3.baseIdx = srsrc.baseIdx + 3;
   Value *dw1 = ctx.regs.readReg32(ctx.B, srsrc1);
   Value *dw2 = ctx.regs.readReg32(ctx.B, srsrc2);
-  return {dw0, dw1, dw2};
+  Value *dw3 = ctx.regs.readReg32(ctx.B, srsrc3);
+  return {dw0, dw1, dw2, dw3};
+}
+
+bool constantI32(Value *v, uint32_t &out) {
+  if (auto *ci = dyn_cast<ConstantInt>(v)) {
+    out = static_cast<uint32_t>(ci->getZExtValue());
+    return true;
+  }
+  return false;
 }
 
 // Build a gfx942-compatible raw buffer descriptor <4 x i32> from the
-// three SRSRC dwords. Each word is routed through
+// source SRSRC dwords. Each word is routed through
 // `amdgcn.readfirstlane` so it lands in an SGPR — the backend would
 // otherwise emit a waterfall loop around the intrinsic call.
 //
-// dw3 (RSRC3) is synthesised rather than read from the source SGPRs:
-// the gfx1250 source V# layout does not carry the gfx942 DATA_FORMAT /
-// NUM_FORMAT bits in the same positions, so pass-through would put
-// junk (or, more often, zero) into gfx942's format field.
+// dw1/dw2/dw3 are target-normalised rather than blindly copied from the
+// source SGPRs. gfx1250 raw-pointer descriptors carry high descriptor
+// marker bits alongside the base-high dword and use a compact
+// NUM_RECORDS sentinel that is not gfx942's raw-buffer maximum, while
+// gfx942 still needs a non-invalid DATA_FORMAT in RSRC3 for stores to
+// commit.
 //
 // Why dw3 must not be zero on gfx942: empirically
 // `buffer_store_dword` (and the other MUBUF raw-store flavours) on
@@ -152,21 +170,103 @@ SRSRCDwords readSRSRCDwords(RaiseContext &ctx, ParsedReg srsrc) {
 //   dw3=0x00000004  DROP    DST_SEL_X identity, DATA_FORMAT=0
 //   dw3=0x00000000  DROP    (what we used to emit)
 //
-// We pick 0x00020000 (DATA_FORMAT=32, NUM_FORMAT=0=UNORM) as the
-// minimum value that unblocks raw stores: it does not set NUM_FORMAT,
-// so a latent raised typed-read would fail loudly (NUM_FORMAT=UNORM
-// on a read would return integer-as-unorm garbage and the per-op
-// CPU-ref comparator would catch it) rather than silently compute
-// the wrong answer.
+// Use Triton's native gfx942 raw-buffer sentinels, narrowly:
+//
+//   RSRC2 = 0x7ffffffe  NUM_RECORDS, the largest 4-byte-aligned byte
+//                       bound used by native gfx942 Triton for raw
+//                       pointer-derived descriptors.
+//   RSRC3 = 0x00027000  FORMAT_32 + NUM_FORMAT_FLOAT.
+//
+// The source descriptor value 0x00ffffff is the gfx1250 raw-pointer
+// "effectively unbounded" sentinel Triton emits for these JIT MUBUF
+// descriptors. Passing it through to gfx942 bounds the buffer to 16 MiB,
+// so GPT-OSS decode_attention._fwd_kernel_stage2's `Mid_O` loads for
+// batches >= 64 were hardware-OOB and returned zero. Map that sentinel
+// to gfx942's native raw-buffer maximum, but preserve every other
+// NUM_RECORDS value exactly. That keeps finite source bounds finite
+// instead of turning real source-OOB accesses into target in-bounds
+// accesses. A true all-ones source value (0xffffffff, OOB disabled per
+// the buffer-resource contract) is also preserved.
+//
+// The previous DATA_FORMAT-only RSRC3 value (0x00020000) is sufficient
+// for the original dword-store probe, but native gfx942 Triton uses
+// FORMAT_32 + NUM_FORMAT_FLOAT for the same raw store family; the raw
+// intrinsics still move the explicitly typed payload bits without
+// numeric conversion.
 Value *buildMubufSRD(RaiseContext &ctx, const SRSRCDwords &dw) {
+  constexpr uint32_t kGfx1250RawPointerWord1Bits = 0xfc000000u;
+  constexpr uint32_t kGfx1250RawBufferMaxRecords = 0x00ffffffu;
+  constexpr uint32_t kGfx942RawBufferMaxRecords = 0x7ffffffeu;
+  constexpr uint32_t kGfx942RawBufferFormat32 = 0x00020000u;
+  constexpr uint32_t kGfx942RawBufferFormat32Uint = 0x00024000u;
+  constexpr uint32_t kGfx942RawBufferFormat32Float = 0x00027000u;
+
   Function *readfirstlane = Intrinsic::getOrInsertDeclaration(
       &ctx.M, Intrinsic::amdgcn_readfirstlane, {ctx.i32Ty});
+  Value *dw1NonBaseBits =
+      ctx.B.CreateAnd(dw.dw1, ConstantInt::get(ctx.i32Ty, 0xFFFF0000u),
+                      "srd_dw1_nonbase_bits");
+  Value *dw1HasOnlyBase =
+      ctx.B.CreateICmpEQ(dw1NonBaseBits, ConstantInt::get(ctx.i32Ty, 0),
+                         "srd_dw1_only_base");
+  Value *dw1HasGfx125RawBits =
+      ctx.B.CreateICmpEQ(dw1NonBaseBits,
+                         ConstantInt::get(ctx.i32Ty, kGfx1250RawPointerWord1Bits),
+                         "srd_dw1_gfx125_raw_bits");
+  Value *dw1IsRawBase =
+      ctx.B.CreateOr(dw1HasOnlyBase, dw1HasGfx125RawBits, "srd_dw1_raw_base");
+  Value *dw3IsZero =
+      ctx.B.CreateICmpEQ(dw.dw3, ConstantInt::get(ctx.i32Ty, 0), "srd_dw3_zero");
+  Value *dw3IsFormat32 =
+      ctx.B.CreateICmpEQ(dw.dw3, ConstantInt::get(ctx.i32Ty, kGfx942RawBufferFormat32),
+                         "srd_dw3_format32");
+  Value *dw3IsFormat32Uint =
+      ctx.B.CreateICmpEQ(dw.dw3,
+                         ConstantInt::get(ctx.i32Ty, kGfx942RawBufferFormat32Uint),
+                         "srd_dw3_format32_uint");
+  Value *dw3IsFormat32Float =
+      ctx.B.CreateICmpEQ(dw.dw3,
+                         ConstantInt::get(ctx.i32Ty, kGfx942RawBufferFormat32Float),
+                         "srd_dw3_format32_float");
+  Value *dw3IsRaw =
+      ctx.B.CreateOr(ctx.B.CreateOr(dw3IsZero, dw3IsFormat32),
+                     ctx.B.CreateOr(dw3IsFormat32Uint, dw3IsFormat32Float),
+                     "srd_dw3_raw_shape");
+  Value *rawPointerShape =
+      ctx.B.CreateAnd(dw1IsRawBase, dw3IsRaw, "srd_raw_pointer_shape");
+
+  uint32_t dw1Const = 0;
+  if (constantI32(dw.dw1, dw1Const) && (dw1Const & 0xFFFF0000u) != 0 &&
+      (dw1Const & 0xFFFF0000u) != kGfx1250RawPointerWord1Bits) {
+    report_fatal_error("transpiler: MUBUF: unsupported non-raw SRSRC "
+                       "descriptor: source word1 contains structured/"
+                       "swizzled fields that the raw-buffer lowering cannot "
+                       "preserve");
+  }
+  uint32_t dw3Const = 0;
+  if (constantI32(dw.dw3, dw3Const) && dw3Const != 0 &&
+      dw3Const != kGfx942RawBufferFormat32 &&
+      dw3Const != kGfx942RawBufferFormat32Uint &&
+      dw3Const != kGfx942RawBufferFormat32Float) {
+    report_fatal_error("transpiler: MUBUF: unsupported non-raw SRSRC "
+                       "descriptor: source word3 is not a raw-buffer "
+                       "FORMAT_32 descriptor shape");
+  }
+
   Value *cleanDw1 = ctx.B.CreateAnd(dw.dw1,
                                      ConstantInt::get(ctx.i32Ty, 0xFFFF));
   Value *srdW0 = ctx.B.CreateCall(readfirstlane, {dw.dw0}, "srd_w0");
   Value *srdW1 = ctx.B.CreateCall(readfirstlane, {cleanDw1}, "srd_w1");
-  Value *srdW2 = ctx.B.CreateCall(readfirstlane, {dw.dw2}, "srd_w2");
-  Value *word3 = ConstantInt::get(ctx.i32Ty, 0x00020000);
+  Value *sourceMax = ConstantInt::get(ctx.i32Ty, kGfx1250RawBufferMaxRecords);
+  Value *targetMax = ConstantInt::get(ctx.i32Ty, kGfx942RawBufferMaxRecords);
+  Value *isSourceMax = ctx.B.CreateICmpEQ(dw.dw2, sourceMax, "srd_is_gfx125_max");
+  Value *shouldMapMax =
+      ctx.B.CreateAnd(isSourceMax, rawPointerShape, "srd_map_gfx125_max");
+  Value *mappedDw2 = ctx.B.CreateSelect(shouldMapMax, targetMax, dw.dw2,
+                                        "srd_num_records");
+  Value *srdW2 =
+      ctx.B.CreateCall(readfirstlane, {mappedDw2}, "srd_w2");
+  Value *word3 = ConstantInt::get(ctx.i32Ty, kGfx942RawBufferFormat32Float);
   Value *srd = UndefValue::get(FixedVectorType::get(ctx.i32Ty, 4));
   srd = ctx.B.CreateInsertElement(srd, srdW0, static_cast<uint64_t>(0));
   srd = ctx.B.CreateInsertElement(srd, srdW1, static_cast<uint64_t>(1));
@@ -191,6 +291,11 @@ MubufAddr decodeMubufAddr(RaiseContext &ctx, const DecodedInst &di,
   }
 
   MubufAddr out;
+  if (m.hasSwz) {
+    report_fatal_error(Twine("transpiler: ") + diagLabel +
+                       ": swizzled buffer addressing is unsupported "
+                       "by the raw-buffer lowering");
+  }
   SRSRCDwords dw = readSRSRCDwords(ctx, m.srsrc);
   out.srd = buildMubufSRD(ctx, dw);
   out.stData = m.vdata;
