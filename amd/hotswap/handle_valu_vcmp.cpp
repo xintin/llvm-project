@@ -137,6 +137,14 @@ HandlerResult handleVALU_Vcmp(RaiseContext &ctx, const DecodedInst &di,
     if (m->bits == 64) {
       s0 = op.src64(0);
       s1 = op.src64(1);
+    } else if (m->bits == 16) {
+      // Integer V_CMP_*_I16/U16 operands live in the low half of the
+      // 32-bit VGPR/inline-constant container.  Compare at i16 width so
+      // signed predicates see 0xbfce as a negative bf16 bit-pattern, not as
+      // the positive i32 value 0x0000bfce.
+      auto *i16Ty = Type::getInt16Ty(ctx.C);
+      s0 = ctx.B.CreateTrunc(op.src(0), i16Ty, "vcmpi16_lo0");
+      s1 = ctx.B.CreateTrunc(op.src(1), i16Ty, "vcmpi16_lo1");
     } else {
       s0 = op.src(0);
       s1 = op.src(1);
