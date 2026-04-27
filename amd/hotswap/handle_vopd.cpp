@@ -161,6 +161,37 @@ bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
     writes.emplace_back(dst, v);
     return true;
   };
+  auto lowerBitOp3 = [&]() {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *a = readVopdSource(ctx, half.src[0], 0);
+    Value *b = readVopdSource(ctx, half.src[1], 1);
+    Value *c = ConstantInt::get(ctx.i32Ty, 0);
+    Value *na = ctx.B.CreateNot(a);
+    Value *nb = ctx.B.CreateNot(b);
+    Value *nc = ctx.B.CreateNot(c);
+    Value *minterms[8] = {
+        ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), nc),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), c),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(na, b), nc),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(na, b), c),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(a, nb), nc),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(a, nb), c),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), nc),
+        ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), c),
+    };
+    Value *result = ConstantInt::get(ctx.i32Ty, 0);
+    for (int i = 0; i < 8; ++i)
+      if (half.bitOp3 & (1u << i))
+        result = ctx.B.CreateOr(result, minterms[i]);
+    return queue(result);
+  };
+
+  // `v_dual_bitop2_b32` components carry an 8-bit `bitop3` truth table even
+  // though LLVM's canonical component opcode may look like a simple V_AND /
+  // V_OR / V_XOR. The immediate is semantic, not decoration: Triton's sort
+  // uses values such as 0x14 (xor) and 0x40 (and) in this encoding.
+  if (half.hasBitOp3)
+    return lowerBitOp3();
 
   switch (half.semOp) {
   case SemOp::V_MOV_B32: {
@@ -285,33 +316,12 @@ bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
         ctx.B.CreateCall(fn, {s0, s1}, name), ctx.i32Ty));
   }
   case SemOp::V_BITOP3_B32: {
-    if (!requireVopdSources(half, 2, di, hr)) return false;
     if (!half.hasBitOp3) {
       hr.failure = RaiseFailure::unsupportedShape(
           di, "VOPD", "VOPD bitop component missing bitop3 immediate");
       return false;
     }
-    Value *a = readVopdSource(ctx, half.src[0], 0);
-    Value *b = readVopdSource(ctx, half.src[1], 1);
-    Value *c = ConstantInt::get(ctx.i32Ty, 0);
-    Value *na = ctx.B.CreateNot(a);
-    Value *nb = ctx.B.CreateNot(b);
-    Value *nc = ctx.B.CreateNot(c);
-    Value *minterms[8] = {
-        ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), nc),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), c),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(na, b), nc),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(na, b), c),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(a, nb), nc),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(a, nb), c),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), nc),
-        ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), c),
-    };
-    Value *result = ConstantInt::get(ctx.i32Ty, 0);
-    for (int i = 0; i < 8; ++i)
-      if (half.bitOp3 & (1u << i))
-        result = ctx.B.CreateOr(result, minterms[i]);
-    return queue(result);
+    return lowerBitOp3();
   }
   default:
     hr.failure = RaiseFailure::unsupportedShape(

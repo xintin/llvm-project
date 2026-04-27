@@ -576,6 +576,35 @@ void decodeVopdHalf(DecodedInst &di, DecodedInst::VopdHalf &half,
 
   for (unsigned i = 0; i < info.getCompParsedSrcOperandsNum(); ++i)
     decodeVopdSource(di, half, info, i, MRI);
+
+  int bitOpIdx = info.getBitOp3OperandIdx();
+  if (bitOpIdx < 0 &&
+      (half.semOp == SemOp::V_AND_B32 || half.semOp == SemOp::V_OR_B32 ||
+       half.semOp == SemOp::V_XOR_B32 ||
+       half.semOp == SemOp::V_BITOP3_B32)) {
+    // Some VOPD bitop2 forms expose the bitop3 immediate only on the paired
+    // VOPD instruction, not on the canonical component pseudo (for example
+    // `V_DUAL_LSHLREV_B32_e32_X_BITOP2_B32_e64_e96_gfx1250`). LLVM
+    // canonicalizes the component to a simple bitwise SemOp, but the paired
+    // VOPD opcode name/layout still carries the authoritative BITOP2_B32
+    // truth-table operand. Use the full instruction's generated named operand
+    // rather than inferring anything from printed mnemonics.
+    bitOpIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                          AMDGPU::OpName::bitop3);
+  }
+  if (!half.hasBitOp3 && bitOpIdx >= 0) {
+    if (static_cast<unsigned>(bitOpIdx) >= inst.getNumOperands())
+      failVopdDecode(di, Twine("bitop3 operand index out of MCInst range: ") +
+                             Twine(bitOpIdx));
+    const MCOperand &mop = inst.getOperand(static_cast<unsigned>(bitOpIdx));
+    if (!mop.isImm())
+      failVopdDecode(di, "bitop3 operand is not an immediate");
+    int64_t raw = mop.getImm();
+    if (raw < 0 || raw > 0xff)
+      failVopdDecode(di, Twine("bitop3 immediate out of range: ") + Twine(raw));
+    half.hasBitOp3 = true;
+    half.bitOp3 = static_cast<uint8_t>(raw);
+  }
 }
 
 void decodeVopd(DecodedInst &di, const MCInstrInfo &MCII,
