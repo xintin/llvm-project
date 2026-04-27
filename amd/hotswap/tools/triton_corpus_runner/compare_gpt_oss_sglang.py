@@ -618,6 +618,7 @@ def main() -> int:
         extra_env={
             "SGLANG_USE_AITER": "0",
             "GPT_OSS_SGLANG_MOE_RUNNER_BACKEND": "triton_kernel",
+            "GPT_OSS_SGLANG_DECOMPOSE_MXFP4_FOR_GFX1250": "1",
             "AITER_ROOT": "/home/mluecke/aiter-sglang-v0.1.12.post1",
             "AITER_CORPUS_CONFIG_DIR": "/tmp/sglang_aiter_configs_1060",
         },

@@ -344,6 +344,13 @@ loader for Salmon transpile decisions/results. This is deliberately stronger
 than grepping stderr; a report can no longer pass merely because the
 intercept shim patched e_flags.
 
+For launch-level triage, set `HSA_SALMON_LAUNCH_LOG=/tmp/.../launch.jsonl`.
+The intercept shim then writes JSONL `hip_module_load`,
+`hip_module_get_function`, and `hip_module_launch` events with kernel name,
+module provenance, grid/block dimensions, dynamic shared memory, and whether
+the module came through the Salmon-patched gfx1250 path. Leave it unset for
+normal runs; it is diagnostic output only and does not affect launch routing.
+
 Native-MXFP4 vs forced-gfx1250 Salmon-MXFP4 comparison:
 
 ```bash
@@ -353,6 +360,48 @@ python3 compare_gpt_oss_sglang.py \
   --out-dir /tmp/gpt_oss_sglang_compare_mxfp4_native \
   --timeout 900
 ```
+
+Exact per-kernel fixture capture for follow-up correctness triage:
+
+```bash
+GPT_OSS_KERNEL_FIXTURE_DIR=/tmp/gpt_oss_kernel_fixtures \
+GPT_OSS_KERNEL_FIXTURE_FILTER='create_flashinfer_kv_indices_triton,_fused_qk_rope_reshape_and_cache_kernel,_fwd*,_topk_forward,*bitmatrix*,*ragged*,*matmul_ogs*' \
+GPT_OSS_KERNEL_FIXTURE_MAX_PER_KERNEL=1 \
+GPT_OSS_KERNEL_FIXTURE_MAX_TENSOR_BYTES=$((512 * 1024 * 1024)) \
+GPT_OSS_SGLANG_RETURN_HIDDEN_STATES=0 \
+python3 compare_gpt_oss_sglang.py \
+  --native-mxfp4 \
+  --out-dir /tmp/gpt_oss_sglang_compare_with_fixtures \
+  --timeout 900
+```
+
+The capture hook lives in `sitecustomize.py`, so it also runs in SGLang worker
+processes. It records the real Triton JIT function, launch grid, constexpr
+kwargs, and tensor argument bytes before/after each matching launch. Replay the
+captured fixtures from the correctness suite:
+
+```bash
+../compare_correctness/gpt_oss_fixture_replay.py /tmp/gpt_oss_kernel_fixtures \
+  --json /tmp/gpt_oss_kernel_fixtures/replay.jsonl
+```
+
+Build a per-run index for assigning individual kernels to owners:
+
+```bash
+../compare_correctness/gpt_oss_fixture_index.py /tmp/gpt_oss_kernel_fixtures \
+  --replay /tmp/gpt_oss_kernel_fixtures/replay.jsonl \
+  --launch /tmp/gpt_oss_sglang_compare_with_fixtures/launch.jsonl \
+  --proof /tmp/gpt_oss_sglang_compare_with_fixtures/salmon_proof.jsonl \
+  --out-dir /tmp/gpt_oss_kernel_fixtures
+```
+
+The capture/replay code is generic for Triton JIT workloads even though the
+environment variables are currently named `GPT_OSS_*`. For another model, put
+this directory on `PYTHONPATH`, set `GPT_OSS_KERNEL_FIXTURE_DIR` to a
+model-specific scratch directory, choose a `GPT_OSS_KERNEL_FIXTURE_FILTER`, run
+the model workload, then replay and index the captured fixtures from
+`tools/compare_correctness`. Do not place full-value fixtures in `/data` or
+commit them to git; they are local debug artifacts and can be many GB.
 
 To iterate without retranslating every previously successful gfx1250 code
 object, enable the Salmon translation cache with a scratch directory:
@@ -393,15 +442,25 @@ this as `salmon_cache` `status:"disabled"` with `kernel_name`.
 Current real Salmon status after the modified-kernarg-pair SMEM fix: the
 proof gate reaches the loader-side Salmon path and the first SGLang helper
 kernels translate successfully (`create_flashinfer_kv_indices_triton`, both
-captured shapes). The run still fails before generation, but the frontier has
-moved past Salmon's `s_load_b32` / `s_load_b64` refusal to a later Triton/LLD
-compile/link error:
+captured shapes). A later SGLang RoPE kernel exposed an LLVM AMDGPU metadata
+bug in forced `gfx1250` codegen:
 
 ```text
 error: amdgpu_user_sgpr_count smaller than than implied by enabled user SGPRs
 ```
 
-This is still a valid GPT-OSS end-to-end finding, not a comparison pass.
+The bad assembly requested 32 user SGPRs but printed
+`.amdhsa_user_sgpr_count 0` because the `gfx1250+` 6-bit
+`COMPUTE_PGM_RSRC2.USER_SGPR_COUNT` field was encoded through the older 5-bit
+helper. See `GFX1250_USER_SGPR_COUNT_BUG.md` for the captured artifact,
+standalone repro, and fix notes.
+
+Important: the SGLang harness uses Triton's native
+`.venv-sglang-rocm720/.../triton/_C/libtriton.so`, not the standalone `llc`
+binary. After patching LLVM, rebuild/reinstall that Triton extension against a
+matching patched LLVM and use a fresh `TRITON_CACHE_DIR` with
+`TRITON_ALWAYS_COMPILE=1`; otherwise stale cached objects or the old wheel can
+still reproduce the same linker error.
 
 ### External SGLang/AITER setup used for investigation
 

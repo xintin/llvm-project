@@ -114,3 +114,28 @@ def _patch_triton_target() -> None:
 
 
 _patch_triton_target()
+
+
+def _install_gpt_oss_kernel_fixture_capture() -> None:
+    if not os.environ.get("GPT_OSS_KERNEL_FIXTURE_DIR", "").strip():
+        return
+    try:
+        import gpt_oss_kernel_fixtures
+    except Exception as exc:
+        print(
+            "[triton_corpus_sitecustomize] cannot install GPT-OSS kernel "
+            f"fixture capture: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
+    gpt_oss_kernel_fixtures.install()
+    print(
+        "[triton_corpus_sitecustomize] GPT-OSS kernel fixture capture "
+        f"enabled at {os.environ['GPT_OSS_KERNEL_FIXTURE_DIR']}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+_install_gpt_oss_kernel_fixture_capture()

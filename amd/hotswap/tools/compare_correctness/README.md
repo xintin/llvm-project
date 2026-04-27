@@ -125,6 +125,96 @@ LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --block=64 --block=128
 LD_PRELOAD=./libsalmon_intercept.so ./compare_correctness --shape=1024 --block=128
 ```
 
+## GPT-OSS exact kernel fixtures
+
+The regular Triton sidecar recipes are still the preferred long-term home for
+small, reviewable correctness tests.  Some GPT-OSS kernels are easier to triage
+first from the exact SGLang launch that produced them: real tensor shapes,
+strides, scalar kwargs, and CUDA-graph warmup sizes.  For that workflow, the
+SGLang runner can capture exact Triton JIT launches and this directory can
+replay each fixture as an independent native-vs-Salmon correctness check.
+
+Capture fixtures during a GPT-OSS run by setting:
+
+```sh
+GPT_OSS_KERNEL_FIXTURE_DIR=/tmp/gpt_oss_kernel_fixtures \
+GPT_OSS_KERNEL_FIXTURE_FILTER='*_topk*,*_fwd_kernel_stage2,*matmul_ogs*' \
+GPT_OSS_KERNEL_FIXTURE_MAX_PER_KERNEL=1 \
+  python3 compare_gpt_oss_sglang.py ...
+```
+
+The filter is a comma-separated `fnmatch` list matched against both the
+function name and `module.function`.  Each fixture records the JIT function,
+launch grid, constexpr kwargs, and CPU copies of tensor arguments before and
+after the launch.  Capture is opt-in and fail-loud: if a requested tensor is
+too large for `GPT_OSS_KERNEL_FIXTURE_MAX_TENSOR_BYTES`, fixture capture raises
+instead of silently dropping data.
+
+Replay captured fixtures:
+
+```sh
+python3 gpt_oss_fixture_replay.py /tmp/gpt_oss_kernel_fixtures \
+  --json /tmp/gpt_oss_kernel_fixtures/replay.jsonl
+```
+
+The replay tool spawns one native child and one Salmon child per fixture.  It
+compares the final state of every tensor argument against native gold, so it
+works for kernels that write multiple output tensors or mutate metadata/cache
+buffers in place.  Results are emitted as JSON lines with `pass`,
+`native-crash`, `salmon-crash`, or `fail` statuses.  A passing fixture is a
+stronger statement than "Salmon translated": it proves that exact SGLang launch
+computes the same final tensor state as native gfx942 under the configured
+tolerance.
+
+### Reusing fixture replay for another Triton model
+
+The fixture mechanism is currently named for GPT-OSS because that is the first
+workload that needed it, but the capture/replay path is generic for Python
+Triton JIT launches.  To reuse it for another model or serving stack:
+
+1. Put `triton_corpus_runner/` on `PYTHONPATH` for the model process so its
+   `sitecustomize.py` runs in every worker process.
+2. Set `GPT_OSS_KERNEL_FIXTURE_DIR` to a scratch artifact directory outside
+   `/data`; use a model-specific path such as
+   `/home/$USER/<model>_kernel_capture/fixtures`.
+3. Set `GPT_OSS_KERNEL_FIXTURE_FILTER` to a comma-separated `fnmatch` list for
+   the kernels you want, for example `'*attention*,*matmul*,*topk*'`.
+4. Run the model workload normally.  The hook records matching Triton JIT
+   launches with real tensor values, grid, kwargs, and dynamic JIT provenance.
+5. Replay one fixture or a whole directory with `gpt_oss_fixture_replay.py`.
+6. Build a triage table with `gpt_oss_fixture_index.py`.
+
+Example:
+
+```sh
+PYTHONPATH=/home/mluecke/rocm-systems/projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/tools/triton_corpus_runner:$PYTHONPATH \
+GPT_OSS_KERNEL_FIXTURE_DIR=/home/$USER/my_model_capture/fixtures \
+GPT_OSS_KERNEL_FIXTURE_FILTER='*attention*,*matmul*' \
+GPT_OSS_KERNEL_FIXTURE_MAX_PER_KERNEL=1 \
+GPT_OSS_KERNEL_FIXTURE_MAX_TENSOR_BYTES=4294967296 \
+  python3 run_my_model.py
+
+python3 gpt_oss_fixture_replay.py /home/$USER/my_model_capture/fixtures \
+  --json /home/$USER/my_model_capture/replay.jsonl
+
+python3 gpt_oss_fixture_index.py /home/$USER/my_model_capture/fixtures \
+  --replay /home/$USER/my_model_capture/replay.jsonl \
+  --out-dir /home/$USER/my_model_capture/fixtures
+```
+
+Limitations:
+
+- This captures Triton JIT launches only.  Native HIP, AITER, CK, rocBLAS, or
+  PyTorch eager kernels need separate instrumentation.
+- Full tensor values can be multi-GB per fixture.  Treat them as local debug
+  artifacts, not committed test data.
+- Dynamic Triton modules may need replay support if they depend on custom
+  closure globals.  The index marks those as replay infrastructure issues
+  rather than Salmon correctness findings.
+- The environment variable names are still `GPT_OSS_*`; a future cleanup should
+  add generic aliases such as `TRITON_KERNEL_FIXTURE_DIR` without breaking the
+  current GPT-OSS workflow.
+
 `--shape` and `--block` are both repeatable.  If both are given, the
 harness runs their cross-product.  If only one is given, the other
 dimension uses the recipe's default list.  `--skip-legacy` leaves the
