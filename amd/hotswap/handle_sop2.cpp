@@ -162,11 +162,7 @@ static void recordDerivedWaveMaskI1(RaiseContext &ctx, ParsedReg dstReg,
     return;
   switch (dstReg.kind) {
   case ParsedReg::SGPR:
-    // `isPair=false`: S_{AND,OR,XOR}_B32 all operate on a single
-    // 32-bit SGPR dst.  B64 variants aren't instrumented here
-    // (wave64-source shapes don't hit the cross-widening
-    // ballot-truncation pattern the shadow cache addresses).
-    ctx.recordSgprWaveMaskI1(dstReg.baseIdx, i1, /*isPair=*/false);
+    ctx.recordSgprWaveMaskI1(dstReg.baseIdx, i1, /*isPair=*/dstReg.width >= 2);
     return;
   case ParsedReg::VCC:
     // Overwrite VCC's stored i1 with the wave-width-correct value.
@@ -506,8 +502,14 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
   if (sop == SemOp::S_XOR_B64) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     hr.sccResult = ctx.B.CreateXor(op.src64(0), op.src64(1), "xor64");
     ctx.regs.writeReg64(ctx.B, op.dst(), hr.sccResult);
+    if (s0_i1 && s1_i1) {
+      Value *xorI1 = ctx.B.CreateXor(s0_i1, s1_i1, "wave_mask_xor64");
+      recordDerivedWaveMaskI1(ctx, op.dst(), xorI1);
+    }
     hr.handled = true;
     return hr;
   }
@@ -613,10 +615,8 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
               " (expected 32 or 64); extend the shift-amount dispatch "
               "before using this path on a new source ISA.");
         unsigned logWs = (srcWaveBits == 64) ? 6 : 5;
-        Function *fnWorkitemIdX = Intrinsic::getOrInsertDeclaration(
-            &ctx.M, Intrinsic::amdgcn_workitem_id_x);
-        Value *tid =
-            ctx.B.CreateCall(fnWorkitemIdX, {}, "wave_id_lift_tid");
+        Value *tid = ctx.projection.emitWorkitemIdX(ctx.B);
+        tid->setName("wave_id_lift_tid");
         Value *waveId = ctx.B.CreateLShr(
             tid, ConstantInt::get(ctx.i32Ty, logWs), "wave_id_in_wg");
         Value *masked = ctx.B.CreateAnd(
@@ -776,15 +776,27 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
   if (sop == SemOp::S_OR_B64) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     Value *res = ctx.B.CreateOr(op.src64(0), op.src64(1), "or64");
     ctx.regs.writeReg64(ctx.B, op.dst(), res);
+    if (s0_i1 && s1_i1) {
+      Value *orI1 = ctx.B.CreateOr(s0_i1, s1_i1, "wave_mask_or64");
+      recordDerivedWaveMaskI1(ctx, op.dst(), orI1);
+    }
     hr.sccResult = res;
     hr.handled = true;
     return hr;
   }
   if (sop == SemOp::S_AND_B64) {
+    Value *s0_i1 = tryGetSrcWaveMaskI1(ctx, op, 0);
+    Value *s1_i1 = tryGetSrcWaveMaskI1(ctx, op, 1);
     Value *res = ctx.B.CreateAnd(op.src64(0), op.src64(1), "and64");
     ctx.regs.writeReg64(ctx.B, op.dst(), res);
+    if (s0_i1 && s1_i1) {
+      Value *andI1 = ctx.B.CreateAnd(s0_i1, s1_i1, "wave_mask_and64");
+      recordDerivedWaveMaskI1(ctx, op.dst(), andI1);
+    }
     hr.sccResult = res;
     hr.handled = true;
     return hr;

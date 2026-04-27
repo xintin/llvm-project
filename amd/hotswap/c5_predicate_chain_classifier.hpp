@@ -168,6 +168,17 @@ struct PredicateChainClassifierReport {
   // refusal paths without string-matching the detail.
   bool waveNativePhantomRefusal = false;
 
+  // True iff WaveNative refused specifically because an equality predicate
+  // (`eq`/`ne`) matched the C5 lane-position shape.  This class can be retried
+  // under ThreadLoopProjection, which keeps per-source-wave predicate masks
+  // distinct instead of truncating them through a single source-width SGPR.
+  bool waveNativeEqualityRefusal = false;
+
+  // True iff a WaveNative equality (`eq`/`ne`) C5 site was observed. These
+  // sites are accepted only by the target-width mask-shadow contract; callers
+  // surface the count/reason in proof logs so acceptance is explicit.
+  bool waveNativeEqualityObserved = false;
+
   // Detail string for the first refused site. Empty iff `!refused`.
   // Stable-enough-for-lit substring format (see lit fixtures under
   // `lit_tests/c5_predicate_chain_*`).

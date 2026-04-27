@@ -49,7 +49,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 
 using hipError_t = int;
 using hipModule_t = void*;
@@ -68,6 +72,8 @@ using hipModuleLaunchKernel_t = hipError_t (*)(
     hipFunction_t, unsigned int, unsigned int, unsigned int,
     unsigned int, unsigned int, unsigned int, unsigned int,
     hipStream_t, void**, void**);
+using hipModuleGetFunction_t = hipError_t (*)(hipFunction_t*, hipModule_t,
+                                              const char*);
 // `hipFuncGetAttribute(int *value, hipFunction_attribute_t attrib, hipFunction_t f)`
 // queries per-function attributes.  The enum value we care about is
 // `HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0` — HIP reads it
@@ -112,6 +118,9 @@ static hipModuleLoadDataEx_t g_proc_hipModuleLoadDataEx = nullptr;
 // HIP-API-versioning reason the load_data resolver does.
 static hipModuleLaunchKernel_t g_real_hipModuleLaunchKernel = nullptr;
 static hipModuleLaunchKernel_t g_proc_hipModuleLaunchKernel = nullptr;
+
+static hipModuleGetFunction_t g_real_hipModuleGetFunction = nullptr;
+static hipModuleGetFunction_t g_proc_hipModuleGetFunction = nullptr;
 
 // hipFuncGetAttribute resolution — same three-path scheme as the
 // launcher / loader pointers.  We don't hook this function; we just
@@ -177,6 +186,172 @@ static bool g_ir_raiser_active = false;
 //      refusal.  The env-var opt-out is explicit acknowledgement,
 //      not a default fallback.
 static bool g_allow_partial_wave_launch = false;
+
+struct ModuleInfo {
+  bool known = false;
+  bool salmon_patched = false;
+  size_t elf_size = 0;
+  uint8_t orig_mach = 0;
+};
+
+struct FunctionInfo {
+  bool known = false;
+  hipModule_t module = nullptr;
+  std::string name;
+  ModuleInfo module_info;
+};
+
+static std::mutex g_tracking_mutex;
+static std::unordered_map<hipModule_t, ModuleInfo> g_module_info;
+static std::unordered_map<hipFunction_t, FunctionInfo> g_function_info;
+static std::atomic<unsigned long long> g_launch_seq{0};
+
+static std::string json_escape(const char* s) {
+  if (!s) return "";
+  std::string out;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(s); *p; ++p) {
+    switch (*p) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (*p < 0x20) {
+          char buf[7];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(*p));
+          out += buf;
+        } else {
+          out += static_cast<char>(*p);
+        }
+    }
+  }
+  return out;
+}
+
+static std::string json_escape(const std::string& s) {
+  return json_escape(s.c_str());
+}
+
+static void append_launch_json(const char* json_fields) {
+  const char* path = std::getenv("HSA_SALMON_LAUNCH_LOG");
+  if (!path || !path[0]) return;
+  std::lock_guard<std::mutex> lock(g_tracking_mutex);
+  FILE* f = std::fopen(path, "a");
+  if (!f) {
+    std::fprintf(stderr,
+                 "salmon_intercept: could not open HSA_SALMON_LAUNCH_LOG=%s\n",
+                 path);
+    return;
+  }
+  std::fprintf(f, "{%s}\n", json_fields);
+  if (std::fclose(f) != 0) {
+    std::fprintf(stderr,
+                 "salmon_intercept: failed to close HSA_SALMON_LAUNCH_LOG=%s\n",
+                 path);
+  }
+}
+
+static bool launch_logging_enabled() {
+  const char* path = std::getenv("HSA_SALMON_LAUNCH_LOG");
+  return path && path[0];
+}
+
+static void remember_module(hipModule_t module, const ModuleInfo& info) {
+  if (!module) return;
+  std::lock_guard<std::mutex> lock(g_tracking_mutex);
+  g_module_info[module] = info;
+}
+
+static void remember_function(hipModule_t module, hipFunction_t function,
+                              const char* name) {
+  if (!function) return;
+  FunctionInfo info;
+  info.known = true;
+  info.module = module;
+  info.name = name ? name : "";
+  {
+    std::lock_guard<std::mutex> lock(g_tracking_mutex);
+    auto it = g_module_info.find(module);
+    if (it != g_module_info.end()) {
+      info.module_info = it->second;
+    }
+    g_function_info[function] = info;
+  }
+}
+
+static void append_module_load_event(const char* api, hipModule_t module,
+                                     const ModuleInfo& info,
+                                     hipError_t return_code) {
+  if (!launch_logging_enabled()) return;
+  std::ostringstream os;
+  os << "\"event\":\"hip_module_load\""
+     << ",\"api\":\"" << api << "\""
+     << ",\"module\":\"" << module << "\""
+     << ",\"return_code\":" << return_code
+     << ",\"module_known\":" << (info.known ? "true" : "false")
+     << ",\"salmon_patched\":" << (info.salmon_patched ? "true" : "false")
+     << ",\"orig_mach\":\"0x" << std::hex
+     << static_cast<unsigned>(info.orig_mach) << std::dec << "\""
+     << ",\"elf_size\":" << info.elf_size;
+  append_launch_json(os.str().c_str());
+}
+
+static void append_get_function_event(const char* phase, hipModule_t module,
+                                      hipFunction_t function, const char* name,
+                                      hipError_t return_code) {
+  if (!launch_logging_enabled()) return;
+  std::ostringstream os;
+  os << "\"event\":\"hip_module_get_function\""
+     << ",\"phase\":\"" << phase << "\""
+     << ",\"module\":\"" << module << "\""
+     << ",\"function\":\"" << function << "\""
+     << ",\"kernel_name\":\"" << json_escape(name) << "\""
+     << ",\"return_code\":" << return_code;
+  append_launch_json(os.str().c_str());
+}
+
+static FunctionInfo lookup_function(hipFunction_t function) {
+  std::lock_guard<std::mutex> lock(g_tracking_mutex);
+  auto it = g_function_info.find(function);
+  if (it != g_function_info.end()) return it->second;
+  return {};
+}
+
+static void append_launch_event(const char* phase, unsigned long long seq,
+                                hipFunction_t function, const FunctionInfo& info,
+                                unsigned int gridDimX, unsigned int gridDimY,
+                                unsigned int gridDimZ, unsigned int blockDimX,
+                                unsigned int blockDimY, unsigned int blockDimZ,
+                                unsigned int sharedMemBytes, hipStream_t stream,
+                                uint64_t block_threads, int max_threads,
+                                hipError_t attr_err, hipError_t return_code,
+                                bool refused) {
+  if (!launch_logging_enabled()) return;
+  std::ostringstream os;
+  os << "\"event\":\"hip_module_launch\""
+     << ",\"phase\":\"" << phase << "\""
+     << ",\"seq\":" << seq
+     << ",\"function\":\"" << function << "\""
+     << ",\"function_known\":" << (info.known ? "true" : "false")
+     << ",\"kernel_name\":\"" << json_escape(info.name) << "\""
+     << ",\"module\":\"" << info.module << "\""
+     << ",\"module_known\":" << (info.module_info.known ? "true" : "false")
+     << ",\"salmon_patched\":" << (info.module_info.salmon_patched ? "true" : "false")
+     << ",\"orig_mach\":\"0x" << std::hex
+     << static_cast<unsigned>(info.module_info.orig_mach) << std::dec << "\""
+     << ",\"elf_size\":" << info.module_info.elf_size
+     << ",\"grid\":[" << gridDimX << "," << gridDimY << "," << gridDimZ << "]"
+     << ",\"block\":[" << blockDimX << "," << blockDimY << "," << blockDimZ << "]"
+     << ",\"block_threads\":" << block_threads
+     << ",\"shared_mem_bytes\":" << sharedMemBytes
+     << ",\"stream\":\"" << stream << "\""
+     << ",\"max_threads_per_block\":" << max_threads
+     << ",\"attr_error\":" << attr_err
+     << ",\"return_code\":" << return_code
+     << ",\"refused\":" << (refused ? "true" : "false");
+  append_launch_json(os.str().c_str());
+}
 
 static void init() {
   static bool done = false;
@@ -301,6 +476,17 @@ static void init() {
             dlerror());
   }
 
+  if (auto* fn = reinterpret_cast<hipModuleGetFunction_t>(
+          dlsym(RTLD_NEXT, "hipModuleGetFunction"))) {
+    g_real_hipModuleGetFunction = fn;
+  } else {
+    fprintf(stderr,
+            "salmon_intercept: hipModuleGetFunction not visible via "
+            "RTLD_NEXT (%s); will rely on the dlsym/hipGetProcAddress "
+            "hooks instead\n",
+            dlerror());
+  }
+
   // hipFuncGetAttribute is used by `hipModuleLaunchKernel`'s gate to
   // query the kernel's `max_flat_workgroup_size` attribute at launch
   // time; see the big comment above `hipModuleLaunchKernel` for the
@@ -374,7 +560,8 @@ static size_t elf_size(const void* data) {
 // process if the image *is* an ELF but patching fails — propagating that
 // as a "load success" would silently bypass the hotswap path and yield
 // meaningless runtime errors elsewhere.
-static uint8_t* patch_image(const void* image, size_t* out_size) {
+static uint8_t* patch_image(const void* image, size_t* out_size,
+                            uint8_t* out_orig_mach) {
   if (!g_patch_elf || g_target_isa.empty() || !is_elf(image)) {
     return nullptr;
   }
@@ -392,6 +579,7 @@ static uint8_t* patch_image(const void* image, size_t* out_size) {
   // ELF (we already verified that via elf_size()), so offsets 9..11 are
   // always safe to access.
   uint8_t orig_mach = buf[48];
+  if (out_orig_mach) *out_orig_mach = orig_mach;
   if (buf[9] == 0 && buf[10] == 0) {
     buf[9] = 'S';
     buf[10] = 'L';
@@ -446,11 +634,31 @@ extern "C" hipError_t hipModuleLoadData(hipModule_t* module,
   }
 
   size_t sz = 0;
-  uint8_t* buf = patch_image(image, &sz);
+  uint8_t orig_mach = 0;
+  uint8_t* buf = patch_image(image, &sz, &orig_mach);
   if (!buf) {
-    return real(module, image);
+    hipError_t err = real(module, image);
+    ModuleInfo info;
+    if (err == 0 && module && *module) {
+      info.known = true;
+      remember_module(*module, info);
+    }
+    append_module_load_event("hipModuleLoadData", module ? *module : nullptr,
+                             info, err);
+    return err;
   }
-  return real(module, buf);
+  hipError_t err = real(module, buf);
+  ModuleInfo info;
+  if (err == 0 && module && *module) {
+    info.known = true;
+    info.salmon_patched = true;
+    info.elf_size = sz;
+    info.orig_mach = orig_mach;
+    remember_module(*module, info);
+  }
+  append_module_load_event("hipModuleLoadData", module ? *module : nullptr,
+                           info, err);
+  return err;
 }
 
 extern "C" hipError_t hipModuleLoadDataEx(hipModule_t* module,
@@ -467,11 +675,31 @@ extern "C" hipError_t hipModuleLoadDataEx(hipModule_t* module,
   }
 
   size_t sz = 0;
-  uint8_t* buf = patch_image(image, &sz);
+  uint8_t orig_mach = 0;
+  uint8_t* buf = patch_image(image, &sz, &orig_mach);
   if (!buf) {
-    return real(module, image, numOptions, options, optionValues);
+    hipError_t err = real(module, image, numOptions, options, optionValues);
+    ModuleInfo info;
+    if (err == 0 && module && *module) {
+      info.known = true;
+      remember_module(*module, info);
+    }
+    append_module_load_event("hipModuleLoadDataEx", module ? *module : nullptr,
+                             info, err);
+    return err;
   }
-  return real(module, buf, numOptions, options, optionValues);
+  hipError_t err = real(module, buf, numOptions, options, optionValues);
+  ModuleInfo info;
+  if (err == 0 && module && *module) {
+    info.known = true;
+    info.salmon_patched = true;
+    info.elf_size = sz;
+    info.orig_mach = orig_mach;
+    remember_module(*module, info);
+  }
+  append_module_load_event("hipModuleLoadDataEx", module ? *module : nullptr,
+                           info, err);
+  return err;
 }
 
 // Resolve the real hipModuleLaunchKernel.  Same preference order as
@@ -483,6 +711,11 @@ extern "C" hipError_t hipModuleLoadDataEx(hipModule_t* module,
 static hipModuleLaunchKernel_t resolve_real_launch_kernel() {
   if (g_proc_hipModuleLaunchKernel) return g_proc_hipModuleLaunchKernel;
   return g_real_hipModuleLaunchKernel;
+}
+
+static hipModuleGetFunction_t resolve_real_get_function() {
+  if (g_proc_hipModuleGetFunction) return g_proc_hipModuleGetFunction;
+  return g_real_hipModuleGetFunction;
 }
 
 // Resolve the real hipFuncGetAttribute.  Unlike the launcher, this
@@ -502,6 +735,28 @@ static hipFuncGetAttribute_t resolve_real_func_get_attribute() {
 // mirrored from the CUDA driver API's `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`.
 // Hard-coded to 0 here to keep the shim header-free.
 static constexpr int kHipFuncAttributeMaxThreadsPerBlock = 0;
+
+extern "C" hipError_t hipModuleGetFunction(hipFunction_t* function,
+                                            hipModule_t module,
+                                            const char* kname) {
+  init();
+
+  hipModuleGetFunction_t real = resolve_real_get_function();
+  if (!real) {
+    fprintf(stderr, "salmon_intercept: no real hipModuleGetFunction\n");
+    std::abort();
+  }
+
+  append_get_function_event("before", module, nullptr, kname, 0);
+  hipError_t err = real(function, module, kname);
+  if (err == 0 && function && *function) {
+    remember_function(module, *function, kname);
+  }
+  append_get_function_event("after", module,
+                            (err == 0 && function) ? *function : nullptr,
+                            kname, err);
+  return err;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // hipModuleLaunchKernel — partial-wave launch refusal gate.
@@ -594,6 +849,23 @@ extern "C" hipError_t hipModuleLaunchKernel(
     std::abort();
   }
 
+  const uint64_t block_threads =
+      static_cast<uint64_t>(blockDimX) *
+      static_cast<uint64_t>(blockDimY) *
+      static_cast<uint64_t>(blockDimZ);
+  FunctionInfo function_info = lookup_function(f);
+  int max_threads = 0;
+  hipError_t attr_err = -1;
+  if (auto* fn_attr = resolve_real_func_get_attribute()) {
+    attr_err = fn_attr(&max_threads, kHipFuncAttributeMaxThreadsPerBlock, f);
+  }
+  const unsigned long long launch_seq = ++g_launch_seq;
+  append_launch_event("before", launch_seq, f, function_info,
+                      gridDimX, gridDimY, gridDimZ,
+                      blockDimX, blockDimY, blockDimZ,
+                      sharedMemBytes, stream, block_threads,
+                      max_threads, attr_err, 0, false);
+
   // Phantom-lane launch gate.  Uses uint64_t for the product to stay
   // immune to unsigned-int overflow on pathologically large launches —
   // even though three 32-bit multiplies overflowing is already a
@@ -609,10 +881,6 @@ extern "C" hipError_t hipModuleLaunchKernel(
   // blanket refusal would over-reject correct kernels on those paths.
   if (g_ir_raiser_active && g_target_wave_size > 0 &&
       !g_allow_partial_wave_launch) {
-    const uint64_t block_threads =
-        static_cast<uint64_t>(blockDimX) *
-        static_cast<uint64_t>(blockDimY) *
-        static_cast<uint64_t>(blockDimZ);
     if (block_threads < static_cast<uint64_t>(g_target_wave_size)) {
       // MODREP-detection shortcut: if the kernel descriptor's
       // `max_flat_workgroup_size` attribute is below the target
@@ -629,18 +897,19 @@ extern "C" hipError_t hipModuleLaunchKernel(
       // either), we conservatively fall through to refusing, which
       // is the safer default: over-refusal is a test-harness
       // annoyance, but under-refusal is a silent miscompile.
-      if (auto* fn_attr = resolve_real_func_get_attribute()) {
-        int max_threads = 0;
-        hipError_t attr_err =
-            fn_attr(&max_threads, kHipFuncAttributeMaxThreadsPerBlock, f);
-        if (attr_err == 0 && max_threads > 0 &&
-            static_cast<unsigned>(max_threads) < g_target_wave_size) {
-          // `max_flat_workgroup_size < targetWaveSize` → raiser
-          // engaged MODREP → phantom-lane-safe.  Pass through.
-          return real(f, gridDimX, gridDimY, gridDimZ,
-                      blockDimX, blockDimY, blockDimZ,
-                      sharedMemBytes, stream, kernelParams, extra);
-        }
+      if (attr_err == 0 && max_threads > 0 &&
+          static_cast<unsigned>(max_threads) < g_target_wave_size) {
+        // `max_flat_workgroup_size < targetWaveSize` → raiser
+        // engaged MODREP → phantom-lane-safe.  Pass through.
+        hipError_t err = real(f, gridDimX, gridDimY, gridDimZ,
+                              blockDimX, blockDimY, blockDimZ,
+                              sharedMemBytes, stream, kernelParams, extra);
+        append_launch_event("after", launch_seq, f, function_info,
+                            gridDimX, gridDimY, gridDimZ,
+                            blockDimX, blockDimY, blockDimZ,
+                            sharedMemBytes, stream, block_threads,
+                            max_threads, attr_err, err, false);
+        return err;
       }
       fprintf(stderr,
               "salmon_intercept: REFUSING hipModuleLaunchKernel: "
@@ -665,13 +934,25 @@ extern "C" hipError_t hipModuleLaunchKernel(
               g_target_wave_size, g_target_wave_size,
               static_cast<unsigned long long>(block_threads),
               kHipErrorInvalidConfiguration);
+      append_launch_event("after", launch_seq, f, function_info,
+                          gridDimX, gridDimY, gridDimZ,
+                          blockDimX, blockDimY, blockDimZ,
+                          sharedMemBytes, stream, block_threads,
+                          max_threads, attr_err, kHipErrorInvalidConfiguration,
+                          true);
       return kHipErrorInvalidConfiguration;
     }
   }
 
-  return real(f, gridDimX, gridDimY, gridDimZ,
-              blockDimX, blockDimY, blockDimZ,
-              sharedMemBytes, stream, kernelParams, extra);
+  hipError_t err = real(f, gridDimX, gridDimY, gridDimZ,
+                        blockDimX, blockDimY, blockDimZ,
+                        sharedMemBytes, stream, kernelParams, extra);
+  append_launch_event("after", launch_seq, f, function_info,
+                      gridDimX, gridDimY, gridDimZ,
+                      blockDimX, blockDimY, blockDimZ,
+                      sharedMemBytes, stream, block_threads,
+                      max_threads, attr_err, err, false);
+  return err;
 }
 
 // Triton (and other runtimes built against newer ROCm) resolve HIP entry
@@ -718,6 +999,13 @@ extern "C" hipError_t hipGetProcAddress(
     g_proc_hipModuleLaunchKernel =
         reinterpret_cast<hipModuleLaunchKernel_t>(*pfn);
     *pfn = reinterpret_cast<void*>(&hipModuleLaunchKernel);
+    fprintf(stderr,
+            "salmon_intercept: redirected hipGetProcAddress(\"%s\")\n",
+            symbol);
+  } else if (std::strcmp(symbol, "hipModuleGetFunction") == 0) {
+    g_proc_hipModuleGetFunction =
+        reinterpret_cast<hipModuleGetFunction_t>(*pfn);
+    *pfn = reinterpret_cast<void*>(&hipModuleGetFunction);
     fprintf(stderr,
             "salmon_intercept: redirected hipGetProcAddress(\"%s\")\n",
             symbol);

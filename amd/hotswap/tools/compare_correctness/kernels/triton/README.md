@@ -123,6 +123,8 @@ intentionally refuses to silently guess.
 | `bf16` | 2     | uniform `[range_lo, range_hi)`            | bf16 → fp32 → fp64 (top-16-bits reinflate)   |
 | `fp32` | 4     | uniform `[range_lo, range_hi)`            | fp32 → fp64                                  |
 | `fp64` | 8     | uniform `[range_lo, range_hi)`            | native fp64                                  |
+| `i8` / `u8` | 1 | uniform full 8-bit pattern              | exact integer compare                        |
+| `i16` / `u16` | 2 | uniform full 16-bit pattern           | exact integer compare                        |
 | `i32`  | 4     | uniform u32 reinterpreted via `memcpy`    | exact integer compare                        |
 | `i64`  | 8     | uniform u64 reinterpreted via `memcpy`    | exact integer compare                        |
 

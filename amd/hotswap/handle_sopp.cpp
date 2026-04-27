@@ -13,7 +13,10 @@ HandlerResult handleSOPP(RaiseContext &ctx, const DecodedInst &di,
   SemOp sop = di.semOp;
 
   if (sop == SemOp::S_ENDPGM) {
-    ctx.B.CreateRetVoid();
+    if (ctx.threadLoopLatch)
+      ctx.B.CreateBr(ctx.threadLoopLatch);
+    else
+      ctx.B.CreateRetVoid();
     hr.handled = true;
     return hr;
   }

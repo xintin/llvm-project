@@ -30,9 +30,10 @@
 //     and rely on virtual dispatch to pick the right answer per
 //     kernel.
 //
-//   * `ThreadLoopProjection` is conservative-by-default and keeps
-//     source-width semantics at projection boundaries; it does not
-//     provide the full-wave EXEC invariant.
+//   * `ThreadLoopProjection` is conservative-by-default and does not
+//     provide the full-wave EXEC invariant. It still uses target-width
+//     EXEC storage so source-wave predicate masks can be banked per
+//     packed source wave.
 
 #include "../wave_projection.hpp"
 
@@ -198,6 +199,7 @@ TEST(WaveProjectionContract, ThreadLoopDoesNotProvideFullWaveExec) {
 
   ThreadLoopProjection proj(src, tgt, i32Ty, i64Ty);
   EXPECT_FALSE(proj.providesFullWaveExecInvariant());
+  EXPECT_EQ(proj.execStorageTy(), i64Ty);
 
   const WaveProjection &base = proj;
   EXPECT_FALSE(base.providesFullWaveExecInvariant());

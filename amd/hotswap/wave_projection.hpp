@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 
@@ -140,6 +141,13 @@ public:
   // "the current lane" means (e.g. a thread-loop projection where a
   // single target lane iterates over multiple source lanes).
   virtual llvm::Value *emitLaneIdx(llvm::IRBuilder<> &B) const;
+
+  // Emit the workitem-id-x value that source-ISA code should observe under
+  // this projection.  The default is the target hardware value.  Projections
+  // that split or re-map source waves override this hook so every raiser-created
+  // `workitem.id.x` leaf flows through one policy surface instead of open-coded
+  // `@llvm.amdgcn.workitem.id.x` calls.
+  virtual llvm::Value *emitWorkitemIdX(llvm::IRBuilder<> &B) const;
 
   // Given the current EXEC alloca value (source-width iN), return an i1
   // true iff the current lane is active. Concrete projections define
@@ -401,20 +409,20 @@ public:
 // ThreadLoopProjection — second rung of the coverage ladder described
 // in hotswap/docs/wave-size-translation.md §2.2.
 //
-// The thread-loop rung wraps the raised IR body in `for iter in 0..R:`
-// with R = W_tgt / W_src, using only the lower W_src target lanes per
-// iteration. It naturally handles Class 3 obstructions (no replicas,
-// no inter-replica races) and Class 4 (per-iteration EXEC) as
-// catalogued in wave-size-translation.md §6, trading full-wave
-// throughput for expanded coverage. It does NOT dissolve Class 2
-// cross-lane obstructions (see wave-size-translation.md §7's
-// unrewritable and pending tables).
+// The thread-loop rung is the coverage-ladder home for source-wave-scoped
+// execution. The current implementation is the first useful subset: it banks
+// source-wave predicate masks in target-width storage and emits a virtual
+// workitem id through one projection hook, so C5 equality predicates can keep
+// the two packed source waves distinct. It does NOT yet clone the full CFG into
+// a temporal `for iter in 0..R` loop, and it still does NOT dissolve Class 2
+// cross-lane obstructions (see wave-size-translation.md §7's unrewritable and
+// pending tables).
 //
-// This first implementation provides a conservative projection surface
-// that keeps source-wave-width semantics at projection boundaries:
-//   * source-width EXEC storage (`execStorageTy = sourceWaveMaskTy`)
-//   * source-width lane indexing for lane-active and wave-mask extract
-//   * target ballots narrowed to source width
+// This implementation provides a conservative projection surface:
+//   * target-width EXEC storage so per-source-wave predicate masks can be
+//     carried independently in SGPR-pair shadows;
+//   * source-wave-scoped lane ops;
+//   * target ballots narrowed only when the destination truly is source-width;
 // and reports source-wave-count per target wave as `W_t / W_s`.
 //
 // The projection is intentionally opt-in and currently selected only by
@@ -440,10 +448,13 @@ public:
   ThreadLoopProjection(const ISAProfile &srcIsa, const ISAProfile &tgtIsa,
                        llvm::Type *i32Ty, llvm::Type *i64Ty);
 
-  llvm::Type *execStorageTy() const override { return sourceWaveMaskTy(); }
+  llvm::Type *execStorageTy() const override { return waveMaskTy_; }
   bool broadcastNarrowExecLoWrite() const override { return false; }
   bool providesFullWaveExecInvariant() const override { return false; }
   bool sourceWaveScopedLaneOps() const override { return true; }
+
+  void setIterationAlloca(llvm::AllocaInst *iter) { iterationAlloca_ = iter; }
+  llvm::Value *emitWorkitemIdX(llvm::IRBuilder<> &B) const override;
 
   llvm::Value *emitLaneActiveBit(llvm::IRBuilder<> &B,
                                   llvm::Value *execVal) const override;
@@ -455,6 +466,9 @@ public:
                                            llvm::Value *v) const override;
 
   unsigned numSourceWavesPerTarget() const override;
+
+private:
+  llvm::AllocaInst *iterationAlloca_ = nullptr;
 };
 
 // ============================================================================

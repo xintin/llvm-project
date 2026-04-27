@@ -49,6 +49,7 @@
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <utility>
 
@@ -841,8 +842,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         isa, targetIsa, i32Ty, i64Ty);
     errs() << "transpiler: kernel '" << kernelName
            << "' selected ThreadLoopProjection (analysis-triggered "
-              "SGPR-forced cross-lane route; writelane/readlane rewrite "
-              "disabled for this retry)\n";
+              "cross-widen route; writelane/readlane rewrite may be "
+              "disabled by the retry caller)\n";
   } else if (useWaveNative) {
     projectionPtr = std::make_unique<WaveNativeProjection>(isa, targetIsa,
                                                              i32Ty, i64Ty);
@@ -1218,8 +1219,6 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
 
   Function *fnWorkgroupIdX =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_x);
-  Function *fnWorkitemIdX =
-      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workitem_id_x);
   Function *fnWorkgroupIdY =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_y);
   // Build the source-ISA user-SGPR ABI from the kernel descriptor.
@@ -1241,9 +1240,13 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   std::map<uint64_t, BasicBlock *> offsetToBB;
   for (uint64_t addr : blockStarts)
     offsetToBB[addr] = BasicBlock::Create(C, "bb_0x" + utohexstr(addr - kernelOffset), F);
+  BasicBlock *entryBB =
+      useThreadLoop ? BasicBlock::Create(C, "entry", F,
+                                         offsetToBB.begin()->second)
+                    : offsetToBB[kernelOffset];
 
   // ==== Phase 4: Init entry registers ====
-  IRBuilder<> B(offsetToBB[kernelOffset]);
+  IRBuilder<> B(entryBB);
 
   AllocaRegFile regs;
   regs.init(B, i32Ty, i1Ty, isa, *mc.regInfo, projection);
@@ -1333,11 +1336,12 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     }
     regs.storeSGPR32(B, static_cast<int>(sgprIdx), dw);
   }
-  // v0 = workitem_id_x
-  regs.storeVGPR32(B, 0, B.CreateCall(fnWorkitemIdX, {}, "tid"));
-  // Init VCC/SCC to false
-  regs.storeVCC(B, ConstantInt::getFalse(i1Ty));
-  regs.storeSCC(B, ConstantInt::getFalse(i1Ty));
+  auto seedWorkitemX = [&](IRBuilder<> &SeedB) {
+    regs.storeVGPR32(SeedB, 0, projection.emitWorkitemIdX(SeedB));
+  };
+
+  if (!useThreadLoop)
+    seedWorkitemX(B);
 
   // On gfx12+ the hardware command processor uses TTMP registers for
   // workgroup scheduling (RDNA4+ / CDNA-next layout):
@@ -1359,6 +1363,7 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // M=32 with an all-1s input shows cols 0..15 = correct 32.0,
   // cols 16..31 = poison-fill from the host's pre-launch memset).
   // gfx11 (RDNA3) passes these via SGPRs set up by the CP instead.
+  std::function<void(IRBuilder<> &)> seedTtmp8 = [](IRBuilder<> &) {};
   if (AMDGPU::isGFX12Plus(*mc.subtargetInfo)) {
     B.CreateStore(B.CreateCall(fnWorkgroupIdX, {}, "ttmp9_wg_id"), regs.ttmp[9]);
 
@@ -1387,12 +1392,86 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     Value *ttmp7Val = B.CreateOr(wgIdYLo, wgIdZHi, "ttmp7_val");
     B.CreateStore(ttmp7Val, regs.ttmp[7]);
 
-    // wave_id = workitem_id_x / wavefront_size (32 for gfx12)
-    Value *tidForTtmp = B.CreateCall(fnWorkitemIdX, {}, "ttmp8_tid");
-    Value *waveId = B.CreateLShr(tidForTtmp, B.getInt32(5), "wave_id_in_wg");
-    Value *ttmp8Val = B.CreateShl(waveId, B.getInt32(25), "ttmp8_val");
-    B.CreateStore(ttmp8Val, regs.ttmp[8]);
+    seedTtmp8 = [&](IRBuilder<> &SeedB) {
+      // wave_id = workitem_id_x / wavefront_size (32 for gfx12)
+      Value *tidForTtmp = projection.emitWorkitemIdX(SeedB);
+      tidForTtmp->setName("ttmp8_tid");
+      Value *waveId =
+          SeedB.CreateLShr(tidForTtmp, SeedB.getInt32(5), "wave_id_in_wg");
+      Value *ttmp8Val =
+          SeedB.CreateShl(waveId, SeedB.getInt32(25), "ttmp8_val");
+      SeedB.CreateStore(ttmp8Val, regs.ttmp[8]);
+    };
+    if (!useThreadLoop)
+      seedTtmp8(B);
   }
+
+  auto seedThreadLoopIterationState = [&](IRBuilder<> &SeedB) {
+    for (auto *slot : regs.sgpr)
+      SeedB.CreateStore(ConstantInt::get(i32Ty, 0), slot);
+    for (auto *slot : regs.vgpr)
+      SeedB.CreateStore(ConstantInt::get(i32Ty, 0), slot);
+    for (auto *slot : regs.agpr)
+      SeedB.CreateStore(ConstantInt::get(i32Ty, 0), slot);
+    for (auto *slot : regs.ttmp)
+      SeedB.CreateStore(ConstantInt::get(i32Ty, 0), slot);
+    SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.m0);
+    SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[0]);
+    SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[1]);
+
+    if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
+      regs.storeSGPR64(
+          SeedB, userSgprLayout.kernargSegmentPtrSgpr,
+          Constant::getNullValue(PointerType::get(C, 4)));
+    }
+    if (userSgprLayout.workgroupIdXSgpr >= 0) {
+      regs.storeSGPR32(SeedB, userSgprLayout.workgroupIdXSgpr,
+                       SeedB.CreateCall(fnWorkgroupIdX, {}, "wg_id_x"));
+    }
+    if (userSgprLayout.workgroupIdYSgpr >= 0) {
+      regs.storeSGPR32(SeedB, userSgprLayout.workgroupIdYSgpr,
+                       SeedB.CreateCall(fnWorkgroupIdY, {}, "wg_id_y"));
+    }
+    for (size_t sgprIdx = 0; sgprIdx < userSgprLayout.entries.size();
+         ++sgprIdx) {
+      const auto &entry = userSgprLayout.entries[sgprIdx];
+      if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
+        continue;
+      std::string why;
+      Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
+      if (!dw)
+        dw = extractKernargDword(kernargs, SeedB, F,
+                                 entry.kernargByteOffset, &why);
+      if (!dw) {
+        report_fatal_error(
+            Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
+            Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
+            Twine(entry.kernargByteOffset) + ": " + why);
+      }
+      regs.storeSGPR32(SeedB, static_cast<int>(sgprIdx), dw);
+    }
+
+    if (AMDGPU::isGFX12Plus(*mc.subtargetInfo)) {
+      SeedB.CreateStore(SeedB.CreateCall(fnWorkgroupIdX, {}, "ttmp9_wg_id"),
+                        regs.ttmp[9]);
+      Value *wgIdY = SeedB.CreateCall(fnWorkgroupIdY, {}, "ttmp7_wg_id_y");
+      Function *fnWorkgroupIdZ = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::amdgcn_workgroup_id_z);
+      Value *wgIdZ = SeedB.CreateCall(fnWorkgroupIdZ, {}, "ttmp7_wg_id_z");
+      Value *wgIdYLo =
+          SeedB.CreateAnd(wgIdY, SeedB.getInt32(0xFFFF), "wg_id_y_lo16");
+      Value *wgIdZHi =
+          SeedB.CreateShl(wgIdZ, SeedB.getInt32(16), "wg_id_z_hi16");
+      Value *ttmp7Val = SeedB.CreateOr(wgIdYLo, wgIdZHi, "ttmp7_val");
+      SeedB.CreateStore(ttmp7Val, regs.ttmp[7]);
+      seedTtmp8(SeedB);
+    }
+
+    seedWorkitemX(SeedB);
+    regs.storeVCC(SeedB, ConstantInt::getFalse(i1Ty));
+    regs.storeSCC(SeedB, ConstantInt::getFalse(i1Ty));
+    regs.storeExec(SeedB, projection.emitInitialExec(SeedB));
+  };
 
   // ==== Phase 5: Raise each instruction ====
 
@@ -1401,6 +1480,7 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // and handler-side ABI decisions use the same descriptor-derived mapping.
   RaiseContext ctx{C, M, B, regs, projection, mc, isa, targetIsa, kernargs,
                    &userSgprLayout, F,
+                   nullptr,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
@@ -1735,6 +1815,46 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // afterwards via `ctx.recordSgprWaveMaskI1`. See hotswap/docs/sgpr-
   // wave-mask-translation.md section 3.1 for the full contract.
   regs.onSgprWritten = [&ctx](int idx) { ctx.invalidateSgprWaveMaskI1(idx); };
+
+  if (useThreadLoop) {
+    auto *iterA = B.CreateAlloca(i32Ty, nullptr, "tl_iter_alloca");
+    B.CreateStore(B.getInt32(0), iterA);
+    static_cast<ThreadLoopProjection *>(projectionPtr.get())
+        ->setIterationAlloca(iterA);
+
+    BasicBlock *condBB = BasicBlock::Create(C, "tl_cond", F);
+    BasicBlock *latchBB = BasicBlock::Create(C, "tl_latch", F);
+    BasicBlock *doneBB = BasicBlock::Create(C, "tl_done", F);
+    ctx.threadLoopLatch = latchBB;
+
+    B.CreateBr(condBB);
+    B.SetInsertPoint(condBB);
+
+    Value *iter = B.CreateLoad(i32Ty, iterA, "tl_iter_val");
+    Value *iterOk = B.CreateICmpULT(
+        iter, B.getInt32(targetIsa.waveSize / isa.waveSize), "tl_iter_ok");
+    Value *lane = projection.emitLaneIdx(B);
+    Value *laneOk =
+        B.CreateICmpULT(lane, B.getInt32(isa.waveSize), "tl_lane_ok");
+    Value *enterBody = B.CreateAnd(iterOk, laneOk, "tl_enter_body");
+
+    seedThreadLoopIterationState(B);
+    for (auto *validA : ctx.sgprWaveMaskValidShadow)
+      B.CreateStore(B.getFalse(), validA);
+
+    B.CreateCondBr(enterBody, offsetToBB[kernelOffset], latchBB);
+
+    B.SetInsertPoint(latchBB);
+    Value *oldIter = B.CreateLoad(i32Ty, iterA, "tl_iter_old");
+    Value *nextIter = B.CreateAdd(oldIter, B.getInt32(1), "tl_iter_next");
+    B.CreateStore(nextIter, iterA);
+    Value *more = B.CreateICmpULT(
+        nextIter, B.getInt32(targetIsa.waveSize / isa.waveSize), "tl_more");
+    B.CreateCondBr(more, condBB, doneBB);
+
+    B.SetInsertPoint(doneBB);
+    B.CreateRetVoid();
+  }
 
   int raisedCount = 0;
 
@@ -2205,6 +2325,38 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     }
 
     if (predReport.refused) {
+      auto hasMatrixOp = [&]() {
+        const auto first =
+            static_cast<uint16_t>(SemOp::V_MFMA_F32_16x16x128_F8F6F4);
+        const auto last =
+            static_cast<uint16_t>(SemOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4);
+        for (const DecodedInst &inst : insts) {
+          const auto op = static_cast<uint16_t>(inst.semOp);
+          if (op >= first && op <= last)
+            return true;
+        }
+        return false;
+      };
+      constexpr bool kEnableThreadLoopC5Retry = false;
+      const bool canRetryThreadLoop =
+          kEnableThreadLoopC5Retry &&
+          predReport.waveNativeEqualityRefusal && !forceThreadLoopProjection &&
+          targetIsa.waveSize > isa.waveSize &&
+          (targetIsa.waveSize % isa.waveSize) == 0 && !hasMatrixOp();
+      if (canRetryThreadLoop) {
+        errs() << "transpiler: post-raise fallback: retrying kernel '"
+               << kernelName
+               << "' under ThreadLoopProjection after WaveNative C5 equality "
+                  "refusal (analysis-triggered, no user opt-in)\n";
+        errs() << "transpiler: thread-loop fallback trigger: "
+               << predReport.refusalDetail << "\n";
+        return raiseToIRImpl(textBytes, sourceISA, kernelName, meta,
+                             kernelOffset, compilationTargetISA,
+                             /*enableWritelaneRewrite=*/false,
+                             /*enableWaveNative=*/false,
+                             /*forceThreadLoopProjection=*/true,
+                             /*suppressC5ForThreadLoopRoute=*/true);
+      }
       RaiseFailure f = RaiseFailure::crossWavePredicateChain(
           kernelName, predReport.refusalDetail);
       errs() << "transpiler: pre-translation abort: " << f.format << " on '"

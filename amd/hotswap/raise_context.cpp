@@ -271,6 +271,17 @@ Value *RaiseContext::readOp32(const DecodedInst &di, unsigned opIdx) {
   if (di.isReg(opIdx)) {
     ParsedReg pr = parseReg(di.getReg(opIdx), opIdx);
     if (pr.kind == ParsedReg::VCC) {
+      if (projection.sourceWaveScopedLaneOps()) {
+        Value *mask = regs.readVCCAsWaveMask(B, regs.execTy);
+        Value *lo = B.CreateTrunc(mask, i32Ty, "vcc_src_wave_lo");
+        Value *hi = B.CreateTrunc(B.CreateLShr(mask, isa.waveSize),
+                                  i32Ty, "vcc_src_wave_hi");
+        Value *lane = projection.emitLaneIdx(B);
+        Value *upper =
+            B.CreateICmpUGE(lane, ConstantInt::get(i32Ty, isa.waveSize),
+                            "vcc_src_wave_upper");
+        return B.CreateSelect(upper, hi, lo, "vcc_src_wave_mask");
+      }
       // Reading VCC as an i32 (wave32 wave-mask, or low 32 bits on
       // wave64) is a cross-lane collection: emit amdgcn.ballot so each
       // lane gets the same bit-mask assembled from all lanes' per-lane
@@ -637,9 +648,21 @@ Value *RaiseContext::readOpExecWidth(const DecodedInst &di, unsigned opIdx) {
     if (pr.kind == ParsedReg::EXEC)
       return regs.loadExec(B);
     if (pr.kind == ParsedReg::SGPR) {
-      Value *narrow = isa.isWave32() ? regs.loadSGPR32(B, pr.baseIdx)
-                                      : regs.loadSGPR64(B, pr.baseIdx);
-      return widenToExec(narrow);
+      Value *narrow =
+          (projection.sourceWaveScopedLaneOps() && pr.width >= 2)
+              ? regs.loadSGPR64(B, pr.baseIdx)
+              : (isa.isWave32() ? regs.loadSGPR32(B, pr.baseIdx)
+                                : regs.loadSGPR64(B, pr.baseIdx));
+      Value *fallback = widenToExec(narrow);
+      if (Value *shadowValid = loadSgprWaveMaskValid(pr.baseIdx)) {
+        Value *shadowExec = loadSgprWaveMaskExec(pr.baseIdx);
+        if (shadowExec->getType() != regs.execTy)
+          shadowExec = B.CreateZExtOrTrunc(shadowExec, regs.execTy,
+                                           "wm_shadow_exec_cast");
+        return B.CreateSelect(shadowValid, shadowExec, fallback,
+                              "exec_width_sgpr_shadow_sel");
+      }
+      return fallback;
     }
     errs() << "transpiler: readOpExecWidth unresolvable register '"
            << mc.regInfo->getName(di.getReg(opIdx)) << "' in " << di.mnemonic

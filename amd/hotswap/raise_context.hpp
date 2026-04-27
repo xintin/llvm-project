@@ -44,6 +44,7 @@ struct RaiseContext {
   // the context.
   const UserSgprLayout *userSgprLayout = nullptr;
   llvm::Function *kernel;
+  llvm::BasicBlock *threadLoopLatch = nullptr;
 
   llvm::Type *i1Ty;
   llvm::Type *i8Ty;

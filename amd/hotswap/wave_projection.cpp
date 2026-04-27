@@ -50,6 +50,13 @@ Value *WaveProjection::emitLaneIdx(IRBuilder<> &B) const {
   return laneId;
 }
 
+Value *WaveProjection::emitWorkitemIdX(IRBuilder<> &B) const {
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *fn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::amdgcn_workitem_id_x);
+  return B.CreateCall(fn, {}, "tid");
+}
+
 Value *WaveProjection::emitInitialExec(IRBuilder<> &B) const {
   // Default: the architectural boot state of a dispatched wave is
   // "every source lane active", i.e. all-ones in the source-width
@@ -407,6 +414,27 @@ ThreadLoopProjection::ThreadLoopProjection(const ISAProfile &srcIsa,
         "multiple of source wave size");
 }
 
+Value *ThreadLoopProjection::emitWorkitemIdX(IRBuilder<> &B) const {
+  if (!iterationAlloca_)
+    report_fatal_error(
+        "ThreadLoopProjection::emitWorkitemIdX requires an iteration alloca; "
+        "raiser must call setIterationAlloca before emitting source workitem ids");
+  Module *M = B.GetInsertBlock()->getModule();
+  Function *fn = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::amdgcn_workitem_id_x);
+  Value *tid = B.CreateCall(fn, {}, "tl_hw_tid");
+  Value *laneId = emitLaneIdx(B);
+  const unsigned srcBits = src_.waveSize;
+  const unsigned tgtBits = tgt_.waveSize;
+  Value *iter = B.CreateLoad(B.getInt32Ty(), iterationAlloca_, "tl_iter");
+  Value *base = B.CreateAnd(tid, B.getInt32(~(tgtBits - 1u)), "tl_tid_base");
+  Value *sourceLane = B.CreateAnd(laneId, B.getInt32(srcBits - 1u), "tl_source_lane");
+  Value *waveOffset =
+      B.CreateMul(iter, B.getInt32(srcBits), "tl_source_wave_off");
+  return B.CreateAdd(B.CreateAdd(base, waveOffset, "tl_tid_wave_base"),
+                     sourceLane, "tl_tid");
+}
+
 Value *ThreadLoopProjection::emitLaneActiveBit(IRBuilder<> &B,
                                                 Value *execVal) const {
   Value *laneId = emitLaneIdx(B);
@@ -431,25 +459,24 @@ Value *ThreadLoopProjection::ballotI1ToWidth(IRBuilder<> &B, Value *pred,
       M, Intrinsic::amdgcn_ballot, {waveMaskTy_});
   Value *waveMask = B.CreateCall(ballot, {pred}, name);
   const unsigned wantedBits = resultTy->getPrimitiveSizeInBits();
-  const unsigned sourceBits = sourceWaveMaskTy()->getPrimitiveSizeInBits();
-  if (wantedBits > sourceBits)
+  const unsigned waveBits = waveMaskTy_->getPrimitiveSizeInBits();
+  if (wantedBits > waveBits)
     report_fatal_error(
-        "ThreadLoopProjection::ballotI1ToWidth requires resultTy <= source "
+        "ThreadLoopProjection::ballotI1ToWidth requires resultTy <= target "
         "wave mask width");
-  Type *sourceTy = sourceWaveMaskTy();
-  Value *sourceMask = waveMask;
-  if (waveMask->getType()->getPrimitiveSizeInBits() > sourceBits)
-    sourceMask = B.CreateTrunc(waveMask, sourceTy, name + "_src_trunc");
-  if (wantedBits == sourceBits)
-    return sourceMask;
-  return B.CreateTrunc(sourceMask, resultTy, name + "_trunc");
+  if (wantedBits == waveBits)
+    return waveMask;
+  return B.CreateTrunc(waveMask, resultTy, name + "_trunc");
 }
 
 Value *ThreadLoopProjection::extractLaneBitFromWaveMask(
     IRBuilder<> &B, Value *v) const {
   if (v->getType() == B.getInt1Ty())
     return v;
-  Type *targetTy = sourceWaveMaskTy();
+  Type *targetTy = v->getType()->getPrimitiveSizeInBits() >
+                           sourceWaveMaskTy()->getPrimitiveSizeInBits()
+                       ? waveMaskTy_
+                       : sourceWaveMaskTy();
   unsigned srcBits = v->getType()->getPrimitiveSizeInBits();
   unsigned dstBits = targetTy->getPrimitiveSizeInBits();
   if (srcBits < dstBits) {
@@ -461,9 +488,12 @@ Value *ThreadLoopProjection::extractLaneBitFromWaveMask(
   }
   Value *laneIdx = emitLaneIdx(B);
   Value *laneIdxExt = B.CreateZExtOrTrunc(laneIdx, targetTy, "tl_mask_lane_idx");
-  Value *laneMod = B.CreateAnd(
-      laneIdxExt, ConstantInt::get(targetTy, dstBits - 1), "tl_mask_lane_mod");
-  Value *shifted = B.CreateLShr(v, laneMod, "tl_mask_at_lane");
+  Value *shiftIdx = (targetTy == waveMaskTy_)
+                        ? laneIdxExt
+                        : B.CreateAnd(laneIdxExt,
+                                      ConstantInt::get(targetTy, dstBits - 1),
+                                      "tl_mask_lane_mod");
+  Value *shifted = B.CreateLShr(v, shiftIdx, "tl_mask_at_lane");
   Value *bit = B.CreateAnd(shifted, ConstantInt::get(targetTy, 1),
                            "tl_mask_lane_bit");
   return B.CreateICmpNE(bit, ConstantInt::get(targetTy, 0), "tl_mask_lane_i1");

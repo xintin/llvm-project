@@ -140,7 +140,20 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
       // wave width, instead of a width-specific half-slice that would
       // silently miscompile under cross-widening.
       else if (name == "vcc_lo") {
-        v = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.i32Ty);
+        if (ctx.projection.sourceWaveScopedLaneOps()) {
+          Value *mask = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.regs.execTy);
+          Value *lo = ctx.B.CreateTrunc(mask, ctx.i32Ty, "vopd_vcc_lo_src");
+          Value *hi =
+              ctx.B.CreateTrunc(ctx.B.CreateLShr(mask, ctx.isa.waveSize),
+                                ctx.i32Ty, "vopd_vcc_hi_src");
+          Value *lane = ctx.projection.emitLaneIdx(ctx.B);
+          Value *upper = ctx.B.CreateICmpUGE(
+              lane, ConstantInt::get(ctx.i32Ty, ctx.isa.waveSize),
+              "vopd_vcc_upper_src_wave");
+          v = ctx.B.CreateSelect(upper, hi, lo, "vopd_vcc_src_wave_mask");
+        } else {
+          v = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.i32Ty);
+        }
       }
       else if (name.starts_with("s")) {
         int sidx = -1;

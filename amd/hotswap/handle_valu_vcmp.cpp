@@ -215,7 +215,10 @@ HandlerResult handleVALU_Vcmp(RaiseContext &ctx, const DecodedInst &di,
         // BB / scalar-interleaved / other-consumer cases remain the
         // obstruction classifier's responsibility to refuse
         // (wave_size_obstruction.cpp).
-        Type *sourceWidth = ctx.projection.sourceWaveMaskTy();
+        Type *sourceWidth =
+            (ctx.projection.sourceWaveScopedLaneOps() && d.width >= 2)
+                ? ctx.i64Ty
+                : ctx.projection.sourceWaveMaskTy();
         Value *mask = ctx.projection.ballotI1ToWidth(
             ctx.B, cmp, sourceWidth, "vcmp_ballot");
         ctx.writeRegExecWidth(d, mask);

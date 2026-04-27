@@ -545,7 +545,10 @@ void AllocaRegFile::writeRegExecWidth(IRBuilder<> &B, ParsedReg pr, Value *v) {
     // width policy. This is the symmetric counterpart of the widen-by-
     // replication done when the value was first read via
     // `readOpExecWidth` or computed by the `V_CMP → SGPR` ballot.
-    Type *sourceWidthTy = projection ? projection->sourceWaveMaskTy() : execTy;
+    Type *sourceWidthTy =
+        (projection && projection->sourceWaveScopedLaneOps() && pr.width >= 2)
+            ? B.getInt64Ty()
+            : (projection ? projection->sourceWaveMaskTy() : execTy);
     if (v->getType() != sourceWidthTy) {
       unsigned have = v->getType()->getPrimitiveSizeInBits();
       unsigned want = sourceWidthTy->getPrimitiveSizeInBits();

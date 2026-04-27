@@ -376,6 +376,27 @@ TEST(C5PredicateChain, WaveNativeProjectionGate) {
             std::string::npos);
 }
 
+TEST(C5PredicateChain, WaveNativeEqualityPredicateUsesMaskShadow) {
+  Harness H;
+  Value *tid = H.emitTid();
+  auto *i32Ty = Type::getInt32Ty(H.ctx);
+  Value *cmp = H.B.CreateICmpEQ(
+      tid, ConstantInt::get(i32Ty, 16), "c5_cmp_wave_native_eq");
+  H.emitStoreGate(cmp);
+  H.finish();
+
+  auto report = classifyPredicateChain(
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::WaveNative,
+      /*maxFlatWorkgroupSize=*/kTgtWs);
+  EXPECT_FALSE(report.refused);
+  EXPECT_FALSE(report.waveNativePhantomRefusal);
+  EXPECT_TRUE(report.waveNativeEqualityObserved);
+  EXPECT_EQ(report.observedSites.size(), 1u);
+  EXPECT_TRUE(report.refusalDetail.empty());
+  EXPECT_NE(report.suppressionReason.find("mask-shadow"),
+            std::string::npos);
+}
+
 TEST(C5PredicateChain, ThreadLoopProjectionGate) {
   Harness H;
   Value *tid = H.emitTid();

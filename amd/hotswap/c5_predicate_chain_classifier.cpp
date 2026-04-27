@@ -305,9 +305,9 @@ std::string formatSuppressionReason(PredicateChainProjection projection,
     break;
   case PredicateChainProjection::ThreadLoop:
     if (suppressThreadLoopC5)
-      return "selected ThreadLoopProjection via the SGPR-forced "
-             "explicit-readfirstlane retry; source-wave-scoped lane ops own "
-             "the C5 boundary for this narrowed route";
+      return "selected ThreadLoopProjection via an analysis-triggered "
+             "cross-widen retry; source-wave-scoped lane ops and banked "
+             "predicate masks own the C5 boundary for this narrowed route";
     break;
   }
   return "";
@@ -488,11 +488,26 @@ PredicateChainClassifierReport classifyPredicateChain(
     report.observedSites.push_back(detail);
 
     // Refuse according to the selected projection's C5 obligation.
+    //
+    // WaveNative removes MODREP's replica-lane EXEC aliasing, but equality
+    // predicates against lane-position constants are still load-bearing. The
+    // GPT-OSS MXFP4 upcast kernel surfaced the concrete counterexample:
+    // `icmp eq workitem.id.x-derived, 16` gates packed-sign selection and
+    // sparsely flips signs under wave32->wave64 WaveNative. The file header
+    // already identified eq/ne as the divergent predicate family; enforce that
+    // distinction here instead of suppressing it as attribution-only.
+    const bool waveNativeEqualitySite =
+        projection == PredicateChainProjection::WaveNative && cmp->isEquality();
+    if (waveNativeEqualitySite)
+      report.waveNativeEqualityObserved = true;
+    const bool siteRefuses = refuseObservedC5;
+
     // `!report.refused` avoids rewriting `refusalDetail` with later sites
     // so the diagnostic names the first failing icmp deterministically.
-    if (refuseObservedC5 && !report.refused) {
+    if (siteRefuses && !report.refused) {
       report.refused = true;
       report.waveNativePhantomRefusal = waveNativePhantomRefusal;
+      report.waveNativeEqualityRefusal = false;
       if (waveNativePhantomRefusal) {
         // Prepend the phantom-lane explanation so the diagnostic
         // names the distinguishing evidence the operator needs:
@@ -520,7 +535,12 @@ PredicateChainClassifierReport classifyPredicateChain(
     }
   }
 
-  if (!report.refused && !report.observedSites.empty())
+  if (!report.refused && report.waveNativeEqualityObserved)
+    report.suppressionReason =
+        "selected WaveNativeProjection with target-width mask-shadow coverage "
+        "for eq/ne C5 predicates; source-width SGPR stores are preserved while "
+        "mask consumers use the shadow when proven valid";
+  else if (!report.refused && !report.observedSites.empty())
     report.suppressionReason =
         formatSuppressionReason(projection, sourceWaveSize, targetWaveSize,
                                 maxFlatWorkgroupSize, suppressThreadLoopC5);

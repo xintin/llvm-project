@@ -87,6 +87,7 @@ TRITON_KERNELS := vecadd_f16 corpus_add_fp32 corpus_asin_fp32 \
                   matmul_fp16_16x16 \
                   sum_bitmatrix_rows_u32 \
                   sum_bitmatrix_rows_u32_nw4 \
+                  upcast_mxfp4_bf16 \
                   downcast_to_mxfp_fp32 \
                   downcast_to_mxfp_bf16 \
                   topk_forward_bf16 \

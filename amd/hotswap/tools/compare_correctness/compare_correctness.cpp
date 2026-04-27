@@ -4485,6 +4485,11 @@ tritonMakeInput(const TritonRecipe &t, int shapeValue) {
         uint32_t u = static_cast<uint32_t>(rng());
         std::memcpy(&out[i], &u, sizeof(uint32_t));
       }
+    } else if (b.dtype == "i8" || b.dtype == "u8") {
+      auto *out = reinterpret_cast<uint8_t *>(buf.data() + off);
+      size_t n = sz;
+      for (size_t i = 0; i < n; ++i)
+        out[i] = static_cast<uint8_t>(rng());
     } else if (b.dtype == "i64") {
       auto *out = reinterpret_cast<int64_t *>(buf.data() + off);
       size_t n = sz / 8;

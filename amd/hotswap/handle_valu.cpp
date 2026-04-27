@@ -134,7 +134,10 @@ void writeCarryOutI1(RaiseContext &ctx, const DecodedInst &di,
       return;
     case ParsedReg::SGPR:
       if (carryDst.baseIdx >= 0) {
-        Type *sourceWidth = ctx.projection.sourceWaveMaskTy();
+        Type *sourceWidth =
+            (ctx.projection.sourceWaveScopedLaneOps() && carryDst.width >= 2)
+                ? ctx.i64Ty
+                : ctx.projection.sourceWaveMaskTy();
         Value *mask = ctx.projection.ballotI1ToWidth(
             ctx.B, carryI1, sourceWidth, "carry_ballot");
         ctx.writeRegExecWidth(carryDst, mask);
