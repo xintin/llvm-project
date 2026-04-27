@@ -99,6 +99,22 @@ HandlerResult handleSOPP(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
 
+  // Source wait counters are ordering operations, not decorative no-ops.  The
+  // TensorDescriptor MXFP upcast emits `s_wait_dscnt 0` between LDS stores /
+  // loads and split barriers; dropping it lets gfx942 reach `s_barrier` before
+  // the prior DS operation is complete, producing sparse nondeterministic sign
+  // flips after the LDS reshape.  Cross-target counter names do not map 1:1, so
+  // use the conservative gfx942-compatible wait-all form.
+  if (sop == SemOp::S_WAITCNT || sop == SemOp::S_WAIT_LOADCNT ||
+      sop == SemOp::S_WAIT_KMCNT || sop == SemOp::S_WAIT_DSCNT ||
+      sop == SemOp::S_WAIT_XCNT || sop == SemOp::S_WAIT_LOADCNT_DSCNT) {
+    Function *waitFn =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::amdgcn_s_waitcnt);
+    ctx.B.CreateCall(waitFn, {ctx.B.getInt32(0)});
+    hr.handled = true;
+    return hr;
+  }
+
   // gfx1250 async-memory wait counters. Explicit arm (rather than
   // falling through to the generic SOPP no-op catch-all below) so
   // this handler's surface documents the async/tensor cross-target
@@ -118,25 +134,19 @@ HandlerResult handleSOPP(RaiseContext &ctx, const DecodedInst &di,
   // re-inserts the target-appropriate `s_waitcnt lgkmcnt(0)` on
   // gfx942 from that ordering constraint.
   //
-  // On the same-target arm (gfx1250 → gfx1250) this branch is
-  // still a no-op — like `S_WAITCNT` / `S_WAIT_LOADCNT` / the
-  // other wait counters handled by the generic catch-all, the
-  // async intrinsic's `IntrInaccessibleMemOrArgMemOnly`
-  // annotation prevents reorder across the wait site and the
-  // backend re-emits the native `s_wait_asynccnt` /
-  // `s_wait_tensorcnt` from the IR's load/store dataflow.  The
-  // two arms are therefore emission-identical; the explicit
-  // branch is a documentation / audit anchor, not a dispatch
-  // split.  See the `S_WAIT_ASYNCCNT` / `S_WAIT_TENSORCNT` SemOp
-  // doc block in `semop.hpp` and `sync-translation.md §5.2.b`
-  // for the full trade-off and the dependency on IR-level
-  // ordering.
+  // On the same-target arm (gfx1250 → gfx1250) this branch remains
+  // emission-light for now: the async intrinsic's
+  // `IntrInaccessibleMemOrArgMemOnly` annotation prevents reorder across the
+  // wait site, while the asynchronous operation itself is what carries the
+  // relevant memory dependency.  Do not merge this arm with the ordinary
+  // wait-counter branch above unless the async/tensor counter semantics have a
+  // target-independent wait-all lowering too.
   if (sop == SemOp::S_WAIT_ASYNCCNT || sop == SemOp::S_WAIT_TENSORCNT) {
     hr.handled = true;
     return hr;
   }
 
-  // All other SOPP instructions (waitcnt, nop, etc.) are no-ops
+  // All other SOPP instructions (nop, scheduling hints, etc.) are no-ops.
   hr.handled = true;
   return hr;
 }

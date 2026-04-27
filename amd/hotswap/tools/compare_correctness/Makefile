@@ -46,6 +46,7 @@ KERNELS        := vecadd block_sum_shfl lane_swap \
                   s_bitset0_b64 v_bfi_b32 v_cmp_cndmask_sgpr \
                   v_cmpx_gt_i32 s_and_saveexec_b32 \
                   vopd_bitop2_or_b32 \
+                  v_perm_b32_sign_lane \
                   wmma_f32_16x16x4_gemm \
                   mubuf_store_b32 s_set_vgpr_msb \
                   canary_readlane_last_lane \

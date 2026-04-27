@@ -2790,6 +2790,86 @@ Recipe makeVopdBitop2OrB32Recipe() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Recipe: v_perm_b32_sign_lane — MXFP4 sign-bit lane packing probe
+// Pins the `v_perm_b32(high_sign, low_sign, 0x05040100)` convention used by
+// `_upcast_from_mxfp`: selector bytes 0/1 must come from instruction src1
+// (the low FP4 sign), while bytes 4/5 come from src0 (the high FP4 sign).
+// ─────────────────────────────────────────────────────────────────────────────
+
+Recipe makeVPermB32SignLaneRecipe() {
+  Recipe r;
+  r.name = "v_perm_b32_sign_lane";
+  r.defaultNs     = {16, 64, 256, 1024, 4096};
+  r.defaultBlocks = {256};
+  r.outputElemBytes = sizeof(uint32_t);
+  r.outputElems = [](int N, int) { return N; };
+
+  r.makeInput = [](int N) {
+    std::vector<uint8_t> buf(N * sizeof(uint32_t));
+    auto *u = reinterpret_cast<uint32_t *>(buf.data());
+    for (int i = 0; i < N; ++i) {
+      // Cycle every byte value, including 0xF1..0xF7 where the high FP4
+      // sign is set and the low FP4 sign is clear.
+      u[i] = static_cast<uint32_t>(i & 0xff);
+    }
+    return buf;
+  };
+
+  r.cpuReference = [](const std::vector<uint8_t> &input, int N, int) {
+    const uint32_t *in = reinterpret_cast<const uint32_t *>(input.data());
+    std::vector<uint8_t> out(N * sizeof(uint32_t));
+    auto *o = reinterpret_cast<uint32_t *>(out.data());
+    for (int i = 0; i < N; ++i) {
+      uint32_t x = in[i] & 0xffu;
+      uint32_t lowSign = x & 0x08u;
+      uint32_t highSign = x & 0x80u;
+      uint32_t packed = (highSign << 16) | lowSign;
+      uint32_t low = (packed & 0x0000ffffu) << 12;
+      uint32_t high = (packed & 0xffff0000u) << 8;
+      o[i] = (high & 0xffff0000u) | (low & 0x0000ffffu);
+    }
+    return out;
+  };
+
+  r.dispatch = [](hipModule_t mod, const std::vector<uint8_t> &input,
+                  int N, int blockSize) {
+    hipFunction_t fn;
+    HIP_ASSERT(hipModuleGetFunction(&fn, mod, "v_perm_b32_sign_lane"));
+    uint32_t *dIn = nullptr, *dOut = nullptr;
+    size_t bytes = N * sizeof(uint32_t);
+    HIP_ASSERT(hipMalloc(&dIn, bytes));
+    HIP_ASSERT(hipMalloc(&dOut, bytes));
+    HIP_ASSERT(hipMemcpy(dIn, input.data(), bytes, hipMemcpyHostToDevice));
+    HIP_ASSERT(hipMemset(dOut, 0x00, bytes));
+    struct alignas(8) Args {
+      const uint32_t *in;
+      uint32_t *out;
+      int n;
+    } args = {dIn, dOut, N};
+    size_t argSize = sizeof(args);
+    void *cfg[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                   HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                   HIP_LAUNCH_PARAM_END};
+    int grd = (N + blockSize - 1) / blockSize;
+    HIP_ASSERT(hipModuleLaunchKernel(fn, grd, 1, 1, blockSize, 1, 1, 0,
+                                     nullptr, nullptr, cfg));
+    HIP_ASSERT(hipDeviceSynchronize());
+    std::vector<uint8_t> out(bytes);
+    HIP_ASSERT(hipMemcpy(out.data(), dOut, bytes, hipMemcpyDeviceToHost));
+    HIP_ASSERT(hipFree(dIn));
+    HIP_ASSERT(hipFree(dOut));
+    return out;
+  };
+
+  r.compare = [](const std::vector<uint8_t> &gold,
+                 const std::vector<uint8_t> &actual,
+                 int /*N*/, int /*blockSize*/, int n) {
+    return compareU32Exact(gold, actual, n);
+  };
+  return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Recipe: c4_lane_dep_cmpx — runtime evidence for Class 4 (lane-
 // position-dependent EXEC writes) per hotswap/docs/wave-size-
 // translation.md §6.
@@ -5381,6 +5461,7 @@ const std::vector<Recipe> &allRecipes() {
         makeVCmpxGtI32Recipe(),
         makeSAndSaveexecB32Recipe(),
         makeVopdBitop2OrB32Recipe(),
+        makeVPermB32SignLaneRecipe(),
         // c4_lane_dep_cmpx is deliberately not registered here.  It is a
         // gfx1250-only fail-loud classifier canary with no native gfx942
         // numerical gold; see kernels/c4_lane_dep_cmpx.hip and the
