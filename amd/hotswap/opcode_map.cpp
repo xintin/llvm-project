@@ -288,6 +288,7 @@ static const Entry kCanonTable[] = {
     E(S_MUL_HI_I32, S_MUL_HI_I32),
     E(S_MUL_U64, S_MUL_U64), E(S_MUL_F32, S_MUL_F32),
     E(S_ADD_F32, S_ADD_F32), E(S_SUB_F32, S_SUB_F32),
+    E(S_FMAC_F32, S_FMAC_F32),
     // LLVM's canonical pseudo is `S_{MIN,MAX}_F32` on both gfx11
     // (`s_{min,max}_f32`) and gfx12+ (`s_{min,max}_num_f32`, via the
     // subtarget-specific real rename). Route it through NUM SemOps so the

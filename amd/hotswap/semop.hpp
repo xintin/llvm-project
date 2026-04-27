@@ -285,6 +285,10 @@ enum class SemOp : uint16_t {
   S_ABSDIFF_I32,
   S_LSHL_B32, S_LSHL_B64, S_LSHR_B32, S_LSHR_B64, S_ASHR_I32, S_ASHR_I64,
   S_MUL_I32, S_MUL_HI_U32, S_MUL_HI_I32, S_MUL_U64, S_MUL_F32, S_ADD_F32, S_SUB_F32,
+  // gfx11+ scalar fused multiply-accumulate. SOP2 encodes only two explicit
+  // sources; OPF_DACCUM ties the old destination value as the third operand:
+  //   sdst.f32 = fma(ssrc0.f32, ssrc1.f32, old sdst.f32)
+  S_FMAC_F32,
   // Scalar IEEE-754-2019 maximumNumber/minimumNumber. LLVM's canonical pseudo
   // is `S_{MAX,MIN}_F32`; gfx12+ manuals name the real mnemonics
   // `s_{max,min}_num_f32` and keep `s_{max,min}_f32` as compatibility aliases.

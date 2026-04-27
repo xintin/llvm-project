@@ -361,6 +361,24 @@ HandlerResult handleSOP2(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // gfx11+ scalar FP fused multiply-accumulate. Manual §4.5.25 marks this
+  // OPF_DACCUM and defines `D0.f32 = fma(S0.f32, S1.f32, D0.f32)`, so the
+  // third operand is the old destination value, not a hidden source slot.
+  if (sop == SemOp::S_FMAC_F32) {
+    ParsedReg dstReg = op.dst();
+    Value *s0 = ctx.B.CreateBitCast(op.src(0), ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(op.src(1), ctx.f32Ty);
+    Value *acc = ctx.B.CreateBitCast(ctx.regs.readReg32(ctx.B, dstReg),
+                                     ctx.f32Ty);
+    Function *fma =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fma, {ctx.f32Ty});
+    ctx.regs.writeReg32(
+        ctx.B, dstReg,
+        ctx.B.CreateBitCast(ctx.B.CreateCall(fma, {s0, s1, acc}, "s_fmac"),
+                            ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
   // Scalar IEEE-754-2019 maximumNumber/minimumNumber. LLVM's canonical pseudo
   // is `S_{MAX,MIN}_F32`; `instruction_manual.pdf` §4.5.39/§4.5.45 names the
   // gfx12+ real mnemonics `s_max_num_f32` / `s_min_num_f32`, with `s_max_f32`
