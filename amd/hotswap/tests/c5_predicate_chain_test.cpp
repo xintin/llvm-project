@@ -39,11 +39,11 @@
 //     direction gate.
 //   * WaveNativeProjectionGate — same refusal-shaped kernel as
 //     TidDirectSmallConstRefuses, but invoked with
-//     `waveNative = true`. MUST return `!refused` while STILL
-//     populating `observedSites` (the walk runs so raiser.cpp
-//     can emit `LLVM_DEBUG` attribution breadcrumbs — the
-//     classifier's `waveNative` gate SUPPRESSES refusal, it does
-//     not skip the walk). Pins the structural projection gate:
+//     `PredicateChainProjection::WaveNative`. MUST return `!refused`
+//     while STILL populating `observedSites` (the walk runs so
+//     raiser.cpp can emit `LLVM_DEBUG` attribution breadcrumbs — the
+//     classifier's projection gate SUPPRESSES refusal, it does not
+//     skip the walk). Pins the structural projection gate:
 //     under WaveNativeProjection each target lane is its own
 //     source lane, so the MODREP replica-1 rationale does not
 //     apply, but we still need the site list for debug
@@ -113,6 +113,7 @@
 using namespace llvm;
 using transpiler::classifyPredicateChain;
 using transpiler::PredicateChainClassifierReport;
+using transpiler::PredicateChainProjection;
 
 namespace {
 
@@ -339,36 +340,40 @@ TEST(C5PredicateChain, WaveNativeProjectionGate) {
   H.emitStoreGate(cmp);
   H.finish();
 
-  // Sanity: under MODREP (waveNative=false) this exact IR refuses.
-  // Narrows the WaveNative assertion to "the flag specifically is
+  // Sanity: under MODREP with unknown workgroup metadata this exact IR
+  // refuses. Narrows the WaveNative assertion to "the projection is
   // what turns the refusal off", not "the IR happens to be safe".
-  auto modrepReport =
-      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/false);
+  auto modrepReport = classifyPredicateChain(
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::ModuloReplication);
   EXPECT_TRUE(modrepReport.refused);
-  EXPECT_FALSE(modrepReport.phantomLaneRefusal);
+  EXPECT_FALSE(modrepReport.waveNativePhantomRefusal);
 
   // WaveNative + no maxFlatWorkgroupSize given (default 0 == unknown
   // to the classifier). Suppression arm kicks in, walk still runs.
-  auto waveNativeReport =
-      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/true);
+  auto waveNativeReport = classifyPredicateChain(
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::WaveNative);
   EXPECT_FALSE(waveNativeReport.refused);
-  EXPECT_FALSE(waveNativeReport.phantomLaneRefusal);
+  EXPECT_FALSE(waveNativeReport.waveNativePhantomRefusal);
   // Walk still runs — `visitedCalls` reflects the tid call count,
   // and `observedSites` names the C5 shape so raiser.cpp can emit
   // LLVM_DEBUG attribution. Only the refusal itself is suppressed.
   EXPECT_EQ(waveNativeReport.visitedCalls, 1u);
   EXPECT_EQ(waveNativeReport.observedSites.size(), 1u);
   EXPECT_TRUE(waveNativeReport.refusalDetail.empty());
+  EXPECT_NE(waveNativeReport.suppressionReason.find("WaveNativeProjection"),
+            std::string::npos);
 
   // WaveNative + maxFlatWorkgroupSize >= targetWaveSize (no phantom
   // lanes). Suppression arm kicks in — same shape as the default-0
   // case above.
   auto noPhantomReport = classifyPredicateChain(
-      *H.F, kSrcWs, kTgtWs, /*waveNative=*/true,
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::WaveNative,
       /*maxFlatWorkgroupSize=*/kTgtWs);
   EXPECT_FALSE(noPhantomReport.refused);
-  EXPECT_FALSE(noPhantomReport.phantomLaneRefusal);
+  EXPECT_FALSE(noPhantomReport.waveNativePhantomRefusal);
   EXPECT_EQ(noPhantomReport.observedSites.size(), 1u);
+  EXPECT_NE(noPhantomReport.suppressionReason.find("target wave size"),
+            std::string::npos);
 }
 
 TEST(C5PredicateChain, ThreadLoopProjectionGate) {
@@ -380,18 +385,20 @@ TEST(C5PredicateChain, ThreadLoopProjectionGate) {
   H.emitStoreGate(cmp);
   H.finish();
 
-  auto modrepReport =
-      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/false);
+  auto modrepReport = classifyPredicateChain(
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::ModuloReplication);
   EXPECT_TRUE(modrepReport.refused);
 
   auto threadLoopReport = classifyPredicateChain(
-      *H.F, kSrcWs, kTgtWs, /*waveNative=*/false,
-      /*maxFlatWorkgroupSize=*/kSrcWs, /*threadLoop=*/true);
+      *H.F, kSrcWs, kTgtWs, PredicateChainProjection::ThreadLoop,
+      /*maxFlatWorkgroupSize=*/kSrcWs, /*suppressThreadLoopC5=*/true);
   EXPECT_FALSE(threadLoopReport.refused);
-  EXPECT_FALSE(threadLoopReport.phantomLaneRefusal);
+  EXPECT_FALSE(threadLoopReport.waveNativePhantomRefusal);
   EXPECT_EQ(threadLoopReport.visitedCalls, 1u);
   EXPECT_EQ(threadLoopReport.observedSites.size(), 1u);
   EXPECT_TRUE(threadLoopReport.refusalDetail.empty());
+  EXPECT_NE(threadLoopReport.suppressionReason.find("ThreadLoopProjection"),
+            std::string::npos);
 }
 
 // ---------------------------------------------------------------------
@@ -412,17 +419,17 @@ TEST(C5PredicateChain, WaveNativePhantomLaneRegimeRefuses) {
   H.finish();
 
   // Phantom-lane guaranteed: max_flat_workgroup_size = source wave
-  // size (32) is BELOW the target wave size (64), so every launch
-  // leaves 32 lanes of the target wavefront outside the source
-  // kernel's lane index space. The classifier must refuse under
-  // WaveNative with `phantomLaneRefusal == true` so downstream
-  // attribution distinguishes this arm from the baseline MODREP
-  // refusal (which fires on the same IR regardless of WG size).
+  // size (32) is BELOW the target wave size (64), so a direct WaveNative
+  // caller would make lanes outside the source lane space active via
+  // init_whole_wave. The classifier must refuse under WaveNative with
+  // `waveNativePhantomRefusal == true` so downstream attribution
+  // distinguishes this defensive arm from the baseline MODREP refusal.
   auto phantomReport =
-      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/true,
+      classifyPredicateChain(*H.F, kSrcWs, kTgtWs,
+                              PredicateChainProjection::WaveNative,
                               /*maxFlatWorkgroupSize=*/kSrcWs);
   EXPECT_TRUE(phantomReport.refused);
-  EXPECT_TRUE(phantomReport.phantomLaneRefusal);
+  EXPECT_TRUE(phantomReport.waveNativePhantomRefusal);
   EXPECT_EQ(phantomReport.observedSites.size(), 1u);
   // Diagnostic names the phantom-lane rationale so operators can
   // distinguish the two refusal arms at triage time. Match on a
@@ -458,10 +465,13 @@ TEST(C5PredicateChain, WaveNativeUnknownWorkgroupSizeKeepsSuppression) {
   // Explicitly pass `maxFlatWorkgroupSize = 0` to assert the
   // "unknown" sentinel does NOT trigger phantom-lane refusal.
   auto report =
-      classifyPredicateChain(*H.F, kSrcWs, kTgtWs, /*waveNative=*/true,
+      classifyPredicateChain(*H.F, kSrcWs, kTgtWs,
+                              PredicateChainProjection::WaveNative,
                               /*maxFlatWorkgroupSize=*/0u);
   EXPECT_FALSE(report.refused);
-  EXPECT_FALSE(report.phantomLaneRefusal);
+  EXPECT_FALSE(report.waveNativePhantomRefusal);
+  EXPECT_NE(report.suppressionReason.find("unknown max_flat_workgroup_size"),
+            std::string::npos);
 }
 
 // ---------------------------------------------------------------------
@@ -471,7 +481,7 @@ TEST(C5PredicateChain, WaveNativeUnknownWorkgroupSizeKeepsSuppression) {
 // but the MODREP path should not flip on. Pins the "MODREP arm is
 // independent of maxFlatWorkgroupSize" contract.
 // ---------------------------------------------------------------------
-TEST(C5PredicateChain, ModrepArmIgnoresWorkgroupSize) {
+TEST(C5PredicateChain, ModrepSingleSourceWaveAccepts) {
   Harness H;
   Value *tid = H.emitTid();
   auto *i32Ty = Type::getInt32Ty(H.ctx);
@@ -480,16 +490,44 @@ TEST(C5PredicateChain, ModrepArmIgnoresWorkgroupSize) {
   H.emitStoreGate(cmp);
   H.finish();
 
-  // MODREP: refuses at maxFlatWG = 0 (unknown), = kSrcWs (phantom
-  // would-be-trigger), and = kTgtWs (no phantom). All three should
-  // refuse with phantomLaneRefusal=false — the phantom-lane bit is
-  // a WaveNative-only annotation.
-  for (unsigned wg : {0u, kSrcWs, kTgtWs, 4u * kTgtWs}) {
+  // MODREP + a statically single-source-wave workgroup has no active
+  // target replica lanes: lanes >= W_s remain hardware-inactive for the
+  // whole kernel, so the C5 replica-divergence obligation does not apply.
+  for (unsigned wg : {1u, kSrcWs - 1, kSrcWs}) {
     auto report = classifyPredicateChain(
-        *H.F, kSrcWs, kTgtWs, /*waveNative=*/false,
+        *H.F, kSrcWs, kTgtWs, PredicateChainProjection::ModuloReplication,
+        /*maxFlatWorkgroupSize=*/wg);
+    EXPECT_FALSE(report.refused) << "wg=" << wg;
+    EXPECT_FALSE(report.waveNativePhantomRefusal) << "wg=" << wg;
+    EXPECT_EQ(report.observedSites.size(), 1u) << "wg=" << wg;
+    EXPECT_TRUE(report.refusalDetail.empty()) << "wg=" << wg;
+    EXPECT_NE(report.suppressionReason.find("no active target replica lanes"),
+              std::string::npos)
+        << "wg=" << wg << " reason='" << report.suppressionReason << "'";
+  }
+}
+
+TEST(C5PredicateChain, ModrepUnknownOrActiveReplicaRefuses) {
+  Harness H;
+  Value *tid = H.emitTid();
+  auto *i32Ty = Type::getInt32Ty(H.ctx);
+  Value *cmp = H.B.CreateICmpULT(
+      tid, ConstantInt::get(i32Ty, 15), "c5_cmp_modrep_active_replica");
+  H.emitStoreGate(cmp);
+  H.finish();
+
+  // Unknown metadata fails conservative. Any workgroup bound above W_s can
+  // activate at least one target lane outside the source-wave lane domain,
+  // so the original MODREP C5 refusal still fires.
+  for (unsigned wg : {0u, kSrcWs + 1, kTgtWs, 4u * kTgtWs}) {
+    auto report = classifyPredicateChain(
+        *H.F, kSrcWs, kTgtWs, PredicateChainProjection::ModuloReplication,
         /*maxFlatWorkgroupSize=*/wg);
     EXPECT_TRUE(report.refused) << "wg=" << wg;
-    EXPECT_FALSE(report.phantomLaneRefusal) << "wg=" << wg;
+    EXPECT_FALSE(report.waveNativePhantomRefusal) << "wg=" << wg;
+    EXPECT_NE(report.refusalDetail.find("compile-time constant 15"),
+              std::string::npos)
+        << "wg=" << wg << " detail='" << report.refusalDetail << "'";
   }
 }
 

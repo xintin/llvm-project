@@ -2142,15 +2142,18 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
   // rewrite, pair it with a `RewriteId` alongside
   // `ObstructionKind::WorkitemIdPredicateChain`.
   {
-    // Pass the selected projection to the classifier. The WaveNative and
-    // ThreadLoop arms suppress the MODREP-specific refusal while still
-    // walking the IR so `observedSites` is populated for attribution. The
-    // WaveNative arm re-enables refusal for the phantom-lane sub-case
-    // (`max_flat_workgroup_size < targetWaveSize`) — see
-    // `c5_predicate_chain_classifier.hpp` for the full rationale.
+    // Pass the projection actually selected for this kernel, not the
+    // user-facing enable flag. Phantom-lane kernels route to MODREP above;
+    // the classifier then decides whether that MODREP instance can have an
+    // active replica lane before turning an observed C5 site into a refusal.
+    PredicateChainProjection predProjection =
+        useThreadLoop ? PredicateChainProjection::ThreadLoop
+                      : (useWaveNative
+                             ? PredicateChainProjection::WaveNative
+                             : PredicateChainProjection::ModuloReplication);
     PredicateChainClassifierReport predReport =
         classifyPredicateChain(*F, isa.waveSize, targetIsa.waveSize,
-                                enableWaveNative,
+                                predProjection,
                                 /*maxFlatWorkgroupSize=*/
                                 meta.maxFlatWorkgroupSize > 0
                                     ? static_cast<unsigned>(
@@ -2159,14 +2162,22 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
                                 useThreadLoop &&
                                     suppressC5ForThreadLoopRoute);
 
-    if ((enableWaveNative || useThreadLoop) && !predReport.refused &&
-        !predReport.observedSites.empty()) {
+    if (!predReport.refused && !predReport.observedSites.empty()) {
+      result.c5SuppressedCount +=
+          static_cast<int>(predReport.observedSites.size());
+      if (result.c5SuppressionReason.empty())
+        result.c5SuppressionReason = predReport.suppressionReason;
+      const char *projectionName =
+          predProjection == PredicateChainProjection::ThreadLoop
+              ? "ThreadLoopProjection"
+              : (predProjection == PredicateChainProjection::WaveNative
+                     ? "WaveNativeProjection"
+                     : "ModuloReplicationProjection");
       LLVM_DEBUG({
         dbgs() << "c5-predicate-chain: observed "
                << predReport.observedSites.size()
                << " C5-shape site(s) in '" << kernelName << "' under "
-               << (useThreadLoop ? "ThreadLoopProjection"
-                                 : "WaveNativeProjection")
+               << projectionName
                << " (refusal "
                   "suppressed per c5_predicate_chain_classifier.hpp "
                   "projection contract):\n";
@@ -2182,7 +2193,7 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
              << f.mnemonic << "' \u2014 " << f.detail << "\n";
       errs() << "  outcome: (c) refuse \u2014 "
                 "WorkitemIdPredicateChain (\u00a73 Class 5"
-             << (predReport.phantomLaneRefusal
+             << (predReport.waveNativePhantomRefusal
                      ? " phantom-lane sub-case"
                      : "")
              << ")\n";

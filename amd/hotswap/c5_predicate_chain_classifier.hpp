@@ -121,10 +121,10 @@ namespace transpiler {
 //
 //   * `canary_bpermute_scan_fp32`: Kogge-Stone scan stages emit
 //     `icmp ult i32 K, %tid` with K in {1, 3, 7, 15} (all
-//     `<= W_s - 1 = 31`). Classifier refuses. This is the
-//     MODREP-path loud-refusal outcome. Under the WaveNative
-//     default the refusal is short-circuited (see `waveNative`
-//     docstring below); the recipe's previously-observed WRONG
+//     `<= W_s - 1 = 31`). Classifier refuses when MODREP can have
+//     active replica lanes. Under the WaveNative default the refusal
+//     is short-circuited (see `projection` docstring below); the
+//     recipe's previously-observed WRONG
 //     numerics turned out to be an orthogonal VOPD-cndmask bug
 //     (design-doc §6.4), fixed independently of this classifier.
 //   * `rmsnorm_fp32`, `swiglu_fp32`, `corpus_layernorm_fp32`:
@@ -144,24 +144,29 @@ namespace transpiler {
 // refuse-only; there is no `RewriteId` entry paired with
 // `ObstructionKind::WorkitemIdPredicateChain` today.
 
+enum class PredicateChainProjection {
+  ModuloReplication,
+  WaveNative,
+  ThreadLoop,
+};
+
 struct PredicateChainClassifierReport {
   // True iff the classifier refused at least one icmp under the
   // current projection. When true, the raiser translates this into a
-  // `RaiseFailure::crossWavePredicateChain` refusal. Under
-  // `waveNative=true` this is false unless the caller also reports
-  // `maxFlatWorkgroupSize < targetWaveSize` (phantom-lane guaranteed,
-  // see the top-of-file docstring), in which case the WaveNative
-  // projection-model statement collapses and the refusal is the
-  // principled outcome.
+  // `RaiseFailure::crossWavePredicateChain` refusal. The decision is
+  // projection- and launch-regime-aware: MODREP refuses only when an
+  // active target replica lane can exist, WaveNative refuses only for
+  // the defensive phantom-lane sub-case, and ThreadLoop suppresses only
+  // for its separately-proven retry route.
   bool refused = false;
 
-  // When `refused == true` AND the trigger was the phantom-lane
-  // sub-case of the WaveNative arm (not the baseline MODREP arm),
-  // `refusalDetail` is augmented with the phantom-lane
-  // explanation so the diagnostic names the specific cause. This
-  // bit lets callers (and the lit fixtures) discriminate between
-  // the two refusal paths without string-matching the detail.
-  bool phantomLaneRefusal = false;
+  // When `refused == true` AND the trigger was the defensive
+  // phantom-lane sub-case of the WaveNative arm (not the baseline
+  // MODREP arm), `refusalDetail` is augmented with the phantom-lane
+  // explanation so the diagnostic names the specific cause. This bit
+  // lets callers (and the lit fixtures) discriminate between the two
+  // refusal paths without string-matching the detail.
+  bool waveNativePhantomRefusal = false;
 
   // Detail string for the first refused site. Empty iff `!refused`.
   // Stable-enough-for-lit substring format (see lit fixtures under
@@ -169,13 +174,19 @@ struct PredicateChainClassifierReport {
   std::string refusalDetail;
 
   // All C5-shape sites the classifier observed, regardless of
-  // whether they were refused. Populated even under
-  // `waveNative=true` so callers can emit an attribution
-  // `LLVM_DEBUG` breadcrumb on the WaveNative path and so a
-  // future iteration can widen the suppression-vs-refusal
-  // decision without rerunning Pass 2. Each entry is the same
-  // kind of string that `refusalDetail` carries.
+  // whether they were refused. Populated on suppressed projection
+  // routes so callers can emit attribution breadcrumbs and so a
+  // future iteration can widen the suppression-vs-refusal decision
+  // without rerunning Pass 2. Each entry is the same kind of string
+  // that `refusalDetail` carries.
   llvm::SmallVector<std::string> observedSites;
+
+  // Non-empty iff `!refused && !observedSites.empty()`. Names the
+  // projection-specific proof that converted the observed C5 site(s)
+  // into an accepted kernel instead of a refusal. This is intentionally
+  // separate from `refusalDetail` so proof logs can surface safe-C5
+  // attribution without pretending it was an error.
+  std::string suppressionReason;
 
   // Number of `@llvm.amdgcn.workitem.id.x()` calls the classifier
   // visited. Informational; used by the lit fixtures to assert
@@ -190,8 +201,14 @@ struct PredicateChainClassifierReport {
 // `targetWaveSize <= sourceWaveSize` (same-wave / narrowing — no
 // replica-1 exists, nothing to refuse).
 //
-// `waveNative` parameter semantics. Setting `waveNative = true`
-// SUPPRESSES refusal; it does not skip the walk. Rationale:
+// `projection` parameter semantics. The caller must pass the projection
+// actually selected for this raise, not a user-facing enable flag. The
+// walk always runs; the projection only decides whether an observed C5
+// site becomes a refusal or an attribution breadcrumb. Successful raises with
+// suppressed C5 sites propagate `suppressionReason` to the loader proof log.
+//
+// `PredicateChainProjection::WaveNative` SUPPRESSES refusal in the normal
+// no-phantom regime. Rationale:
 //
 //   * Under `WaveNativeProjection` the `init_whole_wave` +
 //     per-source-lane modeled-EXEC model means the architectural
@@ -228,7 +245,10 @@ struct PredicateChainClassifierReport {
 //     the caller passes 0 ("unknown"), phantom lanes are
 //     possible but not provable — the classifier stays
 //     permissive and logs the site as an attribution breadcrumb
-//     (unchanged from the pre-phantom-lane behaviour).
+//     (unchanged from the pre-phantom-lane behaviour). The normal raiser
+//     path routes statically-known phantom-lane kernels to MODREP before
+//     this classifier runs; this WaveNative refusal is a defensive guard
+//     for direct callers and future projection-selection bugs.
 //
 //   * The walk still runs so the report's `observedSites` is
 //     populated. raiser.cpp emits `LLVM_DEBUG` for every
@@ -236,25 +256,35 @@ struct PredicateChainClassifierReport {
 //     breadcrumb — if a C5-shape kernel ever miscompiles under
 //     WaveNative, the debug log names the icmp site the
 //     classifier would have refused under MODREP.
+// `PredicateChainProjection::ModuloReplication` refuses only when an
+// active target replica lane can exist. The proof relies on the HSACO
+// metadata contract: `.max_flat_workgroup_size` is a hard upper bound on
+// the runtime workgroup size for the kernel descriptor Salmon emits. If
+// `0 < maxFlatWorkgroupSize <= sourceWaveSize`, the launch cannot
+// activate lanes outside the source wave's lane-index domain; under
+// MODREP those upper target lanes remain hardware-inactive for the whole
+// kernel, so the replica-divergence proof obligation does not apply. If
+// `maxFlatWorkgroupSize == 0` the evidence is unknown and the classifier
+// fails conservative; if `maxFlatWorkgroupSize > sourceWaveSize`, at
+// least one active target lane can evaluate the unmasked `tid` predicate
+// outside `[0, W_s)`, so C5 remains a loud refusal.
+//
 // `maxFlatWorkgroupSize`: the kernel's `max_flat_workgroup_size`
 // metadata field from the HSACO's `.amdgpu_metadata` section, or
-// 0 if the caller does not have the information. Used ONLY under
-// `waveNative = true` to narrow the suppression (see the file-
-// header docstring's phantom-lane discussion); has no effect under
-// the MODREP arm.
+// 0 if the caller does not have the information. Used by WaveNative's
+// defensive phantom-lane refusal and by MODREP's active-replica-lane
+// proof above.
 //
-// `threadLoop` parameter semantics. Setting `threadLoop = true` suppresses
-// the MODREP-only refusal but keeps the walk and `observedSites`. Callers
-// must set it only for a separately-proven ThreadLoop route; raiser.cpp does
-// so only for the SGPR-forced readlane/writelane -> explicit-readfirstlane
-// retry. It is not a blanket "ThreadLoop solves C5" assertion.
-//
-// `waveNative = false` and `threadLoop = false` is the MODREP arm; it still
-// fires unconditionally on any C5 site.
+// `suppressThreadLoopC5` is meaningful only with
+// `PredicateChainProjection::ThreadLoop`. Callers must set it only for a
+// separately-proven ThreadLoop route; raiser.cpp does so only for the
+// SGPR-forced readlane/writelane -> explicit-readfirstlane retry. It is
+// not a blanket "ThreadLoop solves C5" assertion.
 PredicateChainClassifierReport classifyPredicateChain(
     llvm::Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
-    bool waveNative = false, unsigned maxFlatWorkgroupSize = 0,
-    bool threadLoop = false);
+    PredicateChainProjection projection =
+        PredicateChainProjection::ModuloReplication,
+    unsigned maxFlatWorkgroupSize = 0, bool suppressThreadLoopC5 = false);
 
 } // namespace transpiler
 

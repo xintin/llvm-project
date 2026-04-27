@@ -22,6 +22,12 @@ struct RaiseResult {
   int totalCount = 0;
   std::string irText;
   std::string disasmText;
+  // C5 sites that were observed by the post-mem2reg classifier but accepted
+  // under the selected projection's proof obligation (for example
+  // single-source-wave MODREP with no active replica lanes). Propagated to
+  // the loader proof log so successful translations still carry attribution.
+  int c5SuppressedCount = 0;
+  std::string c5SuppressionReason;
   // Structured failure description. `failure.reason == None` iff `success`.
   RaiseFailure failure;
   bool success = false;
@@ -65,22 +71,19 @@ struct RaiseResult {
 // `corpus_layernorm_fp32` partial-matching with much smaller
 // residual error.
 //
-// MODREP (`ModuloReplicationProjection`) is retained but opt-in via
-// `--disable-wave-native` (raise_cli) or `enableWaveNative=false`
-// (pipeline callers). It remains correct on the narrow class of
-// kernels where source-wave-0's semantics replicate cleanly across
-// the target wave (pointwise kernels with no cross-wave state;
-// kernels that pass G1's obstruction classifier and whose cross-
-// lane ops stay within a single source-wave half). The C5
-// predicate-chain classifier (`c5_predicate_chain_classifier`) is
-// structurally MODREP-scoped (the refusal rationale is MODREP-
-// replica-specific) and short-circuits under WaveNative. Under
-// the WaveNative default, every recipe in the compare_correctness
-// Triton corpus that hits the C5 predicate-chain signature
-// end-to-end MATCHes (canary_bpermute_scan_fp32, corpus_layernorm_fp32);
-// see hotswap/docs/modrep-predicate-chain.md §6.4 for the
-// orthogonal VOPD-cndmask / carry-chain SGPR-operand fixes that
-// close those recipes independently of the predicate-chain class.
+// MODREP (`ModuloReplicationProjection`) is retained both as an explicit
+// opt-out via `--disable-wave-native` / `enableWaveNative=false` and as the
+// raiser's phantom-lane fallback for statically sub-wave workgroups. It
+// remains correct when no active target replica lanes exist, and the C5
+// predicate-chain classifier (`c5_predicate_chain_classifier`) now makes that
+// launch-regime proof explicit: MODREP C5 refuses when active replica lanes
+// can exist, but accepts `0 < max_flat_workgroup_size <= sourceWaveSize`
+// because upper target lanes remain hardware-inactive. Under the WaveNative
+// default, every recipe in the compare_correctness Triton corpus that hits the
+// C5 predicate-chain signature end-to-end MATCHes (canary_bpermute_scan_fp32,
+// corpus_layernorm_fp32); see hotswap/docs/modrep-predicate-chain.md §6.4 for
+// the orthogonal VOPD-cndmask / carry-chain SGPR-operand fixes that close
+// those recipes independently of the predicate-chain class.
 //
 // No process-global env-var override. `HSA_SALMON_WAVE_NATIVE=1`
 // was a transient test/debug hook during the graduation sweep

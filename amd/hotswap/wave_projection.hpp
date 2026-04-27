@@ -215,16 +215,18 @@ public:
   // source waves into one target wave (source wave 0 → target lanes
   // 0..31, source wave 1 → target lanes 32..63) — returns 2.
   //
-  // `ModuloReplicationProjection` in the cross-widening direction
-  // always fires under the phantom-lane regime
-  // (`max_flat_workgroup_size < targetWaveSize`, see `raiser.cpp`),
-  // which by definition has a single source wave (the workgroup is
-  // below one target wavefront, so the second "half" of the target
-  // wave has no source workitem — those lanes are phantom).  Same-
-  // wave MODREP instantiations (source == target wave width) also
-  // carry exactly one source wave per target.  Returns 1 in either
-  // case.  A future projection (`ThreadLoopProjection`) would answer
-  // this based on its wrap count.
+  // `ModuloReplicationProjection` in the cross-widening direction is the
+  // raiser's fallback for the statically-known phantom-lane regime
+  // (`max_flat_workgroup_size < targetWaveSize`, see `raiser.cpp`).  The
+  // single-source-wave subset (`max_flat_workgroup_size <= sourceWaveSize`)
+  // has no active target replica lanes: the second "half" of the target wave
+  // has no source workitem and remains hardware-inactive. Same-wave MODREP
+  // instantiations (source == target wave width) also carry exactly one
+  // source wave per target. Returns 1 in either case. Explicit MODREP opt-out
+  // runs that can activate replica lanes are still guarded by the C5
+  // classifier and other obstruction checks before any code is emitted. A
+  // future projection (`ThreadLoopProjection`) would answer this based on its
+  // wrap count.
   //
   // Pure virtual so every new projection must answer the question
   // explicitly — a silent default would let a new cross-widening

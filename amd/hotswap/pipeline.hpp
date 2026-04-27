@@ -17,6 +17,12 @@ struct PipelineResult {
   std::string failFormat;
   std::string failDetail;
   uint64_t failOffset = 0;
+  // Successful raises can still carry proof-relevant attribution. Today this
+  // records C5 predicate-chain sites accepted under a projection-specific
+  // proof (for example single-source-wave MODREP with no active replica
+  // lanes); loader proof logs surface these fields on `salmon_result`.
+  int c5SuppressedCount = 0;
+  std::string c5SuppressionReason;
   int liftedCount = 0;
   int totalCount = 0;
   bool success = false;

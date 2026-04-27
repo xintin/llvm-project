@@ -8,6 +8,8 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
@@ -241,11 +243,82 @@ std::string formatRefusalDetail(const ICmpInst *cmp, unsigned sourceWaveSize,
   return s;
 }
 
+bool modrepCanHaveActiveReplicaLane(unsigned sourceWaveSize,
+                                    unsigned maxFlatWorkgroupSize) {
+  // Unknown metadata cannot prove the no-replica-lane case, so keep the
+  // historical loud refusal. A known workgroup bound no larger than the
+  // source wave means target lanes outside [0, W_s) are hardware-inactive
+  // under MODREP and cannot observe a divergent `tid` predicate.
+  return maxFlatWorkgroupSize == 0 || maxFlatWorkgroupSize > sourceWaveSize;
+}
+
+bool shouldRefuseC5(PredicateChainProjection projection,
+                    unsigned sourceWaveSize, unsigned targetWaveSize,
+                    unsigned maxFlatWorkgroupSize,
+                    bool suppressThreadLoopC5) {
+  switch (projection) {
+  case PredicateChainProjection::ModuloReplication:
+    return modrepCanHaveActiveReplicaLane(sourceWaveSize,
+                                          maxFlatWorkgroupSize);
+  case PredicateChainProjection::WaveNative:
+    return maxFlatWorkgroupSize > 0 && maxFlatWorkgroupSize < targetWaveSize;
+  case PredicateChainProjection::ThreadLoop:
+    return !suppressThreadLoopC5;
+  }
+  llvm_unreachable("unknown PredicateChainProjection");
+}
+
+bool isWaveNativePhantomRefusal(PredicateChainProjection projection,
+                                unsigned targetWaveSize,
+                                unsigned maxFlatWorkgroupSize) {
+  return projection == PredicateChainProjection::WaveNative &&
+         maxFlatWorkgroupSize > 0 && maxFlatWorkgroupSize < targetWaveSize;
+}
+
+std::string formatSuppressionReason(PredicateChainProjection projection,
+                                    unsigned sourceWaveSize,
+                                    unsigned targetWaveSize,
+                                    unsigned maxFlatWorkgroupSize,
+                                    bool suppressThreadLoopC5) {
+  switch (projection) {
+  case PredicateChainProjection::ModuloReplication:
+    if (maxFlatWorkgroupSize > 0 && maxFlatWorkgroupSize <= sourceWaveSize)
+      return formatv("selected ModuloReplicationProjection with "
+                     "max_flat_workgroup_size={0} <= source wave size {1}; "
+                     "the HSACO launch-bound metadata proves no active target "
+                     "replica lanes exist, so upper target lanes remain "
+                     "hardware-inactive and cannot observe the C5 predicate",
+                     maxFlatWorkgroupSize, sourceWaveSize)
+          .str();
+    break;
+  case PredicateChainProjection::WaveNative:
+    if (maxFlatWorkgroupSize == 0)
+      return "selected WaveNativeProjection with unknown "
+             "max_flat_workgroup_size; no WaveNative phantom-lane evidence is "
+             "available, so C5 is an attribution breadcrumb";
+    if (maxFlatWorkgroupSize >= targetWaveSize)
+      return formatv("selected WaveNativeProjection with "
+                     "max_flat_workgroup_size={0} >= target wave size {1}; "
+                     "every target lane has a source-lane mapping",
+                     maxFlatWorkgroupSize, targetWaveSize)
+          .str();
+    break;
+  case PredicateChainProjection::ThreadLoop:
+    if (suppressThreadLoopC5)
+      return "selected ThreadLoopProjection via the SGPR-forced "
+             "explicit-readfirstlane retry; source-wave-scoped lane ops own "
+             "the C5 boundary for this narrowed route";
+    break;
+  }
+  return "";
+}
+
 } // namespace
 
 PredicateChainClassifierReport classifyPredicateChain(
     Function &F, unsigned sourceWaveSize, unsigned targetWaveSize,
-    bool waveNative, unsigned maxFlatWorkgroupSize, bool threadLoop) {
+    PredicateChainProjection projection, unsigned maxFlatWorkgroupSize,
+    bool suppressThreadLoopC5) {
   PredicateChainClassifierReport report;
 
   // Direction gate: no predicate-chain risk at same-wave or narrowing,
@@ -255,27 +328,12 @@ PredicateChainClassifierReport classifyPredicateChain(
   if (sourceWaveSize < 2)
     return report;
 
-  // Phantom-lane guaranteed iff the HSACO's
-  // `max_flat_workgroup_size` is BELOW the target wavefront width.
-  // In that regime every launch under-fills the target wavefront,
-  // lanes with architectural `tid >= maxFlatWorkgroupSize` are
-  // activated by `init_whole_wave` without a source-wave-to-target-
-  // lane mapping, and the WaveNative projection-model statement
-  // ("target lane's `tid` IS its own source-wave tid") collapses.
-  //
-  // The `> 0` guard is required: the raiser defaults
-  // `maxFlatWorkgroupSize` to 1024 when the HSACO metadata omits
-  // it (raiser.cpp §"Pin the workgroup size"), but callers that
-  // don't have the metadata at all (including legacy / ad-hoc
-  // tools) pass 0. Treating `0` as "phantom guaranteed" would
-  // refuse every kernel those callers raise, which is a
-  // soundness/practicality trade-off the phantom-lane rule was
-  // never designed to make — leave the classifier permissive
-  // when the evidence isn't there.
-  const bool phantomLaneGuaranteed =
-      waveNative && maxFlatWorkgroupSize > 0 &&
-      maxFlatWorkgroupSize < targetWaveSize;
-  const bool modrepReplicaRisk = !waveNative && !threadLoop;
+  const bool refuseObservedC5 =
+      shouldRefuseC5(projection, sourceWaveSize, targetWaveSize,
+                     maxFlatWorkgroupSize, suppressThreadLoopC5);
+  const bool waveNativePhantomRefusal =
+      isWaveNativePhantomRefusal(projection, targetWaveSize,
+                                 maxFlatWorkgroupSize);
 
   // ===== Pass 0: collect `@llvm.amdgcn.workitem.id.x()` call sites. =====
   SmallVector<CallInst *> sites;
@@ -333,24 +391,18 @@ PredicateChainClassifierReport classifyPredicateChain(
         // Constants), so this branch should be structurally unreachable.
         // If it ever does fire, that's an unexpected IR shape the
         // classifier can't reason about — refuse (fail loud) per the
-        // AGENTS.md "no silent fallback" discipline. The waveNative
-        // gate still suppresses the RaiseFailure (see Pass 2 below)
-        // but the site is logged for attribution.
+        // AGENTS.md "no silent fallback" discipline. This is deliberately
+        // NOT projection-suppressible: the accepted single-source-wave
+        // MODREP proof below applies to known C5 icmp sites, not unknown IR
+        // user classes.
         report.observedSites.push_back(
             "unexpected non-Instruction user of tid-derived Value; "
             "classifier cannot prove safety. "
             "See hotswap/docs/modrep-predicate-chain.md \u00a75.");
-        // Refuse under MODREP always, and under WaveNative only
-        // when phantom lanes are guaranteed (see file-header
-        // docstring). The ThreadLoop flag is passed only for the narrowed
-        // SGPR-forced retry path; it is not a blanket statement that every
-        // C5 shape is safe under the partial ThreadLoop projection surface.
-        if (modrepReplicaRisk || phantomLaneGuaranteed) {
-          report.refused = true;
-          report.phantomLaneRefusal = phantomLaneGuaranteed;
-          if (report.refusalDetail.empty())
-            report.refusalDetail = report.observedSites.back();
-        }
+        report.refused = true;
+        report.waveNativePhantomRefusal = false;
+        if (report.refusalDetail.empty())
+          report.refusalDetail = report.observedSites.back();
         continue;
       }
 
@@ -435,19 +487,13 @@ PredicateChainClassifierReport classifyPredicateChain(
     std::string detail = formatRefusalDetail(cmp, sourceWaveSize, smallK);
     report.observedSites.push_back(detail);
 
-    // Refuse under MODREP always (the historical behaviour) and
-    // under WaveNative only when phantom lanes are guaranteed. The
-    // ThreadLoop arm is enabled only by raiser.cpp's narrowed
-    // SGPR-forced retry path; it observes/logs the site but does not emit
-    // the MODREP-only refusal for that proven route.
-    // (the post-`canary_bitmatrix_composite` tightening — see
-    // file-header docstring). `!report.refused` avoids rewriting
-    // `refusalDetail` with later sites so the diagnostic names
-    // the first failing icmp deterministically.
-    if ((modrepReplicaRisk || phantomLaneGuaranteed) && !report.refused) {
+    // Refuse according to the selected projection's C5 obligation.
+    // `!report.refused` avoids rewriting `refusalDetail` with later sites
+    // so the diagnostic names the first failing icmp deterministically.
+    if (refuseObservedC5 && !report.refused) {
       report.refused = true;
-      report.phantomLaneRefusal = phantomLaneGuaranteed;
-      if (phantomLaneGuaranteed) {
+      report.waveNativePhantomRefusal = waveNativePhantomRefusal;
+      if (waveNativePhantomRefusal) {
         // Prepend the phantom-lane explanation so the diagnostic
         // names the distinguishing evidence the operator needs:
         // "WaveNative would normally let this through; the
@@ -473,6 +519,11 @@ PredicateChainClassifierReport classifyPredicateChain(
       }
     }
   }
+
+  if (!report.refused && !report.observedSites.empty())
+    report.suppressionReason =
+        formatSuppressionReason(projection, sourceWaveSize, targetWaveSize,
+                                maxFlatWorkgroupSize, suppressThreadLoopC5);
 
   return report;
 }

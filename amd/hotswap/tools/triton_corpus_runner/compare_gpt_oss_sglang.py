@@ -192,6 +192,9 @@ def _salmon_proof(proof_path: Path) -> dict:
     salmon_results = [e for e in events if e.get("event") == "salmon_result"]
     ok_results = [e for e in salmon_results if e.get("success") is True]
     failed_results = [e for e in salmon_results if e.get("success") is False]
+    c5_suppressed = [
+        e for e in ok_results if int(e.get("c5_suppressed_count", 0)) > 0
+    ]
     proof = {
         "proof_log": str(proof_path),
         "forced_child_target": any(
@@ -214,6 +217,10 @@ def _salmon_proof(proof_path: Path) -> dict:
         ),
         "salmon_ok_count": len(ok_results),
         "salmon_failed_count": len(failed_results),
+        "c5_suppressed_count": sum(
+            int(e.get("c5_suppressed_count", 0)) for e in c5_suppressed
+        ),
+        "first_c5_suppression": c5_suppressed[0] if c5_suppressed else None,
         "first_salmon_ok": ok_results[0] if ok_results else None,
         "first_salmon_failed": failed_results[0] if failed_results else None,
         "first_unsupported_instruction": (
@@ -467,6 +474,7 @@ def _write_markdown_report(report: dict, report_path: Path) -> None:
         f"| Saw loader transpile decision | {_fmt(proof.get('saw_loader_transpile_decision'))} |",
         f"| Salmon OK count | {_fmt(proof.get('salmon_ok_count'))} |",
         f"| Salmon FAILED count | {_fmt(proof.get('salmon_failed_count'))} |",
+        f"| C5 suppressed safe sites | {_fmt(proof.get('c5_suppressed_count'))} |",
         f"| First unsupported instruction | `{proof.get('first_unsupported_instruction') or 'n/a'}` |",
         "",
         "## Models",
