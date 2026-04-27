@@ -126,6 +126,8 @@ void populateKernelDescriptorFields(llvm::object::ObjectFile &obj,
   }
 
   using namespace llvm::amdhsa;
+  meta.privateSegmentFixedSize =
+      readU32(kdBytes.data() + PRIVATE_SEGMENT_FIXED_SIZE_OFFSET);
   meta.computePgmRsrc1 = readU32(kdBytes.data() + COMPUTE_PGM_RSRC1_OFFSET);
   meta.computePgmRsrc2 = readU32(kdBytes.data() + COMPUTE_PGM_RSRC2_OFFSET);
   meta.kernelCodeProperties =
@@ -360,6 +362,10 @@ KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
           auto gsfIt = kMap.find(doc.getNode(".group_segment_fixed_size"));
           if (gsfIt != kMap.end())
             meta.groupSegmentFixedSize = getNodeInt(gsfIt->second);
+
+          auto psfIt = kMap.find(doc.getNode(".private_segment_fixed_size"));
+          if (psfIt != kMap.end())
+            meta.privateSegmentFixedSize = getNodeInt(psfIt->second);
 
           auto mfwIt = kMap.find(doc.getNode(".max_flat_workgroup_size"));
           if (mfwIt != kMap.end())

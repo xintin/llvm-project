@@ -26,6 +26,7 @@ struct KernelMeta {
   std::string name;
   int kernargSegmentSize = 0;
   int groupSegmentFixedSize = 0;
+  int privateSegmentFixedSize = 0;
   int maxFlatWorkgroupSize = 256;
   std::vector<KernelArgMeta> args;
 
@@ -34,8 +35,13 @@ struct KernelMeta {
   //
   // Populated by extractKernelMeta from the 64-byte amd_kernel_code_t block
   // that lives at the symbol named `<kernelName>.kd` (always in the .rodata
-  // section for amdhsa code objects). These four integers are the entire
+  // section for amdhsa code objects). These fields are the entire
   // surface needed to derive the source-ISA SGPR ABI:
+  //
+  //   * privateSegmentFixedSize (KD bytes 4-7, mirrored from MsgPack): source
+  //     private/scratch bytes per work-item. A non-zero value paired with
+  //     `compute_pgm_rsrc2.ENABLE_PRIVATE_SEGMENT` is the launch-time ABI
+  //     request that makes ROCR/SPI allocate scratch backing.
   //
   //   * kernelCodeProperties  (KD bytes 56-57): bit field selecting which
   //     `enable_sgpr_*` user SGPRs the loader / packet processor will pre-

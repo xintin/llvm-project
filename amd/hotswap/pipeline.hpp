@@ -23,6 +23,10 @@ struct PipelineResult {
   // lanes); loader proof logs surface these fields on `salmon_result`.
   int c5SuppressedCount = 0;
   std::string c5SuppressionReason;
+  bool usesScratchPrivateSegment = false;
+  uint32_t sourcePrivateSegmentFixedSize = 0;
+  bool targetEnablePrivateSegment = false;
+  uint32_t targetPrivateSegmentFixedSize = 0;
   int liftedCount = 0;
   int totalCount = 0;
   bool success = false;

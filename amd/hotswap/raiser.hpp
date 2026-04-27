@@ -30,6 +30,8 @@ struct RaiseResult {
   std::string c5SuppressionReason;
   // Structured failure description. `failure.reason == None` iff `success`.
   RaiseFailure failure;
+  bool usesScratchPrivateSegment = false;
+  uint32_t sourcePrivateSegmentFixedSize = 0;
   bool success = false;
   bool hasDivergentExec = false;
 };

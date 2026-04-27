@@ -8,9 +8,11 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
+#include "llvm/Support/AMDHSAKernelDescriptor.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/StringExtras.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -90,6 +92,25 @@ std::string makeSafeBasename(const std::string &kernelName,
   return prefix + "_" + buf;
 }
 
+int toolTimeoutSeconds() {
+  static const int timeout = [] {
+    constexpr int kDefaultTimeoutSeconds = 300;
+    const char *env = std::getenv("HSA_SALMON_TOOL_TIMEOUT_S");
+    if (!env || !env[0])
+      return kDefaultTimeoutSeconds;
+    char *end = nullptr;
+    long parsed = std::strtol(env, &end, 10);
+    if (*end != '\0' || parsed <= 0) {
+      llvm::errs() << "transpiler: invalid HSA_SALMON_TOOL_TIMEOUT_S='"
+                   << env << "'; using default " << kDefaultTimeoutSeconds
+                   << " seconds\n";
+      return kDefaultTimeoutSeconds;
+    }
+    return static_cast<int>(parsed);
+  }();
+  return timeout;
+}
+
 int runTool(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args) {
   LLVM_DEBUG({
     llvm::dbgs() << "transpiler: Running:";
@@ -105,7 +126,8 @@ int runTool(llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args) {
 
   std::string errMsg;
   int rc = llvm::sys::ExecuteAndWait(*exeOrErr, args, /*Env=*/std::nullopt,
-                                     /*Redirects=*/{}, /*SecondsToWait=*/120,
+                                     /*Redirects=*/{},
+                                     /*SecondsToWait=*/toolTimeoutSeconds(),
                                      /*MemoryLimit=*/0, &errMsg);
   if (rc != 0)
     llvm::errs() << "transpiler: " << program << " failed (exit " << rc << ")"
@@ -228,6 +250,12 @@ static bool raiseAndCompileKernel(const TextSection &text,
   }
   result.liftedCount += raised.liftedCount;
   result.totalCount += raised.totalCount;
+  if (raised.usesScratchPrivateSegment) {
+    result.usesScratchPrivateSegment = true;
+    if (raised.sourcePrivateSegmentFixedSize >
+        result.sourcePrivateSegmentFixedSize)
+      result.sourcePrivateSegmentFixedSize = raised.sourcePrivateSegmentFixedSize;
+  }
   result.c5SuppressedCount += raised.c5SuppressedCount;
   if (result.c5SuppressionReason.empty() &&
       !raised.c5SuppressionReason.empty())
@@ -300,6 +328,25 @@ static bool linkObjects(llvm::ArrayRef<std::string> objPaths,
   return true;
 }
 
+void collectTargetPrivateSegmentMetadata(PipelineResult &result,
+                                         llvm::ArrayRef<std::string> kernelNames) {
+  using namespace llvm::amdhsa;
+  if (result.hsaco.empty())
+    return;
+  for (const std::string &kernelName : kernelNames) {
+    KernelMeta meta = extractKernelMeta(result.hsaco, kernelName);
+    if (!meta.hasKernelDescriptor)
+      continue;
+    result.targetPrivateSegmentFixedSize = std::max(
+        result.targetPrivateSegmentFixedSize,
+        static_cast<uint32_t>(std::max(meta.privateSegmentFixedSize, 0)));
+    const bool enabled =
+        (meta.computePgmRsrc2 &
+         (1u << COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT)) != 0;
+    result.targetEnablePrivateSegment |= enabled;
+  }
+}
+
 PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
                            const std::string &sourceISA,
                            const std::string &targetISA,
@@ -340,6 +387,7 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
     llvm::errs() << "transpiler: Failed to read HSACO\n";
     return result;
   }
+  collectTargetPrivateSegmentMetadata(result, {kernelName});
 
   LLVM_DEBUG(llvm::dbgs() << "transpiler: HSACO generated: " << result.hsaco.size()
                           << " bytes\n");
@@ -406,6 +454,7 @@ PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
     llvm::errs() << "transpiler: Failed to read merged HSACO\n";
     return result;
   }
+  collectTargetPrivateSegmentMetadata(result, kernelNames);
 
   LLVM_DEBUG(llvm::dbgs() << "transpiler: Merged HSACO: " << result.hsaco.size()
                           << " bytes, " << kernelNames.size()

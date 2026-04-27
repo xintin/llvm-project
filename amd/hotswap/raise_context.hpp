@@ -55,6 +55,16 @@ struct RaiseContext {
 
   std::map<uint64_t, llvm::BasicBlock *> &offsetToBB;
 
+  // Source KD private/scratch allocation. `handle_flat.cpp` sets
+  // `usesScratchPrivateSegment` when it lowers a `scratch_*` instruction; the
+  // on-demand private alloca is deliberately managed by LLVM's frame layout so
+  // target spills cannot overlap translated source scratch slots.
+  uint32_t sourcePrivateSegmentFixedSize = 0;
+  uint32_t sourceComputePgmRsrc2 = 0;
+  uint16_t sourceKernelCodeProperties = 0;
+  bool usesScratchPrivateSegment = false;
+  llvm::AllocaInst *scratchPrivateSegmentAlloca = nullptr;
+
   // Result of the static analysis that classifies every s_set_pc_i64
   // site. Owned by the raiser; the handler reads it to decide
   // between Pattern A (direct br) and Pattern B / DispatchSet

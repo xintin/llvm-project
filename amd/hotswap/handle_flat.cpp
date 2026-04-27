@@ -9,6 +9,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/Support/AMDHSAKernelDescriptor.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
@@ -17,6 +20,8 @@
 #include <optional>
 #include <string>
 #include <tuple>
+
+#define DEBUG_TYPE "transpiler"
 
 using namespace llvm;
 
@@ -56,6 +61,132 @@ Value *emitD16HiHalfTruncI16(RaiseContext &ctx, Value *src32) {
                             "d16hi_trunc");
 }
 
+int64_t firstScratchImm(const DecodedInst &di, OpResolver &op,
+                        unsigned immStart) {
+  for (unsigned k = immStart; k < op.nSrcs(); ++k) {
+    if (di.isImm(op.srcIdx(k)))
+      return di.getImm(op.srcIdx(k));
+  }
+  return 0;
+}
+
+std::string formatScratchAbiDetail(RaiseContext &ctx, const Twine &why) {
+  using namespace llvm::amdhsa;
+  std::string detail;
+  raw_string_ostream os(detail);
+  const bool sourceEnablePrivate =
+      (ctx.sourceComputePgmRsrc2 &
+       (1u << COMPUTE_PGM_RSRC2_ENABLE_PRIVATE_SEGMENT_SHIFT)) != 0;
+  const bool sourceFlatScratchInit =
+      (ctx.sourceKernelCodeProperties &
+       KERNEL_CODE_PROPERTY_ENABLE_SGPR_FLAT_SCRATCH_INIT) != 0;
+  const bool sourcePrivateSegmentSize =
+      (ctx.sourceKernelCodeProperties &
+       KERNEL_CODE_PROPERTY_ENABLE_SGPR_PRIVATE_SEGMENT_SIZE) != 0;
+  why.print(os);
+  os << " source_scratch_kd={private_segment_fixed_size="
+     << ctx.sourcePrivateSegmentFixedSize
+     << ", compute_pgm_rsrc2=0x" << utohexstr(ctx.sourceComputePgmRsrc2)
+     << ", enable_private_segment=" << (sourceEnablePrivate ? 1 : 0)
+     << ", kernel_code_properties=0x"
+     << utohexstr(static_cast<unsigned>(ctx.sourceKernelCodeProperties))
+     << ", enable_sgpr_flat_scratch_init="
+     << (sourceFlatScratchInit ? 1 : 0)
+     << ", enable_sgpr_private_segment_size="
+     << (sourcePrivateSegmentSize ? 1 : 0) << "}.";
+  os.flush();
+  return detail;
+}
+
+AllocaInst *getOrCreateSourcePrivateSegment(RaiseContext &ctx,
+                                            const DecodedInst &di,
+                                            HandlerResult &hr) {
+  if (ctx.sourcePrivateSegmentFixedSize == 0) {
+    std::string detail = formatScratchAbiDetail(
+        ctx,
+        "scratch_* requires source KD private-segment allocation, but "
+        "the parsed source KD reports zero private_segment_fixed_size; "
+        "refusing rather than inventing scratch backing.");
+    errs() << "transpiler: FLAT scratch refused: " << di.mnemonic
+           << " -- " << detail << "\n";
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "FLAT", detail);
+    return nullptr;
+  }
+
+  if (ctx.scratchPrivateSegmentAlloca)
+    return ctx.scratchPrivateSegmentAlloca;
+
+  BasicBlock &entry = ctx.kernel->getEntryBlock();
+  IRBuilder<> entryB(&*entry.getFirstInsertionPt());
+  auto *size = ConstantInt::get(ctx.i32Ty, ctx.sourcePrivateSegmentFixedSize);
+  auto *alloca =
+      entryB.CreateAlloca(ctx.i8Ty, /*AddrSpace=*/5, size,
+                          "source_private_segment");
+  alloca->setAlignment(Align(4));
+  ctx.scratchPrivateSegmentAlloca = alloca;
+  ctx.usesScratchPrivateSegment = true;
+  LLVM_DEBUG(dbgs() << "transpiler: FLAT scratch ABI: allocated source "
+                    << "private segment model for '" << ctx.kernel->getName()
+                    << "' size=" << ctx.sourcePrivateSegmentFixedSize
+                    << " compute_pgm_rsrc2=0x"
+                    << utohexstr(ctx.sourceComputePgmRsrc2)
+                    << " kernel_code_properties=0x"
+                    << utohexstr(static_cast<unsigned>(
+                           ctx.sourceKernelCodeProperties))
+                    << "\n");
+  return alloca;
+}
+
+Value *decodeScratchOffset(RaiseContext &ctx, const DecodedInst &di,
+                           OpResolver &op, unsigned addrStart,
+                           unsigned elemBytes, StringRef label,
+                           HandlerResult &hr) {
+  Value *offset = ConstantInt::get(ctx.i32Ty, 0);
+  unsigned idx = addrStart;
+
+  if (idx < op.nSrcs() && op.isSrcReg(idx) &&
+      op.srcReg(idx).kind == ParsedReg::VGPR) {
+    ParsedReg vaddrPr = op.srcReg(idx++);
+    Value *vaddr = ctx.regs.readReg32(ctx.B, vaddrPr);
+    if (di.hasScaleOffset)
+      vaddr = ctx.B.CreateMul(vaddr, ConstantInt::get(ctx.i32Ty, elemBytes),
+                              "scratch_scaled_voff");
+    offset = ctx.B.CreateAdd(offset, vaddr, "scratch_voff");
+  } else if (idx < op.nSrcs() && op.isSrcReg(idx) &&
+             op.srcReg(idx).kind != ParsedReg::SGPR &&
+             op.srcReg(idx).kind != ParsedReg::NOREG) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "FLAT",
+        (Twine(label) + ": expected VGPR or off/null for VADDR"));
+    return nullptr;
+  }
+
+  if (idx < op.nSrcs() && op.isSrcReg(idx) &&
+      op.srcReg(idx).kind == ParsedReg::SGPR) {
+    ParsedReg saddrPr = op.srcReg(idx++);
+    offset = ctx.B.CreateAdd(offset, ctx.regs.readReg32(ctx.B, saddrPr),
+                             "scratch_soff");
+  } else if (idx < op.nSrcs() && op.isSrcReg(idx) &&
+             op.srcReg(idx).kind != ParsedReg::NOREG) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "FLAT",
+        (Twine(label) + ": expected SGPR or off/null for SADDR"));
+    return nullptr;
+  }
+
+  int64_t imm = firstScratchImm(di, op, idx);
+  if (imm != 0)
+    offset = ctx.B.CreateAdd(
+        offset, ConstantInt::get(ctx.i32Ty, static_cast<uint32_t>(imm)),
+        "scratch_iadd");
+
+  AllocaInst *frame = getOrCreateSourcePrivateSegment(ctx, di, hr);
+  if (!frame)
+    return nullptr;
+  return ctx.B.CreateGEP(ctx.i8Ty, frame, offset, "scratch_ptr");
+}
+
 } // namespace
 
 HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
@@ -65,76 +196,158 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
   SemOp sop = di.semOp;
 
   // ---------------------------------------------------------------------
-  // FLAT scratch family (`scratch_load_*`, `scratch_store_*`,
-  // `scratch_atomic_*`) — early documented refusal.
+  // FLAT scratch family (`scratch_load_*`, `scratch_store_*`).
   //
-  // Detected by the `SIInstrFlags::FlatScratch` TSFlags bit (set by the
-  // `IsFlatScratch` field on `FLAT_Scratch_*_Pseudo` in
-  // FLATInstructions.td); covers the entire scratch-segment FLAT
-  // sub-family in one place rather than enumerating every width × access
-  // SemOp. The mnemonic-prefix safety net is intentionally NOT used as
-  // the primary signal: SIInstrFlags is the canonical, encoding-derived
-  // discriminator and matches LLVM's own dispatch in SIInstrInfo.
+  // `SIInstrFlags::FlatScratch` is the authoritative discriminator for the
+  // scratch-addressing sub-family. We model it as source private-segment
+  // memory, not as a global/flat pointer. The first scratch use creates a
+  // single addrspace(5) private frame sized from the source KD's
+  // `private_segment_fixed_size`; every translated scratch offset is a GEP
+  // within that frame. That is the ABI extension: the target AMDGPU backend
+  // sees real private memory, lays it out together with any target spills, and
+  // emits a target KD with `enable_private_segment` /
+  // `private_segment_fixed_size` instead of relying on a hand-written scratch
+  // backing patch.
   //
-  // Why this is a refusal, not a handler:
-  //
-  //   The principled lift of `scratch_*` is per-thread private-segment
-  //   memory, which in IR is `addrspace(5)` (alloca / load / store).
-  //   Salmon's compilation target ABI deliberately does NOT request
-  //   `flat_scratch_init` in the kernel descriptor — see the regression
-  //   guard in `lit_tests/buffer_store_no_scratch_alloca/`, which
-  //   explicitly forbids any `addrspace(5)` alloca surviving in the
-  //   lifted IR. Reasoning recap (also captured in
-  //   `handle_mubuf.cpp`'s comment block on the legacy OOB sink):
-  //
-  //     * Any `addrspace(5)` alloca that survives PromoteMemToReg makes
-  //       the AMDGPU backend emit `.amdhsa_enable_private_segment 1`
-  //       plus `.amdhsa_private_segment_fixed_size > 0`.
-  //     * Salmon's KD models only the source ABI's user-SGPR set and
-  //       does NOT request `flat_scratch_init`, so on entry
-  //       `FLAT_SCRATCH` is undefined; any lifted flat-scratch access
-  //       is a guaranteed fault — silent miscompile of the entire
-  //       kernel.
-  //
-  // The source kernel (in this case the gfx1250 Triton FA-pipeline
-  // attn_fwd) requested its own `flat_scratch_init` and 64 B of
-  // `private_segment_fixed_size` for live-range spills, but the lifted
-  // module gets a fresh KD generated by the AMDGPU backend — and that
-  // KD will inherit Salmon's no-flat-scratch-init policy. We refuse
-  // loudly rather than synthesise a fake addrspace(5) lowering that
-  // would either fault at run time (no `flat_scratch_init`) OR re-open
-  // the BUFFER_STORE OOB-sink failure mode the
-  // `buffer_store_no_scratch_alloca` regression guard was put in place
-  // to prevent.
-  //
-  // Closing this gap "for real" requires extending the Salmon ABI to
-  // request `flat_scratch_init` + a private-segment size in the
-  // generated KD — a cross-cutting design change well outside the scope
-  // of an instruction-level handler. The refusal here documents the
-  // gap, swaps the generic "Unsupported instruction" surface for a
-  // specific, audit-clean failure, and unblocks the kerneldex coverage
-  // signal so a future ABI extension has a single anchor point to flip.
+  // If the source KD does not request private memory, scratch instructions are
+  // structurally inconsistent with the source launch ABI and still refuse with
+  // KD fields in the diagnostic.
   if (di.tsFlags & SIInstrFlags::FlatScratch) {
-    llvm::errs()
-        << "transpiler: FLAT scratch refused: " << di.mnemonic
-        << " — Salmon's compilation-target KD does not request "
-        << "flat_scratch_init (matching the buffer_store_no_scratch_alloca "
-        << "regression guard); a principled lift via addrspace(5) alloca "
-        << "would either fault at run time on the lifted KD or re-open the "
-        << "FLAT_SCRATCH ABI gap. Refusing rather than emitting a fallback. "
-        << "See handle_flat.cpp's FlatScratch comment block for the design "
-        << "rationale and the ABI-extension that would be needed to lift it.\n";
+    auto scratchAccessBytes = [&]() -> unsigned {
+      switch (sop) {
+      case SemOp::SCRATCH_LOAD_DWORD:
+      case SemOp::SCRATCH_STORE_DWORD:
+        return 4;
+      case SemOp::SCRATCH_LOAD_DWORDX2:
+      case SemOp::SCRATCH_STORE_DWORDX2:
+        return 8;
+      case SemOp::SCRATCH_LOAD_DWORDX3:
+      case SemOp::SCRATCH_STORE_DWORDX3:
+        return 12;
+      case SemOp::SCRATCH_LOAD_DWORDX4:
+      case SemOp::SCRATCH_STORE_DWORDX4:
+        return 16;
+      default:
+        return 0;
+      }
+    };
+    auto scratchAlign = [](unsigned bytes) -> Align {
+      // dwordx3 is a 12-byte access; LLVM Align requires a power of two.
+      // The ISA only promises dword granularity for scratch offsets, so use a
+      // conservative 4-byte alignment for that aggregate width.
+      return bytes == 12 ? Align(4) : Align(bytes);
+    };
+
+    unsigned accessBytes = scratchAccessBytes();
+    if (accessBytes == 0) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "FLAT",
+          formatScratchAbiDetail(
+              ctx,
+              Twine("scratch_* opcode is not a load/store shape Salmon "
+                    "models yet: ") +
+                  di.mnemonic));
+      return hr;
+    }
+
+    if (sop == SemOp::SCRATCH_LOAD_DWORD ||
+        sop == SemOp::SCRATCH_LOAD_DWORDX2 ||
+        sop == SemOp::SCRATCH_LOAD_DWORDX3 ||
+        sop == SemOp::SCRATCH_LOAD_DWORDX4) {
+      if (op.nSrcs() < 2) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "FLAT", "scratch_load_* expected address/cpol operands");
+        return hr;
+      }
+
+      Value *addr = decodeScratchOffset(ctx, di, op, /*addrStart=*/0,
+                                        accessBytes, "scratch_load", hr);
+      if (hr.failure.hasFailed())
+        return hr;
+
+      ParsedReg dest = op.dst();
+      Type *loadTy = nullptr;
+      switch (sop) {
+      case SemOp::SCRATCH_LOAD_DWORD:
+        loadTy = ctx.i32Ty;
+        break;
+      case SemOp::SCRATCH_LOAD_DWORDX2:
+        loadTy = FixedVectorType::get(ctx.i32Ty, 2);
+        break;
+      case SemOp::SCRATCH_LOAD_DWORDX3:
+        loadTy = FixedVectorType::get(ctx.i32Ty, 3);
+        break;
+      case SemOp::SCRATCH_LOAD_DWORDX4:
+        loadTy = FixedVectorType::get(ctx.i32Ty, 4);
+        break;
+      default:
+        llvm_unreachable("scratch load dispatch drifted");
+      }
+
+      ctx.emitUnderExec([&] {
+        Value *loaded = ctx.B.CreateAlignedLoad(
+            loadTy, addr, scratchAlign(accessBytes), "scratch_load");
+        if (accessBytes == 4) {
+          ctx.regs.writeReg32(ctx.B, dest, loaded);
+        } else {
+          unsigned dwords = accessBytes / 4;
+          for (unsigned d = 0; d < dwords; ++d) {
+            ParsedReg sub = dest;
+            sub.baseIdx = dest.baseIdx + static_cast<int>(d);
+            sub.width = 1;
+            ctx.regs.writeReg32(
+                ctx.B, sub,
+                ctx.B.CreateExtractElement(loaded, ctx.B.getInt32(d)));
+          }
+        }
+      });
+      hr.handled = true;
+      return hr;
+    }
+
+    if (sop == SemOp::SCRATCH_STORE_DWORD ||
+        sop == SemOp::SCRATCH_STORE_DWORDX2 ||
+        sop == SemOp::SCRATCH_STORE_DWORDX3 ||
+        sop == SemOp::SCRATCH_STORE_DWORDX4) {
+      if (op.nSrcs() < 3) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "FLAT",
+            "scratch_store_* expected data plus address/cpol operands");
+        return hr;
+      }
+
+      Value *addr = decodeScratchOffset(ctx, di, op, /*addrStart=*/1,
+                                        accessBytes, "scratch_store", hr);
+      if (hr.failure.hasFailed())
+        return hr;
+
+      ParsedReg stData = op.srcReg(0);
+      if (stData.kind != ParsedReg::VGPR) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "FLAT", "scratch_store_* expected VGPR data operand");
+        return hr;
+      }
+
+      ctx.emitUnderExec([&] {
+        if (accessBytes == 4) {
+          ctx.B.CreateAlignedStore(ctx.regs.readReg32(ctx.B, stData), addr,
+                                   Align(4));
+        } else {
+          auto *vecTy = FixedVectorType::get(ctx.i32Ty, accessBytes / 4);
+          ctx.B.CreateAlignedStore(ctx.regs.readRegVec(ctx.B, stData, vecTy),
+                                   addr, scratchAlign(accessBytes));
+        }
+      });
+      hr.handled = true;
+      return hr;
+    }
+
     hr.failure = RaiseFailure::unsupportedShape(
         di, "FLAT",
-        "scratch_* (FLAT scratch segment): Salmon's KD does not request "
-        "flat_scratch_init, so a principled lift via addrspace(5) alloca "
-        "would either fault at run time (no FLAT_SCRATCH base) OR "
-        "re-introduce the regression the "
-        "buffer_store_no_scratch_alloca lit guard prevents. Closing this "
-        "gap requires extending the Salmon ABI to request flat_scratch_init "
-        "in the generated KD — out of scope for an instruction-level "
-        "handler. Refusing loudly rather than emitting a silent-miscompile "
-        "fallback.");
+        formatScratchAbiDetail(
+            ctx,
+            Twine("scratch_* shape reached unreachable dispatch: ") +
+                di.mnemonic));
     return hr;
   }
 

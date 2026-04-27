@@ -48,6 +48,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/Support/Debug.h"
 
+#include <algorithm>
 #include <map>
 #include <utility>
 
@@ -1403,6 +1404,10 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
                    i1Ty, i8Ty, i32Ty, i64Ty, f32Ty, f16Ty,
                    ptrGlobalTy, offsetToBB};
   ctx.setpcAnalysis = &setpcAnalysis;
+  ctx.sourcePrivateSegmentFixedSize =
+      static_cast<uint32_t>(std::max(meta.privateSegmentFixedSize, 0));
+  ctx.sourceComputePgmRsrc2 = meta.computePgmRsrc2;
+  ctx.sourceKernelCodeProperties = meta.kernelCodeProperties;
   ctx.initializeSgprKernargProvenance();
 
   // ==== Phase 4.5: Kernarg-pair pristine-at-BB-entry dataflow ====
@@ -2245,6 +2250,8 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     M.print(irOS, nullptr);
   }
 
+  result.usesScratchPrivateSegment = ctx.usesScratchPrivateSegment;
+  result.sourcePrivateSegmentFixedSize = ctx.sourcePrivateSegmentFixedSize;
   result.success = true;
   return result;
 }
