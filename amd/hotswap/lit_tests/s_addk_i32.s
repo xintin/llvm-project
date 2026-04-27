@@ -18,6 +18,8 @@
 ; hangs. The same bug was latent in `S_MULK_I32` (identical
 ; TableGen class `SOPK_32TIE`). After the fix, `%addk = add i32
 ; <prior-dst>, 1024` with the LITERAL 1024 as the second operand.
+; The fixture also pins a high-bit simm16 (`0xd000`) as `-12288`;
+; hardware sign-extends SOPK simm16 fields.
 ;
 ; The `.hip` sibling forces `s_addk_co_i32 %[x], 0x400` via inline
 ; asm with a `+s` constraint so hipcc cannot substitute a
@@ -37,19 +39,15 @@
 ; CHECK: %addk = add i32 %{{[^,]+}}, 1024
 
 ; The SCC overflow computation feeds the same (prior-dst, 1024)
-; pair into `uadd_with_overflow`. This pins the SCC contract's
+; pair into `sadd_with_overflow`. This pins the SCC contract's
 ; operand symmetry — if a future rewrite gets the imm arg right
 ; on the add but wrong on the SCC overflow (or vice versa), this
 ; CHECK catches the drift.
 ;
-; Note: `uadd_with_overflow` is itself a latent inaccuracy
-; (`s_addk_co_i32` on gfx12+ sets SCC from SIGNED overflow;
-; `sadd_with_overflow` would be more accurate). Not in scope for
-; this fix — the layer-norm kernel consumes the add result via
-; `icmp slt` for its loop exit, not via SCC — but documented as a
-; cleanup opportunity in the handler comment. If that cleanup
-; lands later, swap this CHECK to `@llvm.sadd.with.overflow.i32`.
-; CHECK: call { i32, i1 } @llvm.uadd.with.overflow.i32(i32 %{{[^,]+}}, i32 1024)
+; `s_addk_co_i32` sets SCC from signed overflow.
+; CHECK: call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %{{[^,]+}}, i32 1024)
+; CHECK: %addk{{[0-9]*}} = add i32 %{{[^,]+}}, -12288
+; CHECK: call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %{{[^,]+}}, i32 -12288)
 
 ; NEGATIVE assertions.
 
@@ -66,7 +64,7 @@
 
 ; (b) The SCC overflow intrinsic must not receive two SSA
 ; operands either (it would happen in lockstep with the add bug).
-; CHECK-NOT: call { i32, i1 } @llvm.uadd.with.overflow.i32(i32 %{{[^,]+}}, i32 %{{[^,]+}})
+; CHECK-NOT: call { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %{{[^,]+}}, i32 %{{[^,]+}})
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
@@ -88,6 +86,7 @@ s_addk_i32_kernel:                      ; @s_addk_i32_kernel
 	s_cselect_b32 s2, ttmp9, s3
 	;;#ASMSTART
 	s_addk_co_i32 s2, 0x400
+	s_addk_co_i32 s2, 0xd000
 	
 	;;#ASMEND
 	v_add_nc_u32_e32 v1, s2, v0

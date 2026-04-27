@@ -64,6 +64,10 @@
 ;   * NO `unsupportedOpcode` or `VOPD decomposition failed` text in
 ;     the captured stderr (FileCheck would see empty stdin).
 ;   * NO `llvm.umax` or `llvm.umin` (the corpus shape is signed).
+;   * Negative integer literals in integer VOPD ops stay two's-complement
+;     integers.  They are not source-negation modifiers; treating `-8`
+;     as a float negation produces 0x80000008 and corrupts Triton
+;     Kogge-Stone scan selector arithmetic.
 ;   * NO `lshr` for the ashrrev surface (must be arithmetic).
 
 ; CHECK-LABEL: define amdgpu_kernel void @vopd_extra_subops_kernel(
@@ -111,6 +115,10 @@
 ; here to keep the test stable across projection refactors.
 ; CHECK: call i64 @llvm.amdgcn.ballot.i64
 
+; Pair E: integer negative literal.  This must be `-8` / 0xfffffff8,
+; not the float-sign-bit pattern 0x80000008.
+; CHECK: %vopd_add{{[0-9]*}} = add i32 -8, %{{[^,]+}}
+
 ; Negative pin: the ashrrev must be arithmetic; a regression to
 ; logical shift would have surfaced as `lshr` here (with the same
 ; operand orientation).
@@ -120,6 +128,7 @@
 ; umax.  A regression that confused signed/unsigned would surface
 ; here.
 ; CHECK-NOT: @llvm.umax.i32
+; CHECK-NOT: -2147483640
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6
@@ -159,10 +168,12 @@ vopd_extra_subops_kernel:               ; @vopd_extra_subops_kernel
 	;;#ASMSTART
 	v_cmp_eq_u32_e64 vcc_lo, v8, 0
 	v_dual_mov_b32 v8, vcc_lo :: v_dual_mov_b32 v9, v1
+	v_dual_add_nc_u32 v10, -8, v0 :: v_dual_mov_b32 v11, v0
 	;;#ASMEND
 	s_clause 0x1
 	global_store_b128 v0, v[2:5], s[2:3]
 	global_store_b128 v0, v[6:9], s[2:3] offset:16
+	global_store_dword v0, v10, s[2:3] offset:32
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
@@ -172,7 +183,7 @@ vopd_extra_subops_kernel:               ; @vopd_extra_subops_kernel
 		.amdhsa_user_sgpr_kernarg_segment_ptr 1
 		.amdhsa_wavefront_size32 1
 		.amdhsa_system_sgpr_workgroup_id_x 1
-		.amdhsa_next_free_vgpr 10
+		.amdhsa_next_free_vgpr 12
 		.amdhsa_next_free_sgpr 4
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_denorm_mode_32 3
@@ -202,7 +213,7 @@ amdhsa.kernels:
     .private_segment_fixed_size: 0
     .sgpr_count:     6
     .symbol:         vopd_extra_subops_kernel.kd
-    .vgpr_count:     10
+    .vgpr_count:     12
     .wavefront_size: 32
 amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
 amdhsa.version: [1, 2]

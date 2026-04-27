@@ -6,6 +6,8 @@
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <cstdint>
+
 using namespace llvm;
 
 namespace transpiler {
@@ -199,6 +201,26 @@ static unsigned extractHwregId(int64_t simm16) {
   return static_cast<unsigned>(simm16 & 0x3f);
 }
 
+static Value *getSimm16(RaiseContext &ctx, const DecodedInst &di,
+                        unsigned operandIdx, HandlerResult &hr) {
+  if (operandIdx >= di.inst.getNumOperands() || !di.isImm(operandIdx)) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "SOPK", "expected signed 16-bit immediate operand");
+    return nullptr;
+  }
+  int64_t raw = di.getImm(operandIdx);
+  if (raw < -32768 || raw > 65535) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "SOPK", "signed 16-bit immediate operand out of range");
+    return nullptr;
+  }
+  uint32_t bits = static_cast<uint32_t>(raw) & 0xffffu;
+  int32_t simm16 = (bits & 0x8000u)
+                       ? static_cast<int32_t>(bits) - 0x10000
+                       : static_cast<int32_t>(bits);
+  return ConstantInt::get(ctx.i32Ty, simm16, true);
+}
+
 HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
                          OpResolver &op) {
   HandlerResult hr;
@@ -218,7 +240,9 @@ HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
   //     entries — `src(0)` is the tied SGPR (same physical reg as
   //     sdst, i.e. the prior-dst value already readable via
   //     `readReg32(op.dst())`), and `src(1)` is the simm16
-  //     immediate.
+  //     immediate. The simm16 is sign-extended by hardware; using
+  //     op.src(1)'s zero-extended ConstantInt would turn e.g. 0xd000
+  //     into +53248 instead of -12288.
   //
   //   Pre-fix bug: the SOPK_32TIE handlers below read `op.src(0)`
   //   thinking it was the simm16, but it actually returned the tied
@@ -229,13 +253,16 @@ HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
   //   kernel.  `s_mulk_i32` had the same latent bug (no kernel in
   //   the corpus exercised it).
   if (sop == SemOp::S_MOVK_I32) {
-    ctx.regs.writeReg32(ctx.B, op.dst(), op.src(0));
+    Value *imm = getSimm16(ctx, di, op.srcIdx(0), hr);
+    if (!imm) return hr;
+    ctx.regs.writeReg32(ctx.B, op.dst(), imm);
     hr.handled = true;
     return hr;
   }
   if (sop == SemOp::S_MULK_I32) {
     Value *dst = ctx.regs.readReg32(ctx.B, op.dst());
-    Value *imm = op.src(1);  // simm16; src(0) is the tied SGPR (see block above)
+    Value *imm = getSimm16(ctx, di, op.srcIdx(1), hr);
+    if (!imm) return hr;
     ctx.regs.writeReg32(ctx.B, op.dst(),
                         ctx.B.CreateMul(dst, imm, "mulk"));
     hr.handled = true;
@@ -243,18 +270,14 @@ HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
   }
   if (sop == SemOp::S_ADDK_I32) {
     Value *dst = ctx.regs.readReg32(ctx.B, op.dst());
-    Value *imm = op.src(1);  // simm16; src(0) is the tied SGPR (see block above)
+    Value *imm = getSimm16(ctx, di, op.srcIdx(1), hr);
+    if (!imm) return hr;
     Value *res = ctx.B.CreateAdd(dst, imm, "addk");
     ctx.regs.writeReg32(ctx.B, op.dst(), res);
-    // SCC holds the overflow bit.  On gfx12+ the instruction is
-    // renamed to `s_addk_co_i32`, which documents that the SCC
-    // contract reflects *signed* overflow; `uadd_with_overflow`
-    // here is a latent inaccuracy (no in-corpus kernel consumes
-    // SCC from this instruction today, so the hang at hand does
-    // not depend on it). Swapping to `sadd_with_overflow` is a
-    // follow-up; left as-is to keep this fix minimal and focused
-    // on the operand-index correctness that unblocks layer-norm.
-    auto *ov = ctx.B.CreateIntrinsic(Intrinsic::uadd_with_overflow, {ctx.i32Ty},
+    // SCC holds the signed carry-out/overflow bit. Gfx12+ names this
+    // spelling `s_addk_co_i32`; use the signed overflow intrinsic so
+    // consumers of SCC observe the same flag as the source instruction.
+    auto *ov = ctx.B.CreateIntrinsic(Intrinsic::sadd_with_overflow, {ctx.i32Ty},
                                      {dst, imm});
     ctx.regs.storeSCC(ctx.B, ctx.B.CreateExtractValue(ov, 1));
     hr.sccHandled = true;

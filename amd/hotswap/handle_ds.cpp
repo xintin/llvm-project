@@ -721,34 +721,13 @@ HandlerResult handleDS(RaiseContext &ctx, const DecodedInst &di,
     // `amdgcn.ds_bpermute` intrinsic so the backend emits the real
     // cross-lane gather on the target ISA.
     //
-    // MODREP: wave-width projection. `amdgcn.ds_bpermute` on the
-    // target masks the selector by `target_wave_bits - 1` in hardware.
-    // For gfx1250 wave32 → gfx942 wave64 lifts, a source selector of
-    // `(lane ^ k) * 4` with `k < 32` stays inside the low 32 lanes,
-    // so the natural wave64 behaviour partitions the wave into two
-    // independent 32-lane halves that each reproduce the source's
-    // wave32 shuffle — a clean match under modulo-replication.
-    //
-    //   Selectors this policy covers:
-    //     * `__shfl_xor(x, k)` with `k < sourceWave` — `lane_swap`
-    //       (k=1) and the intra-warp phase of `block_sum_shfl`
-    //       (k ∈ {16,8,4,2,1}).
-    //     * `__shfl_down(x, k)` with `k < sourceWave`.
-    //     * `__shfl(x, srcLane)` with `srcLane < sourceWave`.
-    //
-    //   Selectors this policy does NOT cover:
-    //     * `k ≥ sourceWave` — would step lanes from the "upper" half
-    //       of the target wave into the "lower" half of the source
-    //       replica, which is not what the source kernel meant. A
-    //       proper lift needs SPMDification or same-wave execution.
-    //     * Selectors derived from global thread/lane indices where
-    //       the source's `mbcnt`-based lane ID cannot be re-expressed
-    //       in target-wave terms (see lane_swap / block_sum_shfl
-    //       residual numerical mismatches in RESULTS.md).
-    //
-    // Grep for MODREP when revisiting the cross-wave policy; these
-    // assumptions will need to be either formalised (with a gate that
-    // rejects selectors violating them) or generalised (SPMDification).
+    // Wave32-source selectors are source-wave-local byte offsets. Under
+    // WaveNative cross-widening, one wave64 target wave carries two source
+    // wave32 instances (lanes 0..31 and 32..63). A raw target `ds_bpermute`
+    // would interpret selector 0 from lane 32 as "read hardware lane 0",
+    // but source gfx1250 semantics mean "read lane 0 of this source wave",
+    // i.e. hardware lane 32. Rebase the selector into the current source-wave
+    // half before calling the wave64 intrinsic.
     //
     // EXEC gating. We emit the intrinsic *outside* `emitUnderExec`.
     // `amdgcn.ds_bpermute` is convergent — all lanes of the hardware
@@ -763,6 +742,22 @@ HandlerResult handleDS(RaiseContext &ctx, const DecodedInst &di,
     // `readfirstlane` / explicit VGPR move outside the diamond,
     // otherwise the cross-lane read will pick up `undef`.
     Value *index = op.src(0);
+    if (ctx.projection.numSourceWavesPerTarget() > 1 &&
+        ctx.isa.isWave32() && !ctx.targetIsa.isWave32()) {
+      constexpr uint32_t kSourceWaveLanes = 32;
+      constexpr uint32_t kDwordBytes = 4;
+      constexpr uint32_t kSourceWaveBytes = kSourceWaveLanes * kDwordBytes;
+      Value *localIndex = ctx.B.CreateAnd(
+          index, ctx.B.getInt32(kSourceWaveBytes - 1), "bperm_local_addr");
+      Value *laneId = ctx.emitLaneIdx();
+      Value *sourceWaveLaneBase = ctx.B.CreateAnd(
+          laneId, ctx.B.getInt32(~(kSourceWaveLanes - 1)),
+          "bperm_srcwave_lane_base");
+      Value *sourceWaveByteBase = ctx.B.CreateShl(
+          sourceWaveLaneBase, ctx.B.getInt32(2), "bperm_srcwave_byte_base");
+      index = ctx.B.CreateOr(localIndex, sourceWaveByteBase,
+                             "bperm_srcwave_addr");
+    }
     Value *src = op.src(1);
     Function *bperm = Intrinsic::getOrInsertDeclaration(
         &ctx.M, Intrinsic::amdgcn_ds_bpermute);

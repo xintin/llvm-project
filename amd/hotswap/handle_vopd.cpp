@@ -108,7 +108,18 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
     // srcSlot: MSB slot for this source (0=src0, 1=src1, 2=src2)
     auto readVOPDSrc = [&](StringRef name, unsigned srcSlot = 0) -> Value * {
       bool neg = false, absmod = false;
-      if (name.starts_with("-")) { neg = true; name = name.drop_front(1); }
+      if (name.starts_with("-")) {
+        StringRef rest = name.drop_front(1);
+        bool negativeIntegerLiteral =
+            !rest.empty() &&
+            (std::isdigit(static_cast<unsigned char>(rest.front())) ||
+             rest.starts_with("0x") || rest.starts_with("0X")) &&
+            !rest.contains(".");
+        if (!negativeIntegerLiteral) {
+          neg = true;
+          name = rest;
+        }
+      }
       if (name.starts_with("|") && name.ends_with("|")) {
         absmod = true; name = name.drop_front(1).drop_back(1);
       }
