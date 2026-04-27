@@ -1,6 +1,7 @@
 #include "handlers.hpp"
 
 #include "semop.hpp"
+#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -20,529 +21,283 @@
 using namespace llvm;
 
 namespace transpiler {
-HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
-                        OpResolver &op) {
-  HandlerResult hr;
-  SemOp sop = di.semOp;
 
-  // VOPD instructions are printed as: "v_dual_X dst, src... :: v_dual_Y dst, src..."
-  // We parse the full text to decompose both operations and handle each
-  // by mapping v_dual_X → v_X and dispatching to the VOP handler.
-  StringRef text(di.fullText);
-  auto [xPart, yPart] = text.split(" :: ");
-  if (yPart.empty()) {
-    llvm::errs() << "transpiler: VOPD: cannot split dual instruction: " << text << "\n";
-    hr.failure = RaiseFailure::unsupportedShape(
-        di, "VOPD", "cannot split dual instruction");
-    return hr;
+namespace {
+
+ParsedReg applyVopdVGPRMsb(const RaiseContext &ctx, ParsedReg pr,
+                           unsigned slot) {
+  if (pr.kind == ParsedReg::VGPR || pr.kind == ParsedReg::AGPR)
+    pr.baseIdx += ((ctx.vgprMSBs >> (slot * 2)) & 0x3) * 256;
+  return pr;
+}
+
+Value *readVopdVCCAsSource(RaiseContext &ctx) {
+  if (ctx.projection.sourceWaveScopedLaneOps()) {
+    Value *mask = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.regs.execTy);
+    Value *lo = ctx.B.CreateTrunc(mask, ctx.i32Ty, "vopd_vcc_lo_src");
+    Value *hi = ctx.B.CreateTrunc(
+        ctx.B.CreateLShr(mask, ctx.isa.waveSize), ctx.i32Ty,
+        "vopd_vcc_hi_src");
+    Value *lane = ctx.projection.emitLaneIdx(ctx.B);
+    Value *upper = ctx.B.CreateICmpUGE(
+        lane, ConstantInt::get(ctx.i32Ty, ctx.isa.waveSize),
+        "vopd_vcc_upper_src_wave");
+    return ctx.B.CreateSelect(upper, hi, lo, "vopd_vcc_src_wave_mask");
   }
+  return ctx.regs.readVCCAsWaveMask(ctx.B, ctx.i32Ty);
+}
 
-  // Parse "v_dual_<op> vDST, vSRC0, vSRC1" for each half.
-  // Extract mnemonic and register operands from printed text.
-  //
-  // Both halves share the same 8-bit s_set_vgpr_msb state: LLVM's
-  // AMDGPULowerVGPREncoding pass asserts that the X-op and Y-op of a VOPD
-  // pair must carry identical MSB values per operand slot (see
-  // "Invalid VOPD pair was created").  So we apply `ctx.vgprMSBs` directly.
-  SmallVector<std::pair<int, Value *>, 4> pendingVGPRWrites;
-  auto queueVGPR32 = [&](int idx, Value *v) {
-    pendingVGPRWrites.emplace_back(idx, v);
+Value *applyVopdSourceModifiers(RaiseContext &ctx, Value *v,
+                                uint8_t modifiers) {
+  if (modifiers == 0)
+    return v;
+  bool isI32 = v->getType() == ctx.i32Ty;
+  if (isI32)
+    v = ctx.B.CreateBitCast(v, ctx.f32Ty);
+  if (modifiers & 2)
+    v = ctx.B.CreateUnaryIntrinsic(Intrinsic::fabs, v, nullptr, "vopd_abs");
+  if (modifiers & 1)
+    v = ctx.B.CreateFNeg(v, "vopd_neg");
+  if (isI32)
+    v = ctx.B.CreateBitCast(v, ctx.i32Ty);
+  return v;
+}
+
+Value *readVopdSource(RaiseContext &ctx, const DecodedInst::VopdSource &src,
+                      unsigned srcSlot) {
+  Value *v = nullptr;
+  auto parsed = [&](ParsedReg::Kind kind) {
+    ParsedReg pr;
+    pr.kind = kind;
+    pr.baseIdx = src.baseIdx;
+    pr.width = src.width;
+    return applyVopdVGPRMsb(ctx, pr, srcSlot);
+  };
+  switch (src.kind) {
+  case DecodedInst::VopdSource::Kind::None:
+    return nullptr;
+  case DecodedInst::VopdSource::Kind::Imm:
+    v = ConstantInt::get(ctx.i32Ty,
+                         static_cast<uint32_t>(src.imm & 0xffffffffu));
+    break;
+  case DecodedInst::VopdSource::Kind::VGPR:
+    v = ctx.regs.readReg32(ctx.B, parsed(ParsedReg::VGPR));
+    break;
+  case DecodedInst::VopdSource::Kind::AGPR:
+    v = ctx.regs.readReg32(ctx.B, parsed(ParsedReg::AGPR));
+    break;
+  case DecodedInst::VopdSource::Kind::SGPR:
+    v = ctx.regs.loadSGPR32(ctx.B, src.baseIdx);
+    break;
+  case DecodedInst::VopdSource::Kind::TTMP:
+    v = ctx.B.CreateLoad(ctx.i32Ty, ctx.regs.ttmp[src.baseIdx], "vopd_ttmp");
+    break;
+  case DecodedInst::VopdSource::Kind::VCC:
+    v = readVopdVCCAsSource(ctx);
+    break;
+  case DecodedInst::VopdSource::Kind::EXEC: {
+    ParsedReg pr;
+    pr.kind = ParsedReg::EXEC;
+    pr.baseIdx = src.baseIdx;
+    pr.width = src.width;
+    v = ctx.regs.readReg32(ctx.B, pr);
+    break;
+  }
+  case DecodedInst::VopdSource::Kind::SCC:
+    v = ctx.B.CreateZExt(ctx.regs.loadSCC(ctx.B), ctx.i32Ty);
+    break;
+  case DecodedInst::VopdSource::Kind::M0:
+    v = ctx.B.CreateLoad(ctx.i32Ty, ctx.regs.m0, "vopd_m0");
+    break;
+  }
+  return applyVopdSourceModifiers(ctx, v, src.modifiers);
+}
+
+Value *readVopdCond(RaiseContext &ctx, const DecodedInst &di,
+                    const DecodedInst::VopdSource &src, HandlerResult &hr) {
+  if (src.kind != DecodedInst::VopdSource::Kind::VCC &&
+      src.kind != DecodedInst::VopdSource::Kind::SGPR) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOPD", "VOPD cndmask explicit condition is neither VCC nor SGPR");
+    return nullptr;
+  }
+  if (src.kind == DecodedInst::VopdSource::Kind::VCC)
+    return ctx.regs.loadVCC(ctx.B);
+
+  if (Value *freshCmp = ctx.lookupSgprWaveMaskI1(src.baseIdx))
+    return freshCmp;
+
+  Value *condVal = ctx.isa.isWave32()
+                       ? ctx.regs.loadSGPR32(ctx.B, src.baseIdx)
+                       : ctx.regs.loadSGPR64(ctx.B, src.baseIdx);
+  Value *fallback = ctx.projection.extractLaneBitFromWaveMask(ctx.B, condVal);
+  if (Value *shadowValid = ctx.loadSgprWaveMaskValid(src.baseIdx)) {
+    Value *shadowExec = ctx.loadSgprWaveMaskExec(src.baseIdx);
+    Value *shadowI1 = ctx.projection.extractLaneBitFromWaveMask(ctx.B,
+                                                                 shadowExec);
+    return ctx.B.CreateSelect(shadowValid, shadowI1, fallback,
+                              "vopd_sgpr_mask_shadow_sel");
+  }
+  return fallback;
+}
+
+bool requireVopdSources(const DecodedInst::VopdHalf &half, unsigned n,
+                        const DecodedInst &di, HandlerResult &hr) {
+  if (half.numSrcs >= n)
+    return true;
+  hr.failure = RaiseFailure::unsupportedShape(
+      di, "VOPD", "VOPD component has too few decoded sources");
+  return false;
+}
+
+bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
+                   const DecodedInst::VopdHalf &half,
+                   SmallVectorImpl<std::pair<ParsedReg, Value *>> &writes,
+                   HandlerResult &hr) {
+  ParsedReg dst = applyVopdVGPRMsb(
+      ctx, ctx.parseReg(half.dstReg, AMDGPU::VOPD::Component::DST),
+      /*slot=*/3);
+  auto queue = [&](Value *v) {
+    writes.emplace_back(dst, v);
+    return true;
   };
 
-  auto parseVOPDHalf = [&](StringRef part) -> bool {
-    part = part.ltrim();
-    auto [mnPart, argsPart] = part.split(' ');
-
-    // Map v_dual_X → v_X
-    StringRef baseMn = mnPart;
-    if (baseMn.starts_with("v_dual_"))
-      baseMn = baseMn.drop_front(7); // "v_dual_" = 7 chars
-    std::string vopMn = ("v_" + baseMn).str();
-
-    // Parse comma-separated operands, then further split on spaces
-    // to separate modifiers like "bitop3:0x40" from register names
-    SmallVector<StringRef, 8> operands;
-    StringRef remaining = argsPart.ltrim();
-    while (!remaining.empty()) {
-      if (remaining.starts_with("//")) break;
-      auto [tok, rest] = remaining.split(',');
-      tok = tok.trim();
-      bool hitComment = false;
-      if (size_t cpos = tok.find("//"); cpos != StringRef::npos) {
-        tok = tok.take_front(cpos).rtrim();
-        hitComment = true;
-      }
-      if (!tok.empty()) {
-        // Split further on spaces to handle "v0 bitop3:0x40" → "v0", "bitop3:0x40"
-        SmallVector<StringRef, 4> subToks;
-        tok.split(subToks, ' ', -1, false);
-        for (auto &st : subToks)
-          operands.push_back(st);
-      }
-      if (hitComment) break;
-      remaining = rest.ltrim();
+  switch (half.semOp) {
+  case SemOp::V_MOV_B32: {
+    if (!requireVopdSources(half, 1, di, hr)) return false;
+    return queue(readVopdSource(ctx, half.src[0], 0));
+  }
+  case SemOp::V_CNDMASK_B32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = readVopdSource(ctx, half.src[0], 0);
+    Value *s1 = readVopdSource(ctx, half.src[1], 1);
+    Value *cond = half.numSrcs >= 3 ? readVopdCond(ctx, di, half.src[2], hr)
+                                    : ctx.regs.loadVCC(ctx.B);
+    if (!cond) return false;
+    return queue(ctx.B.CreateSelect(cond, s1, s0, "vopd_cndmask"));
+  }
+  case SemOp::V_ADD_F32:
+  case SemOp::V_MUL_F32:
+  case SemOp::V_SUB_F32:
+  case SemOp::V_SUBREV_F32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[0], 0),
+                                    ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[1], 1),
+                                    ctx.f32Ty);
+    Value *res = nullptr;
+    if (half.semOp == SemOp::V_ADD_F32)
+      res = ctx.B.CreateFAdd(s0, s1, "vopd_fadd");
+    else if (half.semOp == SemOp::V_MUL_F32)
+      res = ctx.B.CreateFMul(s0, s1, "vopd_fmul");
+    else if (half.semOp == SemOp::V_SUBREV_F32)
+      res = ctx.B.CreateFSub(s1, s0, "vopd_fsubrev");
+    else
+      res = ctx.B.CreateFSub(s0, s1, "vopd_fsub");
+    return queue(ctx.B.CreateBitCast(res, ctx.i32Ty));
+  }
+  case SemOp::V_FMAC_F32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[0], 0),
+                                    ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[1], 1),
+                                    ctx.f32Ty);
+    Value *acc = ctx.B.CreateBitCast(ctx.regs.readReg32(ctx.B, dst),
+                                     ctx.f32Ty);
+    Function *fmuladd =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fmuladd,
+                                          {ctx.f32Ty});
+    return queue(ctx.B.CreateBitCast(
+        ctx.B.CreateCall(fmuladd, {s0, s1, acc}, "vopd_fmac"), ctx.i32Ty));
+  }
+  case SemOp::V_FMA_F32: {
+    if (!requireVopdSources(half, 3, di, hr)) return false;
+    Value *s0 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[0], 0),
+                                    ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[1], 1),
+                                    ctx.f32Ty);
+    Value *s2 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[2], 2),
+                                    ctx.f32Ty);
+    Function *fma =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fma,
+                                          {ctx.f32Ty});
+    return queue(ctx.B.CreateBitCast(
+        ctx.B.CreateCall(fma, {s0, s1, s2}, "vopd_fma"), ctx.i32Ty));
+  }
+  case SemOp::V_ADD_NC_U32:
+  case SemOp::V_SUB_NC_U32:
+  case SemOp::V_SUBREV_NC_U32:
+  case SemOp::V_LSHLREV_B32:
+  case SemOp::V_LSHRREV_B32:
+  case SemOp::V_ASHRREV_I32:
+  case SemOp::V_AND_B32:
+  case SemOp::V_OR_B32:
+  case SemOp::V_XOR_B32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = readVopdSource(ctx, half.src[0], 0);
+    Value *s1 = readVopdSource(ctx, half.src[1], 1);
+    Value *res = nullptr;
+    switch (half.semOp) {
+    case SemOp::V_ADD_NC_U32:    res = ctx.B.CreateAdd(s0, s1, "vopd_add"); break;
+    case SemOp::V_SUB_NC_U32:    res = ctx.B.CreateSub(s0, s1, "vopd_sub"); break;
+    case SemOp::V_SUBREV_NC_U32: res = ctx.B.CreateSub(s1, s0, "vopd_subrev"); break;
+    case SemOp::V_LSHLREV_B32:   res = ctx.B.CreateShl(s1, s0, "vopd_shl"); break;
+    case SemOp::V_LSHRREV_B32:   res = ctx.B.CreateLShr(s1, s0, "vopd_lshr"); break;
+    case SemOp::V_ASHRREV_I32:   res = ctx.B.CreateAShr(s1, s0, "vopd_ashr"); break;
+    case SemOp::V_AND_B32:       res = ctx.B.CreateAnd(s0, s1, "vopd_and"); break;
+    case SemOp::V_OR_B32:        res = ctx.B.CreateOr(s0, s1, "vopd_or"); break;
+    case SemOp::V_XOR_B32:       res = ctx.B.CreateXor(s0, s1, "vopd_xor"); break;
+    default: llvm_unreachable("filtered by outer switch");
     }
-    if (operands.empty()) return false;
-
-    // operands[0] = dst, operands[1..] = srcs
-    auto parseVRegIdx = [](StringRef name) -> int {
-      if (name.starts_with("v") && !name.starts_with("vcc")) {
-        int idx = -1;
-        if (!name.drop_front(1).getAsInteger(10, idx)) return idx;
-      }
-      return -1;
-    };
-
-    // s_set_vgpr_msb offset for a given slot (0=src0, 1=src1, 2=src2, 3=dst).
-    auto msbOffset = [&](unsigned slot) -> int {
-      return ((ctx.vgprMSBs >> (slot * 2)) & 0x3) * 256;
-    };
-
-    // dst — apply DST MSB (slot 3)
-    int dstIdx = parseVRegIdx(operands[0]);
-    if (dstIdx < 0) return false;
-    dstIdx += msbOffset(3);
-
-    // Generic VOPD operand reader: VGPR, SGPR, or literal immediate.
-    // Handles source modifiers: -v0 (fneg), |v0| (fabs), -|v0| (fneg+fabs)
-    // srcSlot: MSB slot for this source (0=src0, 1=src1, 2=src2)
-    auto readVOPDSrc = [&](StringRef name, unsigned srcSlot = 0) -> Value * {
-      bool neg = false, absmod = false;
-      if (name.starts_with("-")) {
-        StringRef rest = name.drop_front(1);
-        bool negativeIntegerLiteral =
-            !rest.empty() &&
-            (std::isdigit(static_cast<unsigned char>(rest.front())) ||
-             rest.starts_with("0x") || rest.starts_with("0X")) &&
-            !rest.contains(".");
-        if (!negativeIntegerLiteral) {
-          neg = true;
-          name = rest;
-        }
-      }
-      if (name.starts_with("|") && name.ends_with("|")) {
-        absmod = true; name = name.drop_front(1).drop_back(1);
-      }
-      Value *v = nullptr;
-      int vidx = parseVRegIdx(name);
-      if (vidx >= 0) { v = ctx.regs.loadVGPR32(ctx.B, vidx + msbOffset(srcSlot)); }
-      // TTMP SGPRs ("trap temps") — Triton-emitted kernels on gfx1250 use
-      // `ttmp9` in VOPD source slots to read the workgroup-id-X value the
-      // SPE prelude seeded into `regs.ttmp[9]` (see raiser.cpp's Phase 4
-      // `fnWorkgroupIdX` store).  TTMP lives in its own alloca bank and
-      // must be checked before the plain SGPR branch below, because
-      // `ttmp<N>` does not start with the letter 's' but the next
-      // `name.starts_with("s")` catch-all would otherwise let this fall
-      // through to the integer-literal parser (which fails loudly) rather
-      // than the register load that was intended.
-      else if (name.starts_with("ttmp")) {
-        int tidx = -1;
-        if (!name.drop_front(4).getAsInteger(10, tidx) &&
-            tidx >= 0 &&
-            static_cast<unsigned>(tidx) < ctx.regs.ttmp.size())
-          v = ctx.B.CreateLoad(ctx.i32Ty, ctx.regs.ttmp[tidx], "vopd_ttmp");
-      }
-      // VCC.lo as a scalar source — present in ~8 VOPD sites across the
-      // current corpus (workgroup-id distribution prologues and similar
-      // SPE fixtures).  VOPD is a wave32-only family, so `vcc_lo` is the
-      // entire VCC bitmask in the source ISA; we route through
-      // `readVCCAsWaveMask` so the wave-projection layer sees a
-      // principled VCC-as-scalar read and can re-project to the target
-      // wave width, instead of a width-specific half-slice that would
-      // silently miscompile under cross-widening.
-      else if (name == "vcc_lo") {
-        if (ctx.projection.sourceWaveScopedLaneOps()) {
-          Value *mask = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.regs.execTy);
-          Value *lo = ctx.B.CreateTrunc(mask, ctx.i32Ty, "vopd_vcc_lo_src");
-          Value *hi =
-              ctx.B.CreateTrunc(ctx.B.CreateLShr(mask, ctx.isa.waveSize),
-                                ctx.i32Ty, "vopd_vcc_hi_src");
-          Value *lane = ctx.projection.emitLaneIdx(ctx.B);
-          Value *upper = ctx.B.CreateICmpUGE(
-              lane, ConstantInt::get(ctx.i32Ty, ctx.isa.waveSize),
-              "vopd_vcc_upper_src_wave");
-          v = ctx.B.CreateSelect(upper, hi, lo, "vopd_vcc_src_wave_mask");
-        } else {
-          v = ctx.regs.readVCCAsWaveMask(ctx.B, ctx.i32Ty);
-        }
-      }
-      else if (name.starts_with("s")) {
-        int sidx = -1;
-        if (!name.drop_front(1).getAsInteger(10, sidx))
-          v = ctx.regs.loadSGPR32(ctx.B, sidx);
-      }
-      if (!v) {
-        int64_t imm;
-        if (!name.getAsInteger(0, imm))
-          v = ConstantInt::get(ctx.i32Ty,
-                                static_cast<uint32_t>(imm & 0xFFFFFFFF));
-      }
-      // AMDGPU's instruction printer surfaces the f32 inline-constant
-      // pool (see `printImmediateFloat32` in
-      // llvm/lib/Target/AMDGPU/MCTargetDesc/AMDGPUInstPrinter.cpp) as
-      // their decimal float spelling rather than as the hex bit
-      // pattern.  The integer-literal path above can't parse them, so
-      // we map each printed literal back to its canonical IEEE-754
-      // 32-bit encoding here.  This is the same finite enumeration
-      // the printer uses; anything outside it surfaces as `0xNNNN...`
-      // and is already handled by the integer parse.  The negation /
-      // abs source modifiers were already stripped before this point.
-      if (!v) {
-        static const struct {
-          const char *txt;
-          uint32_t bits;
-        } kF32Inline[] = {
-            {"0.0", 0x00000000u},
-            {"1.0", 0x3f800000u},
-            {"-1.0", 0xbf800000u},
-            {"0.5", 0x3f000000u},
-            {"-0.5", 0xbf000000u},
-            {"2.0", 0x40000000u},
-            {"-2.0", 0xc0000000u},
-            {"4.0", 0x40800000u},
-            {"-4.0", 0xc0800000u},
-            {"0.15915494", 0x3e22f983u},
-        };
-        for (auto &e : kF32Inline) {
-          if (name == e.txt) {
-            v = ConstantInt::get(ctx.i32Ty, e.bits);
-            break;
-          }
-        }
-      }
-      if (!v) return nullptr;
-      if (neg || absmod) {
-        v = ctx.B.CreateBitCast(v, ctx.f32Ty);
-        if (absmod) v = ctx.B.CreateCall(Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fabs, {ctx.f32Ty}), {v});
-        if (neg) v = ctx.B.CreateFNeg(v);
-        v = ctx.B.CreateBitCast(v, ctx.i32Ty);
-      }
-      return v;
-    };
-
-    if (vopMn == "v_mov_b32") {
-      if (operands.size() < 2) return false;
-      Value *srcVal = readVOPDSrc(operands[1]);
-      if (!srcVal) return false;
-      queueVGPR32(dstIdx, srcVal);
-      return true;
+    return queue(res);
+  }
+  case SemOp::V_MAX_I32:
+  case SemOp::V_MIN_I32:
+  case SemOp::V_MAX_U32:
+  case SemOp::V_MIN_U32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = readVopdSource(ctx, half.src[0], 0);
+    Value *s1 = readVopdSource(ctx, half.src[1], 1);
+    Intrinsic::ID id = Intrinsic::smax;
+    if (half.semOp == SemOp::V_MIN_I32) id = Intrinsic::smin;
+    if (half.semOp == SemOp::V_MAX_U32) id = Intrinsic::umax;
+    if (half.semOp == SemOp::V_MIN_U32) id = Intrinsic::umin;
+    Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, id, {ctx.i32Ty});
+    const char *name = "vopd_smax";
+    if (half.semOp == SemOp::V_MIN_I32) name = "vopd_smin";
+    if (half.semOp == SemOp::V_MAX_U32) name = "vopd_umax";
+    if (half.semOp == SemOp::V_MIN_U32) name = "vopd_umin";
+    return queue(ctx.B.CreateCall(fn, {s0, s1}, name));
+  }
+  case SemOp::V_MAX_F32:
+  case SemOp::V_MIN_F32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    Value *s0 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[0], 0),
+                                    ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[1], 1),
+                                    ctx.f32Ty);
+    Intrinsic::ID id =
+        half.semOp == SemOp::V_MAX_F32 ? Intrinsic::maxnum : Intrinsic::minnum;
+    Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, id, {ctx.f32Ty});
+    const char *name =
+        half.semOp == SemOp::V_MAX_F32 ? "vopd_fmax" : "vopd_fmin";
+    return queue(ctx.B.CreateBitCast(
+        ctx.B.CreateCall(fn, {s0, s1}, name), ctx.i32Ty));
+  }
+  case SemOp::V_BITOP3_B32: {
+    if (!requireVopdSources(half, 2, di, hr)) return false;
+    if (!half.hasBitOp3) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOPD", "VOPD bitop component missing bitop3 immediate");
+      return false;
     }
-
-    if (vopMn == "v_cndmask_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1], 0);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-
-      // VOPD on gfx1250 encodes an EXPLICIT scalar condition operand
-      // (operands[3]) for each `v_dual_cndmask_b32` half. Ignoring it and
-      // defaulting to VCC (the previous behaviour) is a silent
-      // miscompile whenever the paired instruction writes `vcc_lo` and
-      // the cndmask's real condition source is a separate SGPR — which
-      // is exactly the shape Triton's `tl.cumsum` Kogge-Stone scan
-      // emits at distance-8 and distance-16: `v_dual_cndmask_b32 v<sel>,
-      // v<sel>, v<next_sel>, s<stage_guard> :: v_dual_cndmask_b32
-      // v<val>, v<val>, v<fadd>, vcc_lo` pairs the selector advance
-      // (guarded by `sN = (tid < 2^s)`) with the value update (guarded
-      // by `vcc = (tid > 2^s - 1)`). Hardcoding VCC for both halves
-      // conflates the two predicates and produces
-      // `canary_bpermute_scan_fp32`'s silent-WRONG scan output (the
-      // root-cause finding in hotswap/docs/modrep-predicate-chain.md
-      // §6.4: stage-3 lanes >= 8 read themselves instead of
-      // lane-8 partner, doubling their accumulator).
-      //
-      // Mirrors the non-VOPD `V_CNDMASK_B32` handler in
-      // handle_valu_vop3p.cpp — if the 3rd operand is an SGPR, prefer
-      // the fresh V_CMP shadow `i1` from the per-BB cache; else route
-      // through the projection's `extractLaneBitFromWaveMask` (lossy
-      // under wave32 → wave64 cross-widening if the producer truncated
-      // to source width, per the documented gap in
-      // hotswap/docs/sgpr-wave-mask-translation.md §3.1). Only if no
-      // scalar condition is specified (or the 3rd operand is
-      // `vcc_lo`/`vcc`) do we fall back to `loadVCC`.
-      Value *cond = nullptr;
-      if (operands.size() >= 4) {
-        StringRef condName = operands[3];
-        if (condName == "vcc_lo" || condName == "vcc") {
-          cond = ctx.regs.loadVCC(ctx.B);
-        } else if (condName.starts_with("s") && !condName.starts_with("scc")) {
-          int sidx = -1;
-          if (!condName.drop_front(1).getAsInteger(10, sidx) && sidx >= 0) {
-            if (Value *freshCmp = ctx.lookupSgprWaveMaskI1(sidx)) {
-              cond = freshCmp;
-            } else {
-              Value *condVal = ctx.isa.isWave32()
-                                   ? ctx.regs.loadSGPR32(ctx.B, sidx)
-                                   : ctx.regs.loadSGPR64(ctx.B, sidx);
-              Value *fallback =
-                  ctx.projection.extractLaneBitFromWaveMask(ctx.B, condVal);
-              if (Value *shadowValid = ctx.loadSgprWaveMaskValid(sidx)) {
-                Value *shadowExec = ctx.loadSgprWaveMaskExec(sidx);
-                Value *shadowI1 =
-                    ctx.projection.extractLaneBitFromWaveMask(ctx.B, shadowExec);
-                cond = ctx.B.CreateSelect(shadowValid, shadowI1, fallback,
-                                          "vopd_sgpr_mask_shadow_sel");
-              } else {
-                cond = fallback;
-              }
-            }
-          }
-        }
-      }
-      if (!cond) cond = ctx.regs.loadVCC(ctx.B);
-      queueVGPR32(dstIdx, ctx.B.CreateSelect(cond, s1, s0, "vopd_cndmask"));
-      return true;
-    }
-
-    if (vopMn == "v_add_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateFAdd(s0, s1, "vopd_fadd"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_mul_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateFMul(s0, s1, "vopd_fmul"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_sub_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateFSub(s0, s1, "vopd_fsub"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_fmac_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      Value *dv = ctx.B.CreateBitCast(ctx.regs.loadVGPR32(ctx.B, dstIdx), ctx.f32Ty);
-      Function *fmuladd = Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fmuladd, {ctx.f32Ty});
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateCall(fmuladd, {s0, s1, dv}, "vopd_fmac"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_add_nc_u32" || vopMn == "v_add_u32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateAdd(s0, s1, "vopd_add"));
-      return true;
-    }
-
-    if (vopMn == "v_sub_nc_u32" || vopMn == "v_subrev_nc_u32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      if (vopMn == "v_subrev_nc_u32") std::swap(s0, s1);
-      queueVGPR32(dstIdx, ctx.B.CreateSub(s0, s1, "vopd_sub"));
-      return true;
-    }
-
-    if (vopMn == "v_lshlrev_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateShl(s1, s0, "vopd_shl"));
-      return true;
-    }
-
-    if (vopMn == "v_and_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateAnd(s0, s1, "vopd_and"));
-      return true;
-    }
-
-    if (vopMn == "v_lshrrev_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateLShr(s1, s0, "vopd_lshr"));
-      return true;
-    }
-
-    // v_ashrrev_i32 mirrors v_lshrrev_b32 but with arithmetic (sign-
-    // preserving) right shift.  The "rev" suffix means the operand
-    // ordering in the printed text is `(shift_amount, value)` — i.e.
-    // operands[1] = shift amount, operands[2] = value to shift.
-    if (vopMn == "v_ashrrev_i32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateAShr(s1, s0, "vopd_ashr"));
-      return true;
-    }
-
-    // v_max_i32 (signed max).  Use llvm.smax for symmetry with the
-    // float min/max paths above; LLVM lowers it to the canonical
-    // `select (icmp sgt) ...` shape on AMDGPU.
-    if (vopMn == "v_max_i32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      Function *smaxFn = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::smax, {ctx.i32Ty});
-      queueVGPR32(dstIdx,
-                  ctx.B.CreateCall(smaxFn, {s0, s1}, "vopd_smax"));
-      return true;
-    }
-
-    // v_min_i32 (signed min).  Mirror of v_max_i32 above; included
-    // for completeness of the signed-integer dual-issue family even
-    // though the current corpus only exercises the smax variant.
-    if (vopMn == "v_min_i32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      Function *sminFn = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::smin, {ctx.i32Ty});
-      queueVGPR32(dstIdx,
-                  ctx.B.CreateCall(sminFn, {s0, s1}, "vopd_smin"));
-      return true;
-    }
-
-    // v_max_u32 / v_min_u32 (unsigned max/min).  Same shape as the
-    // signed variants but using llvm.umax / llvm.umin.  Included for
-    // completeness alongside the signed siblings.
-    if (vopMn == "v_max_u32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      Function *umaxFn = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::umax, {ctx.i32Ty});
-      queueVGPR32(dstIdx,
-                  ctx.B.CreateCall(umaxFn, {s0, s1}, "vopd_umax"));
-      return true;
-    }
-    if (vopMn == "v_min_u32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      Function *uminFn = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::umin, {ctx.i32Ty});
-      queueVGPR32(dstIdx,
-                  ctx.B.CreateCall(uminFn, {s0, s1}, "vopd_umin"));
-      return true;
-    }
-
-    // v_xor_b32 / v_or_b32 — bitwise siblings of v_and_b32 above.
-    // VOPD is a Wave32 dual-issue family for the most common simple
-    // VALU ops; rounding out the bitwise trio costs nothing and
-    // forecloses the next likely "unhandled sub-operation" surprise.
-    if (vopMn == "v_xor_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateXor(s0, s1, "vopd_xor"));
-      return true;
-    }
-    if (vopMn == "v_or_b32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      queueVGPR32(dstIdx, ctx.B.CreateOr(s0, s1, "vopd_or"));
-      return true;
-    }
-
-    if (vopMn == "v_fma_f32") {
-      if (operands.size() < 4) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      Value *s2 = readVOPDSrc(operands[3], 2);
-      if (!s0 || !s1 || !s2) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      s2 = ctx.B.CreateBitCast(s2, ctx.f32Ty);
-      Function *fma = Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fma, {ctx.f32Ty});
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateCall(fma, {s0, s1, s2}, "vopd_fma"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_max_num_f32" || vopMn == "v_max_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      Function *maxFn = Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::maxnum, {ctx.f32Ty});
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateCall(maxFn, {s0, s1}, "vopd_fmax"), ctx.i32Ty));
-      return true;
-    }
-
-    if (vopMn == "v_min_num_f32" || vopMn == "v_min_f32") {
-      if (operands.size() < 3) return false;
-      Value *s0 = readVOPDSrc(operands[1]);
-      Value *s1 = readVOPDSrc(operands[2], 1);
-      if (!s0 || !s1) return false;
-      s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty); s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
-      Function *minFn = Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::minnum, {ctx.f32Ty});
-      queueVGPR32(dstIdx, ctx.B.CreateBitCast(ctx.B.CreateCall(minFn, {s0, s1}, "vopd_fmin"), ctx.i32Ty));
-      return true;
-    }
-
-    // v_bitop2_b32 / v_bitop3_b32 in VOPD context.
-    // The truth table immediate is appended as "bitop3:0xNN".
-    //
-    // IMPORTANT: v_bitop3 consumes THREE logical sources. The prior
-    // implementation incorrectly hardcoded src2=0 for both bitop2 and bitop3,
-    // which silently changed truth-table semantics whenever TTBL depends on
-    // the third input (e.g. 0x28 in topk's merge ladder).
-    if (vopMn == "v_bitop2_b32" || vopMn == "v_bitop3_b32") {
-      if (operands.size() < 3) return false;
-      Value *a = readVOPDSrc(operands[1]);
-      Value *b = readVOPDSrc(operands[2], 1);
-      if (!a || !b) return false;
-      uint32_t lut = 0;
-      for (unsigned k = 3; k < operands.size(); k++) {
-        if (operands[k].starts_with("bitop3:")) {
-          StringRef hex = operands[k].drop_front(7);
-          StringRef clean = hex.take_while([](char c) {
-            return std::isxdigit(static_cast<unsigned char>(c)) ||
-                   c == 'x' || c == 'X';
-          });
-          if (!clean.empty())
-            clean.getAsInteger(0, lut);
-          break;
-        }
-      }
-      // bitop2 has only two inputs: model it as bitop3 with src2=0.
-      // bitop3 must read the real third source operand.
-      Value *c = ConstantInt::get(ctx.i32Ty, 0);
-      if (vopMn == "v_bitop3_b32") {
-        if (operands.size() < 4) return false;
-        c = readVOPDSrc(operands[3], 2);
-        if (!c) return false;
-      }
-      Value *na = ctx.B.CreateNot(a), *nb = ctx.B.CreateNot(b), *nc = ctx.B.CreateNot(c);
-      Value *result = ConstantInt::get(ctx.i32Ty, 0);
-      Value *minterms[8] = {
+    Value *a = readVopdSource(ctx, half.src[0], 0);
+    Value *b = readVopdSource(ctx, half.src[1], 1);
+    Value *c = ConstantInt::get(ctx.i32Ty, 0);
+    Value *na = ctx.B.CreateNot(a);
+    Value *nb = ctx.B.CreateNot(b);
+    Value *nc = ctx.B.CreateNot(c);
+    Value *minterms[8] = {
         ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), nc),
         ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), c),
         ctx.B.CreateAnd(ctx.B.CreateAnd(na, b), nc),
@@ -551,30 +306,45 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
         ctx.B.CreateAnd(ctx.B.CreateAnd(a, nb), c),
         ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), nc),
         ctx.B.CreateAnd(ctx.B.CreateAnd(a, b), c),
-      };
-      for (int i = 0; i < 8; i++)
-        if (lut & (1 << i))
-          result = ctx.B.CreateOr(result, minterms[i]);
-      queueVGPR32(dstIdx, result);
-      return true;
-    }
-
-    llvm::errs() << "transpiler: VOPD: unhandled sub-operation '" << vopMn << "'\n";
-    return false;
-  };
-
-  bool xOk = parseVOPDHalf(xPart);
-  bool yOk = xOk && parseVOPDHalf(yPart);
-  if (!xOk || !yOk) {
+    };
+    Value *result = ConstantInt::get(ctx.i32Ty, 0);
+    for (int i = 0; i < 8; ++i)
+      if (half.bitOp3 & (1u << i))
+        result = ctx.B.CreateOr(result, minterms[i]);
+    return queue(result);
+  }
+  default:
     hr.failure = RaiseFailure::unsupportedShape(
-        di, "VOPD", "VOPD decomposition failed");
-    llvm::errs() << "transpiler: VOPD decomposition failed: " << text << "\n";
+        di, "VOPD", "unhandled structural VOPD component SemOp");
+    return false;
+  }
+}
+
+} // namespace
+
+HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
+                        OpResolver &op) {
+  HandlerResult hr;
+  (void)op;
+  if (!di.hasVopd) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOPD", "VOPD instruction reached handler without sidecar");
     return hr;
   }
+
+  SmallVector<std::pair<ParsedReg, Value *>, 4> pendingVGPRWrites;
+  bool xOk = lowerVopdHalf(ctx, di, di.vopd[AMDGPU::VOPD::ComponentIndex::X],
+                           pendingVGPRWrites, hr);
+  bool yOk = xOk && lowerVopdHalf(
+                        ctx, di, di.vopd[AMDGPU::VOPD::ComponentIndex::Y],
+                        pendingVGPRWrites, hr);
+  if (!xOk || !yOk)
+    return hr;
+
   // VOPD executes as a paired issue packet: both halves read pre-instruction
   // register state. Commit writes only after both halves are decoded/lifted.
   for (const auto &w : pendingVGPRWrites)
-    ctx.storeVGPR32(w.first, w.second);
+    ctx.writeReg32(w.first, w.second);
   hr.handled = true;
   return hr;
 }

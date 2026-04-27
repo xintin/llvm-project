@@ -96,6 +96,59 @@ struct DecodedInst {
   bool hasDsSwizzleImm = false;
   uint16_t dsSwizzleImm = 0;
 
+  // ── VOPD structural decode ────────────────────────────────────────
+  //
+  // VOPD packets contain two VALU component instructions sharing one
+  // MCInst. The disassembler prints them as
+  //   v_dual_<x> ... :: v_dual_<y> ...
+  // but the raiser must not recover semantics by tokenizing that text.
+  // The decoder populates this sidecar from LLVM's VOPD component tables
+  // and MC operand indices; handle_vopd.cpp consumes only this typed view.
+  struct VopdSource {
+    enum class Kind : uint8_t {
+      None,
+      VGPR,
+      AGPR,
+      SGPR,
+      TTMP,
+      VCC,
+      EXEC,
+      SCC,
+      M0,
+      Imm,
+    };
+    Kind kind = Kind::None;
+    // Original MC operand index. Kept for diagnostics / drift checks.
+    unsigned operandIndex = 0;
+    // Original MC register id for register-like kinds.
+    unsigned reg = 0;
+    // Logical register-file index for register-like kinds.
+    int baseIdx = -1;
+    int width = 1;
+    // Raw immediate when kind == Imm. The component SemOp determines
+    // whether the bit pattern is interpreted as integer bits or f32 bits.
+    int64_t imm = 0;
+    // VOPD3 source modifier bits (same low-bit neg / abs contract that
+    // VOP3 source modifiers use). Zero for VOPD1/2 and unmodified sources.
+    uint8_t modifiers = 0;
+  };
+
+  struct VopdHalf {
+    SemOp semOp = SemOp::Unknown;
+    unsigned componentOpcode = 0;
+    unsigned dstReg = 0;
+    VopdSource src[3] = {};
+    unsigned numSrcs = 0;
+    bool hasSrc2Acc = false;
+    bool isVOP3 = false;
+    bool hasBitOp3 = false;
+    uint8_t bitOp3 = 0;
+  };
+
+  bool hasVopd = false;
+  bool isVopd3 = false;
+  VopdHalf vopd[2] = {};
+
   unsigned firstSrcIdx = 0;
 
   // Upper bound on the logical-source count the raiser's walk can produce.
