@@ -190,6 +190,18 @@ def _salmon_proof(proof_path: Path) -> dict:
     forced = [e for e in events if e.get("event") == "triton_forced_target"]
     decisions = [e for e in events if e.get("event") == "transpile_decision"]
     salmon_results = [e for e in events if e.get("event") == "salmon_result"]
+    cache_events = [e for e in events if e.get("event") == "salmon_cache"]
+    cache_status_counts = {
+        status: sum(1 for e in cache_events if e.get("status") == status)
+        for status in (
+            "hit",
+            "miss",
+            "invalid",
+            "disabled",
+            "write_success",
+            "write_failed",
+        )
+    }
     ok_results = [e for e in salmon_results if e.get("success") is True]
     failed_results = [e for e in salmon_results if e.get("success") is False]
     c5_suppressed = [
@@ -217,6 +229,20 @@ def _salmon_proof(proof_path: Path) -> dict:
         ),
         "salmon_ok_count": len(ok_results),
         "salmon_failed_count": len(failed_results),
+        "salmon_cache_event_count": len(cache_events),
+        "salmon_cache_hit_count": cache_status_counts["hit"],
+        "salmon_cache_miss_count": cache_status_counts["miss"],
+        "salmon_cache_invalid_count": cache_status_counts["invalid"],
+        "salmon_cache_disabled_count": cache_status_counts["disabled"],
+        "salmon_cache_write_success_count": cache_status_counts["write_success"],
+        "salmon_cache_write_failed_count": cache_status_counts["write_failed"],
+        "first_salmon_cache_event": cache_events[0] if cache_events else None,
+        "first_salmon_cache_invalid": next(
+            (e for e in cache_events if e.get("status") == "invalid"), None
+        ),
+        "first_salmon_cache_write_failed": next(
+            (e for e in cache_events if e.get("status") == "write_failed"), None
+        ),
         "c5_suppressed_count": sum(
             int(e.get("c5_suppressed_count", 0)) for e in c5_suppressed
         ),
@@ -474,6 +500,12 @@ def _write_markdown_report(report: dict, report_path: Path) -> None:
         f"| Saw loader transpile decision | {_fmt(proof.get('saw_loader_transpile_decision'))} |",
         f"| Salmon OK count | {_fmt(proof.get('salmon_ok_count'))} |",
         f"| Salmon FAILED count | {_fmt(proof.get('salmon_failed_count'))} |",
+        f"| Cache hits | {_fmt(proof.get('salmon_cache_hit_count'))} |",
+        f"| Cache misses | {_fmt(proof.get('salmon_cache_miss_count'))} |",
+        f"| Cache disabled/bypassed | {_fmt(proof.get('salmon_cache_disabled_count'))} |",
+        f"| Cache invalid entries | {_fmt(proof.get('salmon_cache_invalid_count'))} |",
+        f"| Cache write successes | {_fmt(proof.get('salmon_cache_write_success_count'))} |",
+        f"| Cache write failures | {_fmt(proof.get('salmon_cache_write_failed_count'))} |",
         f"| C5 suppressed safe sites | {_fmt(proof.get('c5_suppressed_count'))} |",
         f"| First unsupported instruction | `{proof.get('first_unsupported_instruction') or 'n/a'}` |",
         "",

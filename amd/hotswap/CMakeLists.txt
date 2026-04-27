@@ -143,6 +143,7 @@ add_library(hotswap-transpiler STATIC
   wmma_lowering.cpp
   mxfp4_dequant.cpp
   pipeline.cpp
+  translation_cache.cpp
   code_object_utils.cpp
   kernarg_layout.cpp
   user_sgpr_layout.cpp
@@ -281,6 +282,7 @@ set(TEST_SOURCES
   tests/mc_context_inline_srcmgr_test.cpp
   tests/mxfp4_dequant_test.cpp
   tests/tdm_gpu_test.cpp
+  tests/translation_cache_test.cpp
   tests/wave_projection_test.cpp
 )
 

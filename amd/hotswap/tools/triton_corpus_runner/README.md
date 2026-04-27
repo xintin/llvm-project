@@ -354,6 +354,42 @@ python3 compare_gpt_oss_sglang.py \
   --timeout 900
 ```
 
+To iterate without retranslating every previously successful gfx1250 code
+object, enable the Salmon translation cache with a scratch directory:
+
+```bash
+TRITON_ALWAYS_COMPILE=1 \
+TRITON_CACHE_DIR=/tmp/triton_cache_gpt_oss_decompose_rerun10 \
+HSA_SALMON_CACHE_DIR=/tmp/salmon_translation_cache \
+GPT_OSS_SGLANG_DECOMPOSE_MXFP4_FOR_GFX1250=1 \
+HSA_SALMON_TOOL_TIMEOUT_S=600 \
+GPT_OSS_SGLANG_RETURN_HIDDEN_STATES=0 \
+GPT_OSS_SGLANG_PROMPTS_JSON='[{"name":"identity_salmon","prompt":"Answer with exactly one word: salmon","expected_text":"salmon"}]' \
+python3 compare_gpt_oss_sglang.py \
+  --native-mxfp4 \
+  --out-dir /tmp/gpt_oss_sglang_compare_cache_debug \
+  --timeout 900
+```
+
+Run the same command again with the same `HSA_SALMON_CACHE_DIR`; the second
+Salmon run should report `salmon_cache` `hit` events for code objects whose
+source bytes and Salmon configuration still match. The comparison JSON and
+Markdown summary include cache hit, miss, invalid, and write counts under the
+Salmon proof section. Invalid cache entries are not treated as misses: they are
+reported loudly and fail the Salmon load so stale output cannot hide a current
+translation failure.
+
+When actively fixing one kernel, bypass cached translations for just that
+kernel with an exact comma-separated skip list:
+
+```bash
+HSA_SALMON_CACHE_SKIP_KERNELS=_upcast_from_mxfp
+```
+
+The cache artifact is code-object scoped, so a matching kernel disables cache
+lookup and writes for its whole containing code object. The proof log records
+this as `salmon_cache` `status:"disabled"` with `kernel_name`.
+
 Current real Salmon status after the modified-kernarg-pair SMEM fix: the
 proof gate reaches the loader-side Salmon path and the first SGLang helper
 kernels translate successfully (`create_flashinfer_kv_indices_triton`, both

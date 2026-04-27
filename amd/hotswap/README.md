@@ -480,4 +480,46 @@ reuses the surrounding integration infrastructure.  Specifically:
 | `HSA_HOTSWAP_RULES` | No | Path to JSON rules file.  Set to `/dev/null` if no rules are needed but the engine must be enabled. |
 | `HSA_SALMON_DUMP_DIR` | No | Directory for intermediate files.  Each invocation creates a unique `salmon-XXXXXX/` subdirectory.  When unset, intermediates go to a temp dir that is cleaned up on exit. |
 | `HSA_SALMON_DUMP_INPUT` | No | Set to `1` to also save the input code object (`input.co`) and per-kernel disassembly (`.dis`) alongside the raised IR. |
+| `HSA_SALMON_CACHE_DIR` | No | Opt-in directory for successful translated HSACO cache entries.  Use a `/tmp/...` or scratch path; do not place generated cache artifacts under `/data`. |
+| `HSA_SALMON_CACHE_DISABLE` | No | Set to a non-zero value to bypass the cache even when `HSA_SALMON_CACHE_DIR` is set. |
+| `HSA_SALMON_CACHE_READONLY` | No | Set to a non-zero value to allow validated hits but skip cache writes. |
+| `HSA_SALMON_CACHE_DEBUG` | No | Set to a non-zero value for extra stderr diagnostics on clean misses and writes. |
+| `HSA_SALMON_CACHE_SKIP_KERNELS` | No | Comma-separated exact kernel names whose containing code objects should bypass cache lookup and writes. |
+
+### Translation cache
+
+`HSA_SALMON_CACHE_DIR` enables a conservative disk cache for successful Salmon
+translations. The loader hashes the exact code object bytes it is about to hand
+to Salmon, together with the resolved source/target gfx names, recovered
+original MACH byte when the intercept provided one, `HSA_HOTSWAP_RULES` content
+hash, strict/wave/writelane settings, LLVM tool content identities, and the
+loaded runtime image content identity. A hit is only accepted when both the metadata JSON and
+cached HSACO match the expected key and object SHA256.
+
+The cache stores one complete merged target HSACO per input code object. This is
+intentional for multi-kernel code objects: `runPipelineAllKernels` must raise
+and link every kernel successfully, and ROCR must accept the translated HSACO
+with `InitAsBuffer`, before the result is written. Cache writes use temporary
+files followed by rename. Clean misses run the normal translation path; corrupt
+or mismatched entries emit a structured `salmon_cache` proof event with
+`status:"invalid"` and fail the load rather than silently translating over the
+bad entry.
+
+When `HSA_SALMON_PROOF_LOG` is set, cache activity appears as:
+
+```json
+{"event":"salmon_cache","status":"hit","source_gfx":"gfx1250","target_gfx":"gfx942","key":"...","cached_object":"..."}
+```
+
+Cache hits still emit the existing successful `salmon_result` event, with
+`cache_hit:true`, so reports can distinguish a Salmon-mediated cached load from
+native execution.
+
+When iterating on arithmetic correctness for a specific kernel, use
+`HSA_SALMON_CACHE_SKIP_KERNELS=_kernel_name` to force that kernel's code object
+through a fresh translation while leaving unrelated entries cacheable. Matching
+is exact, not substring-based. Because the cache artifact is the whole merged
+HSACO for a code object, any match disables lookup and writes for the entire
+containing code object and emits `salmon_cache` with `status:"disabled"` and the
+matched `kernel_name`.
 
