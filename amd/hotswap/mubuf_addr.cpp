@@ -350,23 +350,4 @@ MubufAddr decodeMubufAddr(RaiseContext &ctx, const DecodedInst &di,
   return out;
 }
 
-MubufAtomicAddr decodeMubufAtomicAddr(RaiseContext &ctx,
-                                       const DecodedInst & /*di*/,
-                                       OpResolver &op,
-                                       StringRef /*diagLabel*/) {
-  // `readReg32` fatal's on out-of-range SGPR indices, so no null-check
-  // is needed here — the loads either succeed or never return.
-  ParsedReg srsrc = op.srcReg(0);
-  Value *dw0 = ctx.regs.readReg32(ctx.B, srsrc);
-  ParsedReg srsrc1 = srsrc; srsrc1.baseIdx = srsrc.baseIdx + 1;
-  Value *dw1 = ctx.regs.readReg32(ctx.B, srsrc1);
-  Value *lo = ctx.B.CreateZExt(dw0, ctx.i64Ty);
-  Value *hi = ctx.B.CreateAnd(ctx.B.CreateZExt(dw1, ctx.i64Ty),
-                               ConstantInt::get(ctx.i64Ty, 0xFFFF));
-  Value *ptrInt = ctx.B.CreateOr(lo, ctx.B.CreateShl(hi, 32), "buf_base");
-  MubufAtomicAddr out;
-  out.ptr = ctx.B.CreateIntToPtr(ptrInt, PointerType::get(ctx.C, 0));
-  return out;
-}
-
 } // namespace transpiler

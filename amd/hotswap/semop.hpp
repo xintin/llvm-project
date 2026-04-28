@@ -768,9 +768,8 @@ enum class SemOp : uint16_t {
   // Class 3 non-commutative atomics (NonCommutativeAtomic), see
   // hotswap/docs/wave-size-translation.md §6.
   // The wave-size classifier flags these in the cross-wave case;
-  // commutative AtomicRMW dispatch in handle_mubuf.cpp does not
-  // model the cmpxchg / xchg semantics, so the handler's default
-  // branch refuses with `unsupportedShape`.
+  // handle_mubuf.cpp models them with raw-buffer atomics so same-wave
+  // and same-target lifts preserve descriptor-relative addressing.
   BUFFER_ATOMIC_SWAP, BUFFER_ATOMIC_CMPSWAP,
   BUFFER_ATOMIC_ADD_F32,
   BUFFER_ATOMIC_PK_ADD_BF16, BUFFER_ATOMIC_PK_ADD_F16,

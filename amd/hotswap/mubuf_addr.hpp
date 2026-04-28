@@ -9,7 +9,7 @@
 
 namespace transpiler {
 
-// Decoded addressing shape of a MUBUF / VBUFFER load or store.
+// Decoded addressing shape of a MUBUF / VBUFFER load, store, or atomic.
 //
 // `srd` is a <4 x i32> raw buffer descriptor built from the SRSRC
 // 128-bit SGPR tuple. `rawPtrRsrc` is the same resource expressed as
@@ -23,8 +23,8 @@ namespace transpiler {
 // "auxFlags is hard-coded to 0" item in
 // hotswap/docs/buffer-store-lowering.md §"Known limitations").
 //
-// For stores, `stData` is the VGPR source carrying the data. For
-// loads it's a default-constructed ParsedReg (kind == OTHER).
+// For stores and atomics, `stData` is the VGPR source carrying the data.
+// For loads it's a default-constructed ParsedReg (kind == OTHER).
 //
 // Historical note: an earlier revision of this struct also exposed
 // the raw SRSRC dwords (`dw0` / `dw1` / `dw2`) for the flat-store
@@ -44,12 +44,13 @@ struct MubufAddr {
   ParsedReg stData;
 };
 
-// Decode a MUBUF / VBUFFER load or store's addressing operands into a
+// Decode a MUBUF / VBUFFER load, store, or atomic's addressing operands into a
 // fully-materialised `MubufAddr`. Recognises the LLVM-MC operand
 // layout:
 //
 //   load:  [dst(vdata), srsrc(SGPR4), vaddr(VGPR), soff(SGPR?), imm?, cpol?]
-//   store: [srsrc(SGPR4), vdata(VGPR), vaddr(VGPR), soff(SGPR?), imm?, cpol?]
+//   store/atomic:
+//         [srsrc(SGPR4), vdata(VGPR), vaddr(VGPR), soff(SGPR?), imm?, cpol?]
 //
 // Both MUBUF and VBUFFER encodings share this shape — the operand
 // order inside an encoding can vary between LLVM versions so the
@@ -61,21 +62,6 @@ struct MubufAddr {
 MubufAddr decodeMubufAddr(RaiseContext &ctx, const DecodedInst &di,
                           OpResolver &op, bool isStore,
                           llvm::StringRef diagLabel);
-
-// Atomic form of MUBUF: the SRSRC is used as a plain 64-bit base
-// pointer (lo + masked hi16) rather than a raw-buffer descriptor.
-// `ptr` is the resulting flat pointer in address space 0.
-struct MubufAtomicAddr {
-  llvm::Value *ptr = nullptr;
-};
-
-// Decode a `buffer_atomic_*` instruction's addressing operands.
-// `op.srcReg(0)` MUST be the SRSRC SGPR tuple. Fails loudly on shape
-// mismatch.
-MubufAtomicAddr decodeMubufAtomicAddr(RaiseContext &ctx,
-                                       const DecodedInst &di,
-                                       OpResolver &op,
-                                       llvm::StringRef diagLabel);
 
 } // namespace transpiler
 

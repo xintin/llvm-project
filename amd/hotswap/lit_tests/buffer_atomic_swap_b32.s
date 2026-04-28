@@ -6,11 +6,12 @@
 ; Lift test for the gfx11+/gfx1250 VBUFFER buffer-atomic swap
 ; (`buffer_atomic_swap_b32`).  Sibling of
 ; `lit_tests/buffer_atomic_add_u32/`, which pins the commutative
-; add path; this fixture pins the exchange path — `AtomicRMWInst::Xchg`
-; in handle_mubuf.cpp.  The RTN-form write-back (see the "RTN-form
+; add path; this fixture pins the exchange path through
+; `llvm.amdgcn.raw.buffer.atomic.swap` in handle_mubuf.cpp.  The RTN-form
+; write-back (see the "RTN-form
 ; write-back" comment in that handler) is the semantic point of
 ; `buffer_atomic_swap`: the caller reads the old value.  Without
-; write-back, the handler would emit a pure `atomicrmw xchg` that
+; write-back, the handler would emit a raw-buffer swap call that
 ; discards the original value and reduce the swap to a store —
 ; quietly miscompiling any CAS-loop that relies on it.
 ;
@@ -32,33 +33,18 @@
 ;
 ; Invariants:
 ;
-;   1. `atomicrmw xchg` with `monotonic` ordering — matches the
-;      MUBUF family convention (see the ADD sibling fixture's
-;      comment block on the `scope:SCOPE_DEV` → `monotonic`
-;      lowering).
-;   2. The RTN write-back is present: the `atomicrmw`'s result
-;      reaches the destination VGPR through a `writeReg32` — in IR
-;      this shows up as a `store i32 %atomicrmw.result, ...` or
-;      equivalent SSA flow back to a tied VGPR.  We don't pin the
-;      exact shape (the writeReg path varies with register widths
-;      and VGPR aliases) but we DO pin that the atomicrmw's result
-;      is named / bound to an SSA value, i.e. the value isn't
-;      dropped at the IR level.
-;   3. No `raw.buffer.atomic` intrinsic — all commutative and swap
-;      buffer atomics route through AtomicRMW, not the buffer-
-;      intrinsic path.
+;   1. The swap lifts to the raw-buffer atomic intrinsic, preserving
+;      descriptor-relative addressing and hardware OOB behavior.
+;   2. The RTN write-back is present: the intrinsic's old-value
+;      result reaches the destination VGPR through `writeReg32`.
 
 ; CHECK-LABEL: define amdgpu_kernel void @buffer_atomic_swap_b32_kernel(
 
-; The atomic itself: atomicrmw xchg with monotonic ordering.
-; CHECK: atomicrmw xchg ptr {{.*}} monotonic
+; The atomic itself: raw-buffer swap, not a flat pointer atomic.
+; CHECK: call i32 @llvm.amdgcn.raw.buffer.atomic.swap
 
-; Negative pin: no raw.buffer.atomic intrinsic.  Mirrors the ADD
-; fixture's convention — all commutative and swap buffer atomics are
-; modelled as AtomicRMW so the backend can re-lower to the native
-; form per target ISA.
-; CHECK-NOT: call {{.*}}@llvm.amdgcn.raw.buffer.atomic.swap
-; CHECK-NOT: call {{.*}}@llvm.amdgcn.struct.buffer.atomic.swap
+; Negative pin: no flat pointer atomic.
+; CHECK-NOT: atomicrmw xchg
 
 ; Negative pin: no `cmpxchg` — SWAP and CMPSWAP are distinct opcodes
 ; with distinct handler arms; a regression that routes SWAP through

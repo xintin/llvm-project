@@ -270,12 +270,11 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
   // vdata register at operand 0 in BOTH the RTN (glc=1 / tied-def)
   // and non-RTN (glc=0 / pure-source) forms.  The difference is
   // whether operand 0 is also tied to the destination (RTN) or
-  // only a source (non-RTN).  `op.dst(0)` — which maps to
-  // `ctx.parseReg(di.getReg(0), 0)` per `raise_context.hpp:489` —
-  // reads operand 0 unconditionally and therefore returns the
-  // vdata register for both forms.  The RTN-only write-back below
-  // is gated by `di.numDefs > 0` (consistent with the assert just
-  // below this comment), which correctly SKIPS for non-RTN.  The
+  // only a source (non-RTN).  `decodeMubufAddr(..., isStore=true)`
+  // treats the first VGPR source as vdata for both forms, and the
+  // RTN-only write-back below is gated by `di.numDefs > 0`
+  // (consistent with the assert just below this comment), which
+  // correctly SKIPS for non-RTN.  The
   // two per-form invariants are pinned by
   // `lit_tests/buffer_atomic_swap_b32/` (RTN) +
   // `lit_tests/buffer_atomic_swap_b32_nortn/` (non-RTN) and the
@@ -283,56 +282,59 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
   if (sop >= SemOp::BUFFER_ATOMIC_ADD && sop <= SemOp::BUFFER_ATOMIC_PK_ADD_F16) {
     assert(((di.tsFlags & SIInstrFlags::IsAtomicRet) != 0) == (di.numDefs > 0) &&
            "buffer atomic: IsAtomicRet disagrees with numDefs");
-    MubufAtomicAddr atomic =
-        decodeMubufAtomicAddr(ctx, di, op, "buffer_atomic");
-    Value *gep = atomic.ptr;
+    MubufAddr mbuf = decodeMubufAddr(ctx, di, op, /*isStore=*/true,
+                                     "buffer_atomic");
 
     // `BUFFER_ATOMIC_CMPSWAP` is the one buffer atomic whose vdata is
     // a register PAIR carrying `{cmp, new}` rather than a single data
-    // word.  Split it out before the single-word atomicrmw dispatch
-    // below; mirrors the sibling FLAT_ATOMIC_CMPSWAP /
-    // GLOBAL_ATOMIC_CMPSWAP handlers in `handle_flat.cpp`, which
-    // decode the vdata pair with a synthetic `baseIdx + 1` read.
-    // The MUBUF vdata register is addressable through `op.dst(0)`
-    // (tied operand, only populated for RTN form — the assert above
-    // already pins `IsAtomicRet == (numDefs > 0)` so reaching this
-    // branch with a meaningful `op.dst(0)` is safe).
+    // word.  Split it out before the single-word raw-buffer atomic
+    // dispatch below. The MUBUF data register is the first VGPR source,
+    // and the second word is read with a synthetic `baseIdx + 1`.
     if (sop == SemOp::BUFFER_ATOMIC_CMPSWAP) {
-      ParsedReg dataPair = op.dst(0);
+      ParsedReg dataPair = mbuf.stData;
       Value *cmpVal = ctx.regs.readReg32(ctx.B, dataPair);
       ParsedReg newReg = dataPair;
       newReg.baseIdx += 1;
       newReg.width = 1;
       Value *newVal = ctx.regs.readReg32(ctx.B, newReg);
+      Function *casFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_raw_buffer_atomic_cmpswap, {ctx.i32Ty});
       ctx.emitUnderExec([&] {
-        // `Monotonic` ordering to match the sibling MUBUF atomicrmw
-        // branch below (see the comment there on the fixture-pinned
-        // choice).  FLAT / GLOBAL cmpxchg use SequentiallyConsistent
-        // but that's their family convention; MUBUF pins Monotonic
-        // via `buffer_atomic_add_u32` fixture and we stay consistent.
-        auto *cas = ctx.B.CreateAtomicCmpXchg(
-            gep, cmpVal, newVal, MaybeAlign(),
-            AtomicOrdering::Monotonic,
-            AtomicOrdering::Monotonic);
+        // Raw-buffer atomics preserve descriptor-relative addressing and
+        // hardware OOB behavior. The intrinsic takes {new, cmp}, matching
+        // LLVM's AMDGPU intrinsic contract for buffer cmpswap.
+        Value *oldVal = ctx.B.CreateCall(
+            casFn, {newVal, cmpVal, mbuf.srd, mbuf.voffset, mbuf.soffset,
+                    mbuf.auxFlags},
+            "buf_atomic_cmpswap");
         if (di.numDefs > 0)
-          ctx.regs.writeReg32(ctx.B, op.dst(),
-                              ctx.B.CreateExtractValue(cas, 0));
+          ctx.regs.writeReg32(ctx.B, op.dst(), oldVal);
       });
       hr.handled = true;
       return hr;
     }
 
-    Value *data = ctx.regs.readReg32(ctx.B, op.dst(0));
+    Value *data = ctx.regs.readReg32(ctx.B, mbuf.stData);
 
-    AtomicRMWInst::BinOp atomicOp;
+    Intrinsic::ID atomicIntrinsic = Intrinsic::not_intrinsic;
     Type *atomicTy = ctx.i32Ty;
     bool isFP = false;
     switch (sop) {
-    case SemOp::BUFFER_ATOMIC_ADD: atomicOp = AtomicRMWInst::Add; break;
-    case SemOp::BUFFER_ATOMIC_SUB: atomicOp = AtomicRMWInst::Sub; break;
-    case SemOp::BUFFER_ATOMIC_AND: atomicOp = AtomicRMWInst::And; break;
-    case SemOp::BUFFER_ATOMIC_OR:  atomicOp = AtomicRMWInst::Or; break;
-    case SemOp::BUFFER_ATOMIC_XOR: atomicOp = AtomicRMWInst::Xor; break;
+    case SemOp::BUFFER_ATOMIC_ADD:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_add;
+      break;
+    case SemOp::BUFFER_ATOMIC_SUB:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_sub;
+      break;
+    case SemOp::BUFFER_ATOMIC_AND:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_and;
+      break;
+    case SemOp::BUFFER_ATOMIC_OR:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_or;
+      break;
+    case SemOp::BUFFER_ATOMIC_XOR:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_xor;
+      break;
     // `buffer_atomic_swap` — pure exchange.  Added in the same
     // commit as the CMPSWAP branch above to close the handler gap
     // that used to refuse both atomics at the `default:` arm.  The
@@ -341,15 +343,24 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
     // `buffer_atomic_swap` to a plain store and lose the caller's
     // "old value" read, quietly miscompiling any CAS-loop or
     // lock-free shape that relies on it.
-    case SemOp::BUFFER_ATOMIC_SWAP: atomicOp = AtomicRMWInst::Xchg; break;
+    case SemOp::BUFFER_ATOMIC_SWAP:
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_swap;
+      break;
     case SemOp::BUFFER_ATOMIC_ADD_F32:
-      atomicOp = AtomicRMWInst::FAdd; atomicTy = ctx.f32Ty; isFP = true; break;
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_fadd;
+      atomicTy = ctx.f32Ty;
+      isFP = true;
+      break;
     case SemOp::BUFFER_ATOMIC_PK_ADD_BF16:
-      atomicOp = AtomicRMWInst::FAdd;
-      atomicTy = FixedVectorType::get(Type::getBFloatTy(ctx.C), 2); isFP = true; break;
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_fadd;
+      atomicTy = FixedVectorType::get(Type::getBFloatTy(ctx.C), 2);
+      isFP = true;
+      break;
     case SemOp::BUFFER_ATOMIC_PK_ADD_F16:
-      atomicOp = AtomicRMWInst::FAdd;
-      atomicTy = FixedVectorType::get(Type::getHalfTy(ctx.C), 2); isFP = true; break;
+      atomicIntrinsic = Intrinsic::amdgcn_raw_buffer_atomic_fadd;
+      atomicTy = FixedVectorType::get(Type::getHalfTy(ctx.C), 2);
+      isFP = true;
+      break;
     default:
       llvm::errs() << "transpiler: Unsupported buffer atomic: " << mn << "\n";
       hr.failure = RaiseFailure::unsupportedShape(di, "MUBUF",
@@ -357,27 +368,19 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
       return hr;
     }
     if (isFP) data = ctx.B.CreateBitCast(data, atomicTy);
+    Function *atomicFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, atomicIntrinsic, {atomicTy});
     ctx.emitUnderExec([&] {
-      auto *rmw = ctx.B.CreateAtomicRMW(atomicOp, gep, data, MaybeAlign(),
-                                        AtomicOrdering::Monotonic);
-      // RTN-form write-back.  Previously this handler dropped the
-      // `atomicrmw` result unconditionally, which miscompiled every
-      // RTN buffer atomic (the destination VGPR kept the pre-atomic
-      // value, so any downstream read got the wrong "old value").
-      // The bug was latent because no Triton corpus kernel currently
-      // exercises the RTN form of `buffer_atomic_{add,sub,and,or,xor,
-      // add_f32,pk_add_{bf16,f16}}`; it would have surfaced as a
-      // correctness regression the moment one did.  Sibling FLAT
-      // (`handle_flat.cpp` ~line 865) and GLOBAL handlers already
-      // do this write-back; this brings MUBUF to parity.  Ordering
-      // is kept at `Monotonic` to match the existing
-      // `buffer_atomic_add_u32` lit fixture's pinned expectation
-      // (the `scope:SCOPE_DEV` modifier on gfx12 doesn't imply
-      // stronger ordering at the IR level; the backend adds the
-      // needed s_wait_* fences from the ISA scope bits, not from
-      // IR ordering).
+      Value *oldVal = ctx.B.CreateCall(
+          atomicFn,
+          {data, mbuf.srd, mbuf.voffset, mbuf.soffset, mbuf.auxFlags},
+          "buf_atomic");
+      // RTN-form write-back. The raw-buffer intrinsic returns the old
+      // memory value just like the target ISA RTN form; when the source
+      // is non-RTN, leaving the result unused lets the backend select
+      // the no-return encoding.
       if (di.numDefs > 0) {
-        Value *retVal = rmw;
+        Value *retVal = oldVal;
         if (isFP) retVal = ctx.B.CreateBitCast(retVal, ctx.i32Ty);
         ctx.regs.writeReg32(ctx.B, op.dst(), retVal);
       }

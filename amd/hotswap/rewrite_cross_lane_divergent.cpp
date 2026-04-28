@@ -356,6 +356,32 @@ bool isIntrinsicVGPRSafeSink(Intrinsic::ID id) {
   }
 }
 
+bool isRawBufferAtomic(Intrinsic::ID id) {
+  switch (id) {
+  case Intrinsic::amdgcn_raw_buffer_atomic_swap:
+  case Intrinsic::amdgcn_raw_buffer_atomic_add:
+  case Intrinsic::amdgcn_raw_buffer_atomic_sub:
+  case Intrinsic::amdgcn_raw_buffer_atomic_smin:
+  case Intrinsic::amdgcn_raw_buffer_atomic_umin:
+  case Intrinsic::amdgcn_raw_buffer_atomic_fmin:
+  case Intrinsic::amdgcn_raw_buffer_atomic_smax:
+  case Intrinsic::amdgcn_raw_buffer_atomic_umax:
+  case Intrinsic::amdgcn_raw_buffer_atomic_fmax:
+  case Intrinsic::amdgcn_raw_buffer_atomic_and:
+  case Intrinsic::amdgcn_raw_buffer_atomic_or:
+  case Intrinsic::amdgcn_raw_buffer_atomic_xor:
+  case Intrinsic::amdgcn_raw_buffer_atomic_inc:
+  case Intrinsic::amdgcn_raw_buffer_atomic_dec:
+  case Intrinsic::amdgcn_raw_buffer_atomic_cond_sub_u32:
+  case Intrinsic::amdgcn_raw_buffer_atomic_sub_clamp_u32:
+  case Intrinsic::amdgcn_raw_buffer_atomic_cmpswap:
+  case Intrinsic::amdgcn_raw_buffer_atomic_fadd:
+    return true;
+  default:
+    return false;
+  }
+}
+
 // Classify how `V` (our tracked value) is used by the call
 // instruction `CB` at operand index `operandIdx`. Returns the call
 // site's role for the purposes of the forward walk.
@@ -391,6 +417,20 @@ IntrinsicRole classifyIntrinsicUse(CallBase *CB, Value *V,
   }
   if (id == Intrinsic::amdgcn_raw_buffer_store) {
     return IntrinsicRole::VGPRSafeSink;
+  }
+  if (isRawBufferAtomic(id)) {
+    // Raw-buffer atomics consume vdata and vaddr as VGPR operands, then
+    // terminate this value's use chain at memory. The descriptor and soffset
+    // operands are SGPR-constrained; keep the safety net loud if a rewritten
+    // cross-lane value ever reaches those positions.
+    const bool isCmpSwap = id == Intrinsic::amdgcn_raw_buffer_atomic_cmpswap;
+    const unsigned rsrcIdx = isCmpSwap ? 2 : 1;
+    const unsigned offsetIdx = isCmpSwap ? 3 : 2;
+    const unsigned soffsetIdx = isCmpSwap ? 4 : 3;
+    if (operandIdx == rsrcIdx || operandIdx == soffsetIdx)
+      return IntrinsicRole::SGPRForced;
+    if (operandIdx < rsrcIdx || operandIdx == offsetIdx)
+      return IntrinsicRole::VGPRSafeSink;
   }
 
   if (isIntrinsicVGPRSafePropagator(id))

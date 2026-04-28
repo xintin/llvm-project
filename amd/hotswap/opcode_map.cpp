@@ -906,9 +906,8 @@ static const Entry kCanonTable[] = {
     // Class 3 non-commutative atomics (hotswap/docs/wave-size-
     // translation.md §6). The wave-size classifier flags them in
     // the cross-wave case before
-    // dispatch ever reaches handle_mubuf.cpp's switch (which would
-    // otherwise refuse them via the default branch since they don't
-    // fit the AtomicRMW commutative model).
+    // dispatch ever reaches handle_mubuf.cpp's switch. Same-wave and
+    // same-target lifts are still modeled with raw-buffer atomics there.
     MUBUF4(BUFFER_ATOMIC_SWAP, BUFFER_ATOMIC_SWAP),
     MUBUF4(BUFFER_ATOMIC_CMPSWAP, BUFFER_ATOMIC_CMPSWAP),
     MUBUF4(BUFFER_ATOMIC_ADD_F32, BUFFER_ATOMIC_ADD_F32),
@@ -924,7 +923,7 @@ static const Entry kCanonTable[] = {
     // descriptor encoding from the legacy MUBUF one. The decoder in
     // mubuf_addr.cpp explicitly recognises both encodings (keys on
     // ParsedReg::Kind rather than operand position) so the existing
-    // BUFFER_ATOMIC_* SemOps and the AtomicRMW lowering in
+    // BUFFER_ATOMIC_* SemOps and raw-buffer atomic lowering in
     // handle_mubuf.cpp's `sop >= BUFFER_ATOMIC_ADD &&
     // sop <= BUFFER_ATOMIC_PK_ADD_F16` branch work unchanged for
     // VBUFFER atomics. Without these entries the gfx1250 corpus
