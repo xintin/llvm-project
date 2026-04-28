@@ -101,6 +101,9 @@ KernargGlobalLoad tryExtractKernargSaddrGlobalLoad(RaiseContext &ctx,
     return out;
 
   auto fail = [&](const Twine &detail) {
+    llvm::errs() << "transpiler: " << di.mnemonic << " SADDR s["
+                 << saddrPr.baseIdx << ":" << (saddrPr.baseIdx + 1)
+                 << "] vaddr=v" << vaddrPr.baseIdx << ": " << detail << "\n";
     hr.failure = RaiseFailure::unsupportedShape(di, "FLAT", detail);
     out.status = KernargGlobalLoad::Status::Failed;
     return out;

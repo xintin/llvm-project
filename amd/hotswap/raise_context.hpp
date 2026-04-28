@@ -225,6 +225,10 @@ struct RaiseContext {
   // unless the original kernarg pair is proven pristine by
   // `kernargPristineBBs`.
   llvm::DenseSet<uint64_t> sgprProvenanceFallthroughBBs;
+  llvm::DenseMap<uint64_t, llvm::SmallVector<SgprKernargProvenance>>
+      sgprProvenanceAtBBEntry =
+          llvm::DenseMap<uint64_t,
+                         llvm::SmallVector<SgprKernargProvenance>>();
 
   void initializeSgprKernargProvenance() {
     sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
@@ -371,17 +375,43 @@ struct RaiseContext {
     if (sgprProvenanceFallthroughBBs.contains(bbOffset))
       return;
 
+    auto entryIt = sgprProvenanceAtBBEntry.find(bbOffset);
+    if (entryIt != sgprProvenanceAtBBEntry.end()) {
+      sgprKernargProvenance.assign(entryIt->second.begin(),
+                                   entryIt->second.end());
+    } else {
+      sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
+    }
+
     kernargPtrDelta.delta = 0;
-    kernargPtrDelta.baseKind = kernargPristineBBs.contains(bbOffset)
-                                   ? KernargPtrDelta::BaseKind::Kernarg
-                                   : KernargPtrDelta::BaseKind::Unknown;
+    kernargPtrDelta.baseKind = KernargPtrDelta::BaseKind::Unknown;
+    if (userSgprLayout != nullptr) {
+      const int kaLo = userSgprLayout->kernargSegmentPtrSgpr;
+      if (kaLo >= 0 &&
+          static_cast<size_t>(kaLo + 1) < sgprKernargProvenance.size()) {
+        const auto &lo = sgprKernargProvenance[kaLo];
+        const auto &hi = sgprKernargProvenance[kaLo + 1];
+        if (lo.kind == SgprKernargProvenance::Kind::Kernarg &&
+            hi.kind == SgprKernargProvenance::Kind::Kernarg &&
+            lo.subDword == 0 && hi.subDword == 1 && lo.delta == hi.delta) {
+          kernargPtrDelta.baseKind = KernargPtrDelta::BaseKind::Kernarg;
+          kernargPtrDelta.delta = lo.delta;
+        } else if (lo.kind == SgprKernargProvenance::Kind::NonKernarg &&
+                   hi.kind == SgprKernargProvenance::Kind::NonKernarg) {
+          kernargPtrDelta.baseKind = KernargPtrDelta::BaseKind::NonKernarg;
+        }
+      }
+    }
+    if (kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Unknown &&
+        kernargPristineBBs.contains(bbOffset)) {
+      kernargPtrDelta.baseKind = KernargPtrDelta::BaseKind::Kernarg;
+      kernargPtrDelta.delta = 0;
+      setKernargPairProvenance(KernargPtrDelta::BaseKind::Kernarg, 0);
+    }
     kernargPtrDelta.valid =
         kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg;
     kernargPtrDelta.pendingLow = false;
     kernargPtrDelta.pendingLowDelta = 0;
-    sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
-    if (kernargPtrDelta.baseKind == KernargPtrDelta::BaseKind::Kernarg)
-      setKernargPairProvenance(KernargPtrDelta::BaseKind::Kernarg, 0);
   }
 
   // gfx1250 s_set_vgpr_msb state: only the LOW 8 bits of the instruction's

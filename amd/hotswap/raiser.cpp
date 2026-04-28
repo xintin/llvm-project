@@ -197,6 +197,145 @@ static bool threadLoopUnsupportedWorkgroupMemoryOrBarrier(
   return false;
 }
 
+bool provenanceSemOpHasLogicalDst(SemOp Sop) {
+  switch (Sop) {
+  case SemOp::S_GETREG_B32:
+  case SemOp::S_MOV_B32:
+  case SemOp::S_MOV_B64:
+  case SemOp::S_AND_B32:
+  case SemOp::S_OR_B32:
+  case SemOp::S_XOR_B32:
+  case SemOp::S_ANDN2_B32:
+  case SemOp::S_ORN2_B32:
+  case SemOp::S_NAND_B32:
+  case SemOp::S_NOR_B32:
+  case SemOp::S_XNOR_B32:
+  case SemOp::S_ADD_U32:
+  case SemOp::S_ADDC_U32:
+  case SemOp::S_SUB_U32:
+  case SemOp::S_SUBB_U32:
+  case SemOp::S_MUL_I32:
+  case SemOp::S_MUL_HI_U32:
+  case SemOp::S_MUL_HI_I32:
+  case SemOp::S_LSHL_B32:
+  case SemOp::S_LSHR_B32:
+  case SemOp::S_ASHR_I32:
+  case SemOp::S_BFE_U32:
+  case SemOp::S_BFE_I32:
+  case SemOp::S_BFM_B32:
+  case SemOp::S_CSELECT_B32:
+  case SemOp::S_NOT_B64:
+  case SemOp::S_CMOV_B64:
+  case SemOp::S_AND_B64:
+  case SemOp::S_OR_B64:
+  case SemOp::S_XOR_B64:
+  case SemOp::S_ANDN2_B64:
+  case SemOp::S_ORN2_B64:
+  case SemOp::S_NAND_B64:
+  case SemOp::S_NOR_B64:
+  case SemOp::S_XNOR_B64:
+  case SemOp::S_LSHL_B64:
+  case SemOp::S_LSHR_B64:
+  case SemOp::S_ASHR_I64:
+  case SemOp::S_BFM_B64:
+  case SemOp::S_CSELECT_B64:
+  case SemOp::S_BITSET0_B64:
+  case SemOp::S_BITSET1_B64:
+  case SemOp::S_ADD_NC_U64:
+  case SemOp::S_SUB_NC_U64:
+  case SemOp::S_MUL_U64:
+  case SemOp::S_LOAD_B32:
+  case SemOp::S_LOAD_B64:
+  case SemOp::S_LOAD_B96:
+  case SemOp::S_LOAD_B128:
+  case SemOp::S_LOAD_B256:
+  case SemOp::S_LOAD_B512:
+  case SemOp::S_LOAD_U8:
+  case SemOp::S_LOAD_I8:
+  case SemOp::S_LOAD_U16:
+  case SemOp::S_LOAD_I16:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool provenanceSemOpWritesScalarPair(SemOp Sop) {
+  switch (Sop) {
+  case SemOp::S_MOV_B64:
+  case SemOp::S_NOT_B64:
+  case SemOp::S_CMOV_B64:
+  case SemOp::S_AND_B64:
+  case SemOp::S_OR_B64:
+  case SemOp::S_XOR_B64:
+  case SemOp::S_ANDN2_B64:
+  case SemOp::S_ORN2_B64:
+  case SemOp::S_NAND_B64:
+  case SemOp::S_NOR_B64:
+  case SemOp::S_XNOR_B64:
+  case SemOp::S_LSHL_B64:
+  case SemOp::S_LSHR_B64:
+  case SemOp::S_ASHR_I64:
+  case SemOp::S_BFM_B64:
+  case SemOp::S_CSELECT_B64:
+  case SemOp::S_BITSET0_B64:
+  case SemOp::S_BITSET1_B64:
+  case SemOp::S_ADD_NC_U64:
+  case SemOp::S_SUB_NC_U64:
+  case SemOp::S_MUL_U64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool provenanceIsSmemLoadResult(SemOp Sop) {
+  switch (Sop) {
+  case SemOp::S_LOAD_B32:
+  case SemOp::S_LOAD_B64:
+  case SemOp::S_LOAD_B96:
+  case SemOp::S_LOAD_B128:
+  case SemOp::S_LOAD_B256:
+  case SemOp::S_LOAD_B512:
+  case SemOp::S_LOAD_U8:
+  case SemOp::S_LOAD_I8:
+  case SemOp::S_LOAD_U16:
+  case SemOp::S_LOAD_I16:
+    return true;
+  default:
+    return false;
+  }
+}
+
+int provenanceSmemLoadDwords(SemOp Sop) {
+  switch (Sop) {
+  case SemOp::S_LOAD_B64:
+    return 2;
+  case SemOp::S_LOAD_B96:
+    return 3;
+  case SemOp::S_LOAD_B128:
+    return 4;
+  case SemOp::S_LOAD_B256:
+    return 8;
+  case SemOp::S_LOAD_B512:
+    return 16;
+  default:
+    return 1;
+  }
+}
+
+int provenanceSemanticDefDwords(SemOp Sop, ParsedReg PR) {
+  if (PR.kind != ParsedReg::SGPR)
+    return 0;
+  if (provenanceIsSmemLoadResult(Sop))
+    return provenanceSmemLoadDwords(Sop);
+  if (PR.width >= 2)
+    return PR.width;
+  if (provenanceSemOpWritesScalarPair(Sop) || Sop == SemOp::S_LOAD_B64)
+    return 2;
+  return 1;
+}
+
 // Tracks one narrow question while raising a single instruction:
 //
 //   "Did this instruction prove that the source-ABI kernarg SGPR pair no
@@ -237,130 +376,19 @@ private:
   bool HasLogicalDst = false;
 
   static bool semOpHasLogicalDst(SemOp Sop) {
-    switch (Sop) {
-    case SemOp::S_GETREG_B32:
-    case SemOp::S_MOV_B32:
-    case SemOp::S_MOV_B64:
-    case SemOp::S_AND_B32:
-    case SemOp::S_OR_B32:
-    case SemOp::S_XOR_B32:
-    case SemOp::S_ANDN2_B32:
-    case SemOp::S_ORN2_B32:
-    case SemOp::S_NAND_B32:
-    case SemOp::S_NOR_B32:
-    case SemOp::S_XNOR_B32:
-    case SemOp::S_ADD_U32:
-    case SemOp::S_ADDC_U32:
-    case SemOp::S_SUB_U32:
-    case SemOp::S_SUBB_U32:
-    case SemOp::S_MUL_I32:
-    case SemOp::S_MUL_HI_U32:
-    case SemOp::S_MUL_HI_I32:
-    case SemOp::S_LSHL_B32:
-    case SemOp::S_LSHR_B32:
-    case SemOp::S_ASHR_I32:
-    case SemOp::S_BFE_U32:
-    case SemOp::S_BFE_I32:
-    case SemOp::S_BFM_B32:
-    case SemOp::S_CSELECT_B32:
-    case SemOp::S_NOT_B64:
-    case SemOp::S_CMOV_B64:
-    case SemOp::S_AND_B64:
-    case SemOp::S_OR_B64:
-    case SemOp::S_XOR_B64:
-    case SemOp::S_ANDN2_B64:
-    case SemOp::S_ORN2_B64:
-    case SemOp::S_NAND_B64:
-    case SemOp::S_NOR_B64:
-    case SemOp::S_XNOR_B64:
-    case SemOp::S_LSHL_B64:
-    case SemOp::S_LSHR_B64:
-    case SemOp::S_ASHR_I64:
-    case SemOp::S_BFM_B64:
-    case SemOp::S_CSELECT_B64:
-    case SemOp::S_BITSET0_B64:
-    case SemOp::S_BITSET1_B64:
-    case SemOp::S_ADD_NC_U64:
-    case SemOp::S_SUB_NC_U64:
-    case SemOp::S_MUL_U64:
-    case SemOp::S_LOAD_B32:
-    case SemOp::S_LOAD_B64:
-    case SemOp::S_LOAD_B96:
-    case SemOp::S_LOAD_B128:
-    case SemOp::S_LOAD_B256:
-    case SemOp::S_LOAD_B512:
-    case SemOp::S_LOAD_U8:
-    case SemOp::S_LOAD_I8:
-    case SemOp::S_LOAD_U16:
-    case SemOp::S_LOAD_I16:
-      return true;
-    default:
-      return false;
-    }
+    return provenanceSemOpHasLogicalDst(Sop);
   }
 
   static bool semOpWritesScalarPair(SemOp Sop) {
-    switch (Sop) {
-    case SemOp::S_MOV_B64:
-    case SemOp::S_NOT_B64:
-    case SemOp::S_CMOV_B64:
-    case SemOp::S_AND_B64:
-    case SemOp::S_OR_B64:
-    case SemOp::S_XOR_B64:
-    case SemOp::S_ANDN2_B64:
-    case SemOp::S_ORN2_B64:
-    case SemOp::S_NAND_B64:
-    case SemOp::S_NOR_B64:
-    case SemOp::S_XNOR_B64:
-    case SemOp::S_LSHL_B64:
-    case SemOp::S_LSHR_B64:
-    case SemOp::S_ASHR_I64:
-    case SemOp::S_BFM_B64:
-    case SemOp::S_CSELECT_B64:
-    case SemOp::S_BITSET0_B64:
-    case SemOp::S_BITSET1_B64:
-    case SemOp::S_ADD_NC_U64:
-    case SemOp::S_SUB_NC_U64:
-    case SemOp::S_MUL_U64:
-      return true;
-    default:
-      return false;
-    }
+    return provenanceSemOpWritesScalarPair(Sop);
   }
 
   static bool isSmemLoadResult(SemOp Sop) {
-    switch (Sop) {
-    case SemOp::S_LOAD_B32:
-    case SemOp::S_LOAD_B64:
-    case SemOp::S_LOAD_B96:
-    case SemOp::S_LOAD_B128:
-    case SemOp::S_LOAD_B256:
-    case SemOp::S_LOAD_B512:
-    case SemOp::S_LOAD_U8:
-    case SemOp::S_LOAD_I8:
-    case SemOp::S_LOAD_U16:
-    case SemOp::S_LOAD_I16:
-      return true;
-    default:
-      return false;
-    }
+    return provenanceIsSmemLoadResult(Sop);
   }
 
   static int smemLoadDwords(SemOp Sop) {
-    switch (Sop) {
-    case SemOp::S_LOAD_B64:
-      return 2;
-    case SemOp::S_LOAD_B96:
-      return 3;
-    case SemOp::S_LOAD_B128:
-      return 4;
-    case SemOp::S_LOAD_B256:
-      return 8;
-    case SemOp::S_LOAD_B512:
-      return 16;
-    default:
-      return 1;
-    }
+    return provenanceSmemLoadDwords(Sop);
   }
 
   bool computeLogicalDst(ParsedReg &Out) {
@@ -373,12 +401,12 @@ private:
   int semanticDefDwords(ParsedReg PR) const {
     if (PR.kind != ParsedReg::SGPR)
       return 0;
+    if (isSmemLoadResult(DI.semOp))
+      return smemLoadDwords(DI.semOp);
     if (PR.width >= 2)
       return PR.width;
     if (semOpWritesScalarPair(DI.semOp) || DI.semOp == SemOp::S_LOAD_B64)
       return 2;
-    if (isSmemLoadResult(DI.semOp))
-      return smemLoadDwords(DI.semOp);
     return 1;
   }
 
@@ -1847,6 +1875,291 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
             "branch-target collection.");
       }
     }
+
+    // Step 4: per-BB SGPR provenance for values that are definitely not the
+    // sentinel-modeled entry kernarg pointer on every incoming edge.
+    //
+    // `kernargPristineBBs` answers only "is the original kernarg pair still
+    // pristine at this BB?".  RoPE-style Triton kernels also keep ordinary
+    // pointer/scalar args in SGPRs loaded from the kernarg prologue, carry them
+    // across a control-flow merge, and later overwrite s[ka:ka+1] from those
+    // ordinary SGPRs before a `global_load ... s[ka:ka+1]`.  A local BB reset
+    // loses those non-kernarg facts and turns the overwrite into Unknown.
+    //
+    // This is a conservative forward must-analysis over dword provenance:
+    // a fact survives a BB entry only when all predecessors agree on the same
+    // provenance.  Unknown is the default and remains loud at consumers.
+    using DwordProv = RaiseContext::SgprKernargProvenance;
+    using DwordKind = RaiseContext::SgprKernargProvenance::Kind;
+
+    auto unknownProvenanceVector = [&]() {
+      llvm::SmallVector<DwordProv> vec;
+      vec.resize(regs.sgpr.size());
+      return vec;
+    };
+
+    auto sameProvenance = [](const DwordProv &a, const DwordProv &b) {
+      if (a.kind == DwordKind::NonKernarg && b.kind == DwordKind::NonKernarg)
+        return true;
+      if (a.kind == DwordKind::Unknown && b.kind == DwordKind::Unknown)
+        return true;
+      return a.kind == b.kind && a.delta == b.delta &&
+             a.subDword == b.subDword;
+    };
+
+    auto sameVector = [&](ArrayRef<DwordProv> a, ArrayRef<DwordProv> b) {
+      if (a.size() != b.size())
+        return false;
+      for (size_t i = 0; i < a.size(); ++i) {
+        if (!sameProvenance(a[i], b[i]))
+          return false;
+      }
+      return true;
+    };
+
+    auto joinProvenance = [&](const DwordProv &a, const DwordProv &b) {
+      if (sameProvenance(a, b))
+        return a;
+      return DwordProv{};
+    };
+
+    auto joinVectors = [&](ArrayRef<DwordProv> a, ArrayRef<DwordProv> b) {
+      llvm::SmallVector<DwordProv> out;
+      out.resize(regs.sgpr.size());
+      for (size_t i = 0; i < out.size(); ++i)
+        out[i] = joinProvenance(a[i], b[i]);
+      return out;
+    };
+
+    llvm::DenseMap<uint64_t, llvm::SmallVector<const DecodedInst *>>
+        instsByBB;
+    for (uint64_t bs : blockStarts)
+      instsByBB.try_emplace(bs, llvm::SmallVector<const DecodedInst *>{});
+    for (const DecodedInst &di : insts) {
+      auto it = bbOfInst.find(di.offset);
+      if (it != bbOfInst.end())
+        instsByBB[it->second].push_back(&di);
+    }
+
+    auto entryVec = unknownProvenanceVector();
+    for (size_t i = 0; i < userSgprLayout.entries.size() &&
+                       i < entryVec.size();
+         ++i) {
+      const auto &entry = userSgprLayout.entries[i];
+      if (entry.source == UserSgprLayout::Source::KernargSegmentPtr) {
+        entryVec[i].kind = DwordKind::Kernarg;
+        entryVec[i].delta = 0;
+        entryVec[i].subDword = entry.subDword;
+      } else if (entry.source != UserSgprLayout::Source::Unset) {
+        entryVec[i].kind = DwordKind::NonKernarg;
+      }
+    }
+
+    auto dwordAt = [](ArrayRef<DwordProv> state, int idx) {
+      if (idx < 0 || static_cast<size_t>(idx) >= state.size())
+        return DwordProv{};
+      return state[idx];
+    };
+
+    auto setDword = [](llvm::SmallVectorImpl<DwordProv> &state, int idx,
+                       DwordProv p) {
+      if (idx < 0 || static_cast<size_t>(idx) >= state.size())
+        return;
+      state[idx] = p;
+    };
+
+    auto setDwordKind = [&](llvm::SmallVectorImpl<DwordProv> &state, int idx,
+                            DwordKind kind) {
+      DwordProv p;
+      p.kind = kind;
+      setDword(state, idx, p);
+    };
+
+    auto regDefinitelyNonKernarg = [&](ArrayRef<DwordProv> state,
+                                       ParsedReg pr, int width) {
+      if (pr.kind != ParsedReg::SGPR)
+        return true;
+      for (int i = 0; i < width; ++i) {
+        if (dwordAt(state, pr.baseIdx + i).kind != DwordKind::NonKernarg)
+          return false;
+      }
+      return true;
+    };
+
+    auto allSourcesDefinitelyNonKernarg =
+        [&](ArrayRef<DwordProv> state, const DecodedInst &di) {
+          for (unsigned s = 0; s < di.numSrcs; ++s) {
+            unsigned idx = di.srcMap[s];
+            if (!di.isReg(idx))
+              continue;
+            ParsedReg pr = ctx.parseReg(di.getReg(idx), idx);
+            int width = std::max(pr.width, 1);
+            if (pr.kind == ParsedReg::SGPR &&
+                provenanceSemOpWritesScalarPair(di.semOp))
+              width = std::max(width, 2);
+            if (pr.kind == ParsedReg::SGPR &&
+                !regDefinitelyNonKernarg(state, pr, width))
+              return false;
+          }
+          return true;
+        };
+
+    auto pairProvenanceFromReg = [&](ArrayRef<DwordProv> state, ParsedReg pr) {
+      DwordProv lo = dwordAt(state, pr.baseIdx);
+      DwordProv hi = dwordAt(state, pr.baseIdx + 1);
+      std::pair<RaiseContext::KernargPtrDelta::BaseKind, int64_t> out = {
+          RaiseContext::KernargPtrDelta::BaseKind::Unknown, 0};
+      if (lo.kind == DwordKind::NonKernarg &&
+          hi.kind == DwordKind::NonKernarg) {
+        out.first = RaiseContext::KernargPtrDelta::BaseKind::NonKernarg;
+      } else if (lo.kind == DwordKind::Kernarg &&
+                 hi.kind == DwordKind::Kernarg && lo.subDword == 0 &&
+                 hi.subDword == 1 && lo.delta == hi.delta) {
+        out.first = RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
+        out.second = lo.delta;
+      }
+      return out;
+    };
+
+    auto setPairFromBaseKind =
+        [&](llvm::SmallVectorImpl<DwordProv> &state, int dst,
+            RaiseContext::KernargPtrDelta::BaseKind kind, int64_t delta = 0) {
+          switch (kind) {
+          case RaiseContext::KernargPtrDelta::BaseKind::Kernarg: {
+            DwordProv lo, hi;
+            lo.kind = DwordKind::Kernarg;
+            lo.delta = delta;
+            lo.subDword = 0;
+            hi.kind = DwordKind::Kernarg;
+            hi.delta = delta;
+            hi.subDword = 1;
+            setDword(state, dst, lo);
+            setDword(state, dst + 1, hi);
+            break;
+          }
+          case RaiseContext::KernargPtrDelta::BaseKind::NonKernarg:
+            setDwordKind(state, dst, DwordKind::NonKernarg);
+            setDwordKind(state, dst + 1, DwordKind::NonKernarg);
+            break;
+          case RaiseContext::KernargPtrDelta::BaseKind::Unknown:
+            setDwordKind(state, dst, DwordKind::Unknown);
+            setDwordKind(state, dst + 1, DwordKind::Unknown);
+            break;
+          }
+        };
+
+    auto updateDef = [&](llvm::SmallVectorImpl<DwordProv> &state,
+                         const DecodedInst &di, ParsedReg def) {
+      const int defDwords = provenanceSemanticDefDwords(di.semOp, def);
+      if (defDwords == 0)
+        return;
+
+      if (provenanceIsSmemLoadResult(di.semOp)) {
+        for (int i = 0; i < defDwords; ++i)
+          setDwordKind(state, def.baseIdx + i, DwordKind::NonKernarg);
+        return;
+      }
+
+      if (di.semOp == SemOp::S_MOV_B64 && defDwords >= 2 &&
+          di.numSrcs >= 1) {
+        unsigned src0 = di.srcMap[0];
+        if (di.isReg(src0)) {
+          ParsedReg src = ctx.parseReg(di.getReg(src0), src0);
+          auto [kind, delta] = pairProvenanceFromReg(state, src);
+          setPairFromBaseKind(state, def.baseIdx, kind, delta);
+          return;
+        }
+      }
+
+      if (di.semOp == SemOp::S_MOV_B32 && defDwords == 1 &&
+          di.numSrcs >= 1) {
+        unsigned src0 = di.srcMap[0];
+        if (di.isReg(src0)) {
+          ParsedReg src = ctx.parseReg(di.getReg(src0), src0);
+          if (src.kind == ParsedReg::SGPR) {
+            setDword(state, def.baseIdx, dwordAt(state, src.baseIdx));
+            return;
+          }
+        } else {
+          setDwordKind(state, def.baseIdx, DwordKind::NonKernarg);
+          return;
+        }
+      }
+
+      DwordKind kind = allSourcesDefinitelyNonKernarg(state, di)
+                           ? DwordKind::NonKernarg
+                           : DwordKind::Unknown;
+      for (int i = 0; i < defDwords; ++i)
+        setDwordKind(state, def.baseIdx + i, kind);
+    };
+
+    auto transferBB = [&](ArrayRef<DwordProv> in,
+                          ArrayRef<const DecodedInst *> bbInsts) {
+      llvm::SmallVector<DwordProv> state(in.begin(), in.end());
+      for (const DecodedInst *di : bbInsts) {
+        for (unsigned d = 0; d < di->numDefs; ++d) {
+          if (di->isReg(d))
+            updateDef(state, *di, ctx.parseReg(di->getReg(d), d));
+        }
+        if (provenanceSemOpHasLogicalDst(di->semOp) && di->numDefs > 0 &&
+            di->isReg(0))
+          updateDef(state, *di, ctx.parseReg(di->getReg(0), 0));
+      }
+      return state;
+    };
+
+    llvm::DenseMap<uint64_t, llvm::SmallVector<DwordProv>> provIn;
+    llvm::DenseMap<uint64_t, llvm::SmallVector<DwordProv>> provOut;
+    for (uint64_t bs : blockStarts) {
+      provIn[bs] = unknownProvenanceVector();
+      provOut[bs] = unknownProvenanceVector();
+    }
+    provIn[kernelOffset] = entryVec;
+
+    bool provChanged = true;
+    unsigned provIters = 0;
+    const unsigned provMaxIters =
+        static_cast<unsigned>(blockStarts.size()) + 2;
+    while (provChanged && provIters < provMaxIters) {
+      provChanged = false;
+      ++provIters;
+      for (uint64_t bs : blockStarts) {
+        llvm::SmallVector<DwordProv> newIn;
+        if (bs == kernelOffset) {
+          newIn = entryVec;
+        } else {
+          const auto &preds = predecessors[bs];
+          if (preds.empty()) {
+            newIn = unknownProvenanceVector();
+          } else {
+            newIn = provOut[preds.front()];
+            for (uint64_t pred : ArrayRef<uint64_t>(preds).drop_front())
+              newIn = joinVectors(newIn, provOut[pred]);
+          }
+        }
+
+        if (!sameVector(provIn[bs], newIn)) {
+          provIn[bs] = newIn;
+          provChanged = true;
+        }
+
+        auto newOut = transferBB(provIn[bs], instsByBB[bs]);
+        if (!sameVector(provOut[bs], newOut)) {
+          provOut[bs] = newOut;
+          provChanged = true;
+        }
+      }
+    }
+    if (provIters >= provMaxIters && provChanged) {
+      report_fatal_error(
+          "transpiler: SGPR kernarg provenance dataflow failed to converge "
+          "within #BBs + 2 iterations; the CFG edge construction in "
+          "raiser.cpp Phase 4.5 is out of sync with the decoder's "
+          "branch-target collection.");
+    }
+
+    for (uint64_t bs : blockStarts)
+      ctx.sgprProvenanceAtBBEntry[bs] = provIn[bs];
   }
 
   // Dominance-safe SGPR wave-mask shadow storage.
