@@ -311,12 +311,24 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
         copy_one<IsLoad, DS>(rsrc, x * DS, lds_byte_off + x * DS);
 
       // Per-row LDS advance + padding accounting (uniform across lanes).
-      lds_byte_off += T0 * DS;
+      const uint32_t row_bytes = T0 * DS;
+      lds_byte_off += row_bytes;
       if (pad_interval_bytes) {
-        bytes_since_pad += T0 * DS;
-        while (bytes_since_pad >= pad_interval_bytes) {
-          bytes_since_pad -= pad_interval_bytes;
-          lds_byte_off += pad_amount_bytes;
+        // Some TensorDescriptor encodings make `tile_dim0` the logical row
+        // width and carry the LDS padding only in the interval/amount fields
+        // (GPT-OSS input tile: 64 bytes + 16 bytes padding). Others make
+        // `tile_dim0` the already-padded LDS row span and still carry the
+        // interval fields (GPT-OSS output tile: 136 bf16 = 256 + 16 bytes).
+        // Do not apply the same padding twice when the row width already
+        // equals one padded interval.
+        const bool row_bytes_include_one_pad_interval =
+            row_bytes == pad_interval_bytes + pad_amount_bytes;
+        if (!row_bytes_include_one_pad_interval) {
+          bytes_since_pad += row_bytes;
+          while (bytes_since_pad >= pad_interval_bytes) {
+            bytes_since_pad -= pad_interval_bytes;
+            lds_byte_off += pad_amount_bytes;
+          }
         }
       }
     }

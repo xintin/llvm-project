@@ -715,6 +715,115 @@ std::vector<uint8_t> buildSourceWaveLocalCanaryHsaco() {
   return compileModuleToHsaco(M);
 }
 
+std::vector<uint8_t> buildPaddedStoreRowAdvanceCanaryHsaco() {
+  using namespace llvm;
+
+  LLVMContext C;
+  Module M("tdm_padded_store_row_advance_canary", C);
+  if (!configureGfx942Module(M))
+    return {};
+
+  Type *voidTy = Type::getVoidTy(C);
+  Type *i32Ty = Type::getInt32Ty(C);
+  Type *i64Ty = Type::getInt64Ty(C);
+  PointerType *globalPtrTy = PointerType::get(C, 1);
+  ArrayType *ldsTy = ArrayType::get(i32Ty, 10);
+  auto *lds = new GlobalVariable(
+      M, ldsTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
+      PoisonValue::get(ldsTy), "tdm_padded_store_lds", nullptr,
+      GlobalValue::NotThreadLocal, /*AddressSpace=*/3);
+  lds->setAlignment(Align(4));
+
+  FunctionType *kernelTy =
+      FunctionType::get(voidTy, {globalPtrTy}, /*isVarArg=*/false);
+  Function *F = Function::Create(kernelTy, GlobalValue::ExternalLinkage,
+                                 "tdm_padded_store_row_advance_canary", M);
+  F->setCallingConv(CallingConv::AMDGPU_KERNEL);
+  F->addFnAttr("amdgpu-flat-work-group-size", "64,64");
+  Value *out = F->getArg(0);
+  out->setName("out");
+
+  BasicBlock *entry = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(entry);
+  Function *mbcntLo =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_mbcnt_lo);
+  Function *mbcntHi =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_mbcnt_hi);
+  Function *barrier =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_s_barrier);
+
+  Value *laneLo =
+      B.CreateCall(mbcntLo, {B.getInt32(-1), B.getInt32(0)}, "lane_lo");
+  Value *lane = B.CreateCall(mbcntHi, {B.getInt32(-1), laneLo}, "lane");
+  Value *laneLt8 = B.CreateICmpULT(lane, B.getInt32(8), "lane_lt_8");
+  Value *laneLt4 = B.CreateICmpULT(lane, B.getInt32(4), "lane_lt_4");
+  Value *row1Lane = B.CreateSub(lane, B.getInt32(4), "row1_lane");
+  Value *ldsIdx = B.CreateSelect(laneLt4, lane, B.CreateAdd(row1Lane, B.getInt32(5)),
+                                 "lds_idx");
+  Value *row0Pattern = B.CreateAdd(B.getInt32(0x71000000u), lane, "row0_pattern");
+  Value *row1Pattern = B.CreateAdd(B.getInt32(0x72000000u), row1Lane, "row1_pattern");
+  Value *pattern = B.CreateSelect(laneLt4, row0Pattern, row1Pattern, "pattern");
+
+  BasicBlock *fillBB = BasicBlock::Create(C, "fill_lds", F);
+  BasicBlock *afterFillBB = BasicBlock::Create(C, "after_fill", F);
+  B.CreateCondBr(laneLt8, fillBB, afterFillBB);
+
+  B.SetInsertPoint(fillBB);
+  Value *ldsPtr = B.CreateInBoundsGEP(ldsTy, lds, {B.getInt32(0), ldsIdx},
+                                      "lds_slot");
+  B.CreateStore(pattern, ldsPtr);
+  B.CreateBr(afterFillBB);
+
+  B.SetInsertPoint(afterFillBB);
+  B.CreateCall(barrier, {});
+
+  Value *outI64 = B.CreatePtrToInt(out, i64Ty, "out_i64");
+  Value *outLo = B.CreateTrunc(outI64, i32Ty, "out_lo");
+  Value *outHi = B.CreateTrunc(B.CreateLShr(outI64, 32), i32Ty, "out_hi");
+  auto *v4i = FixedVectorType::get(i32Ty, 4);
+  auto *v8i = FixedVectorType::get(i32Ty, 8);
+  Value *g0 = PoisonValue::get(v4i);
+  g0 = B.CreateInsertElement(g0, B.getInt32(1), B.getInt32(0), "g0");
+  g0 = B.CreateInsertElement(g0, B.getInt32(0), B.getInt32(1), "g0");
+  g0 = B.CreateInsertElement(g0, outLo, B.getInt32(2), "g0");
+  g0 = B.CreateInsertElement(g0, outHi, B.getInt32(3), "g0");
+
+  Value *g1 = PoisonValue::get(v8i);
+  // DS=4 bytes, padding enabled, interval=16 bytes, amount=4 bytes.
+  g1 = B.CreateInsertElement(g1, B.getInt32((2u << 16) | (1u << 20) | (1u << 22)),
+                             B.getInt32(0), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(4u << 16), B.getInt32(1), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(2u << 16), B.getInt32(2), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(5u << 16), B.getInt32(3), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(2), B.getInt32(4), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(4), B.getInt32(5), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(8u << 16), B.getInt32(6), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(0), B.getInt32(7), "g1");
+
+  Value *zero4 = ConstantAggregateZero::get(v4i);
+  FunctionCallee storeHelper = transpiler::declareTDMStore(M);
+  BasicBlock *doStoreBB = BasicBlock::Create(C, "do_store", F);
+  BasicBlock *retBB = BasicBlock::Create(C, "ret", F);
+  B.CreateCondBr(B.CreateICmpULT(lane, B.getInt32(32)), doStoreBB, retBB);
+
+  B.SetInsertPoint(doStoreBB);
+  B.CreateCall(storeHelper, {g0, g1, zero4, zero4, B.getInt32(32)});
+  B.CreateBr(retBB);
+
+  B.SetInsertPoint(retBB);
+  B.CreateRetVoid();
+
+  if (!transpiler::linkTDMRuntime(M, "gfx942")) {
+    ADD_FAILURE() << "linkTDMRuntime failed for padded store canary";
+    return {};
+  }
+  if (verifyModule(M, &errs())) {
+    ADD_FAILURE() << "padded store canary module failed LLVM verification";
+    return {};
+  }
+  return compileModuleToHsaco(M);
+}
+
 // Run one parameter point through the full raise -> dispatch ->
 // compare cycle. Returns the number of mismatches (0 == pass),
 // or -1 if any prerequisite step failed before the compare could run.
@@ -1232,6 +1341,65 @@ TEST_F(TdmGpu, SourceWaveLocalDescriptors) {
   (void)hipFree(d_desc0);
   (void)hipFree(d_desc1);
   EXPECT_EQ(mism, 0) << "source-wave-local TDM canary mismatches";
+}
+
+TEST_F(TdmGpu, PaddedStoreRowAdvance) {
+  if (!transpiler::tdmRuntimeAvailable())
+    GTEST_SKIP() << "TDM runtime bitcode not embedded "
+                    "(transpiler built without hipcc).";
+
+  std::vector<uint8_t> hsaco = buildPaddedStoreRowAdvanceCanaryHsaco();
+  ASSERT_FALSE(hsaco.empty()) << "failed to build padded-store TDM canary";
+
+  uint32_t *d_out = nullptr;
+  HIP_ASSERT(hipMalloc(&d_out, 8 * sizeof(uint32_t)));
+  HIP_ASSERT(hipMemset(d_out, 0xcd, 8 * sizeof(uint32_t)));
+
+  hipModule_t mod;
+  HIP_ASSERT(hipModuleLoadData(&mod, hsaco.data()));
+  hipFunction_t fn;
+  HIP_ASSERT(hipModuleGetFunction(&fn, mod,
+                                  "tdm_padded_store_row_advance_canary"));
+
+  struct Args {
+    uint32_t *out;
+  } args{d_out};
+  size_t argSize = sizeof(args);
+  void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                    HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                    HIP_LAUNCH_PARAM_END};
+  HIP_ASSERT(hipModuleLaunchKernel(fn, 1, 1, 1, 64, 1, 1, 0, nullptr,
+                                   nullptr, config));
+  HIP_ASSERT(hipDeviceSynchronize());
+
+  std::vector<uint32_t> host(8);
+  HIP_ASSERT(
+      hipMemcpy(host.data(), d_out, 8 * sizeof(uint32_t), hipMemcpyDeviceToHost));
+  int mism = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t expected = 0x71000000u + i;
+    if (host[i] != expected) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [padded-store] row0 mismatch at %u: got 0x%08x expected 0x%08x\n",
+                i, host[i], expected);
+      ++mism;
+    }
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint32_t expected = 0x72000000u + i;
+    if (host[4 + i] != expected) {
+      if (mism < 4)
+        fprintf(stderr,
+                "  [padded-store] row1 mismatch at %u: got 0x%08x expected 0x%08x\n",
+                i, host[4 + i], expected);
+      ++mism;
+    }
+  }
+
+  (void)hipModuleUnload(mod);
+  (void)hipFree(d_out);
+  EXPECT_EQ(mism, 0) << "padded-store row advance mismatches";
 }
 
 TEST_F(TdmGpu, SourceWaveDivergentFixture) {
