@@ -255,6 +255,27 @@ bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
     return queue(ctx.B.CreateBitCast(
         ctx.B.CreateCall(fma, {s0, s1, s2}, "vopd_fma"), ctx.i32Ty));
   }
+  case SemOp::V_FMAMK_F32:
+  case SemOp::V_FMAAK_F32: {
+    if (!requireVopdSources(half, 3, di, hr)) return false;
+    Value *s0 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[0], 0),
+                                    ctx.f32Ty);
+    Value *s1 = ctx.B.CreateBitCast(readVopdSource(ctx, half.src[1], 1),
+                                    ctx.f32Ty);
+    // MADK VOPD encodings have only src0/vsrc1 register fields; the mandatory
+    // literal occupies a logical source slot but not a VGPR-MSB slot.
+    unsigned s2Slot = half.semOp == SemOp::V_FMAMK_F32 ? 1 : 2;
+    Value *s2 =
+        ctx.B.CreateBitCast(readVopdSource(ctx, half.src[2], s2Slot),
+                            ctx.f32Ty);
+    Function *fma =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fma,
+                                          {ctx.f32Ty});
+    const char *name =
+        half.semOp == SemOp::V_FMAMK_F32 ? "vopd_fmamk" : "vopd_fmaak";
+    return queue(ctx.B.CreateBitCast(
+        ctx.B.CreateCall(fma, {s0, s1, s2}, name), ctx.i32Ty));
+  }
   case SemOp::V_ADD_NC_U32:
   case SemOp::V_SUB_NC_U32:
   case SemOp::V_SUBREV_NC_U32:

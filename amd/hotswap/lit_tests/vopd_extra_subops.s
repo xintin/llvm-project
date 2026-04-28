@@ -3,7 +3,7 @@
 ; RUN:     --emit-ir=vopd_extra_subops_kernel 2>/dev/null \
 ; RUN:   | %FileCheck %s
 ;
-; Lift fixture for five previously-unhandled VOPD sub-shapes (see
+; Lift fixture for six previously-unhandled VOPD sub-shapes (see
 ; transpiler/handle_vopd.cpp and the matching kernel comment block):
 ;
 ;   1. v_dual_mov_b32 with f32 inline-constant literal source
@@ -27,6 +27,10 @@
 ;      wave-projection implementation adds).  Surface form: a call
 ;      into `llvm.amdgcn.ballot.i32` somewhere between the VCC
 ;      def and the VGPR store.
+;   6. v_dual_fmamk_f32 paired with v_dual_mov_b32 — the E2E
+;      get_num_kv_splits_triton shape uses the MADK literal form as a
+;      VOPD component.  Surface form: a named `llvm.fma.f32` call from
+;      the VOPD handler.
 ;
 ; Each shape lives in its own VOPD pair in the kernel so a regression
 ; in any one branch surfaces exactly one CHECK failure rather than
@@ -118,6 +122,11 @@
 ; Pair E: integer negative literal.  This must be `-8` / 0xfffffff8,
 ; not the float-sign-bit pattern 0x80000008.
 ; CHECK: %vopd_add{{[0-9]*}} = add i32 -8, %{{[^,]+}}
+;
+; Pair F: VOPD MADK f32 FMA.  The paired issue packet that exposed the
+; E2E blocker is `v_dual_mov_b32 ... :: v_dual_fmamk_f32 ...`.
+; CHECK: %vopd_fmamk = call float @llvm.fma.f32
+; CHECK: %vopd_fmaak = call float @llvm.fma.f32
 
 ; Negative pin: the ashrrev must be arithmetic; a regression to
 ; logical shift would have surfaced as `lshr` here (with the same
@@ -169,11 +178,14 @@ vopd_extra_subops_kernel:               ; @vopd_extra_subops_kernel
 	v_cmp_eq_u32_e64 vcc_lo, v8, 0
 	v_dual_mov_b32 v8, vcc_lo :: v_dual_mov_b32 v9, v1
 	v_dual_add_nc_u32 v10, -8, v0 :: v_dual_mov_b32 v11, v0
+	v_dual_mov_b32 v10, v8 :: v_dual_fmamk_f32 v11, v8, 0xcf800000, v11
+	v_dual_mov_b32 v10, v8 :: v_dual_fmaak_f32 v11, v8, v11, 0x3f800000
 	;;#ASMEND
 	s_clause 0x1
 	global_store_b128 v0, v[2:5], s[2:3]
 	global_store_b128 v0, v[6:9], s[2:3] offset:16
 	global_store_dword v0, v10, s[2:3] offset:32
+	global_store_dword v0, v11, s[2:3] offset:36
 	s_endpgm
 	.section	.rodata,"a",@progbits
 	.p2align	6, 0x0
