@@ -2049,6 +2049,21 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // gfx1250 V_SUB_NC_U64: per-lane i64 `src0 - src1`. The real instruction
+  // exposes no carry/borrow result for Salmon to model. LLVM's
+  // VOP2Instructions.td names the opcode `v_sub_nc_u64` and SIInstructions.td
+  // lowers the pseudo through `DivergentBinFrag<sub>` with operands preserved
+  // in this order.
+  if (sop == SemOp::V_SUB_NC_U64) {
+    Value *s0 = op.src64(0), *s1 = op.src64(1);
+    if (s0->getType() != ctx.i64Ty)
+      s0 = ctx.B.CreateBitOrPointerCast(s0, ctx.i64Ty);
+    if (s1->getType() != ctx.i64Ty)
+      s1 = ctx.B.CreateBitOrPointerCast(s1, ctx.i64Ty);
+    ctx.writeReg64(op.dst(), ctx.B.CreateSub(s0, s1, "vsub64"));
+    hr.handled = true;
+    return hr;
+  }
   if (sop == SemOp::V_MAX_I64 || sop == SemOp::V_MAX_U64 ||
       sop == SemOp::V_MIN_I64 || sop == SemOp::V_MIN_U64) {
     Value *s0 = op.src64(0), *s1 = op.src64(1);

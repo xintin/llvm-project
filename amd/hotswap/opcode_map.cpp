@@ -608,6 +608,12 @@ static const Entry kCanonTable[] = {
     E(V_LSHL_ADD_U64_e64, V_LSHL_ADD_U64),
     // LLVM's 64-bit no-carry add pseudo is simply `V_ADD_U64_e64`.
     E(V_ADD_U64_e64, V_ADD_NC_U64),
+    // gfx1250 VOP2 64-bit no-carry subtract. LLVM's real opcode is
+    // `V_SUB_U64_e64` while the printed ISA mnemonic is `v_sub_nc_u64`;
+    // route by opcode, not by mnemonic text. VOP2Instructions.td marks it
+    // non-commutable and SIInstructions.td gives the i64 `src0 - src1`
+    // pattern, so the handler must preserve operand order exactly.
+    E(V_SUB_U64_e64, V_SUB_NC_U64),
     // gfx1250 VOP3 64-bit integer min/max.  VOP3Instructions.td attaches
     // smax/umax/smin/umin patterns respectively; the handler mirrors the
     // manual's compare-and-select semantics on the full i64 lane value.
