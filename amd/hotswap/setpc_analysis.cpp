@@ -130,6 +130,8 @@
 #include "SIDefines.h"
 #include "mc_state.hpp"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/Support/raw_ostream.h"
@@ -1165,7 +1167,7 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
     retPairsConsumedByB.insert(pb.retPairLowReg);
 
   // Collect DispatchSet consumers (pair → set of allowed values).
-  std::map<unsigned, std::set<uint64_t>> dispatchSetTargets;
+  llvm::DenseMap<unsigned, llvm::DenseSet<uint64_t>> dispatchSetTargets;
   for (const auto &kv : result.setpcSites) {
     if (kv.second.kind == SetPcSiteInfo::Kind::DispatchSet) {
       auto &set = dispatchSetTargets[kv.second.indirectRetPairLowReg];
@@ -1174,20 +1176,22 @@ SetPcAnalysis analyseSetPC(ArrayRef<DecodedInst> insts,
     }
   }
 
-  // Prune chain terminators.
-  for (auto it = result.chainTerminators.begin();
-       it != result.chainTerminators.end();) {
-    bool keepForB = retPairsConsumedByB.count(it->second.retPairLowReg);
+  // Prune chain terminators. DenseMap::erase does not return an
+  // iterator, so collect the offsets to drop in a first pass and
+  // erase them in a second pass.
+  llvm::SmallVector<uint64_t> toErase;
+  for (const auto &kv : result.chainTerminators) {
+    bool keepForB = retPairsConsumedByB.count(kv.second.retPairLowReg);
     bool keepForDispatch = false;
-    auto dt = dispatchSetTargets.find(it->second.retPairLowReg);
+    auto dt = dispatchSetTargets.find(kv.second.retPairLowReg);
     if (dt != dispatchSetTargets.end() &&
-        dt->second.count(it->second.resolvedReturnAddr))
+        dt->second.count(kv.second.resolvedReturnAddr))
       keepForDispatch = true;
     if (!keepForB && !keepForDispatch)
-      it = result.chainTerminators.erase(it);
-    else
-      ++it;
+      toErase.push_back(kv.first);
   }
+  for (uint64_t off : toErase)
+    result.chainTerminators.erase(off);
 
   // Build per-pair return-target lists for IndirectB from the
   // surviving terminators.

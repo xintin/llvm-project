@@ -21,7 +21,6 @@
 #include "llvm/MC/MCRegister.h"
 
 #include <algorithm>
-#include <map>
 
 namespace transpiler {
 
@@ -55,7 +54,7 @@ struct RaiseContext {
   llvm::Type *f16Ty;
   llvm::Type *ptrGlobalTy;
 
-  std::map<uint64_t, llvm::BasicBlock *> &offsetToBB;
+  llvm::DenseMap<uint64_t, llvm::BasicBlock *> &offsetToBB;
 
   // Source KD private/scratch allocation. `handle_flat.cpp` sets
   // `usesScratchPrivateSegment` when it lowers a `scratch_*` instruction; the

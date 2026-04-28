@@ -50,7 +50,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <map>
 #include <utility>
 
 #define DEBUG_TYPE "wave-projection"
@@ -1338,13 +1337,24 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     return result;
   }
   // ==== Phase 3: Create basic blocks ====
-  std::map<uint64_t, BasicBlock *> offsetToBB;
-  for (uint64_t addr : blockStarts)
-    offsetToBB[addr] = BasicBlock::Create(C, "bb_0x" + utohexstr(addr - kernelOffset), F);
-  BasicBlock *entryBB =
-      useThreadLoop ? BasicBlock::Create(C, "entry", F,
-                                         offsetToBB.begin()->second)
-                    : offsetToBB[kernelOffset];
+  // `blockStarts` is a std::set (see decode.hpp) so it iterates in
+  // ascending source-address order, giving deterministic BB labels.
+  // `offsetToBB` is a DenseMap and intentionally unordered; for the
+  // thread-loop entry BB we need the lowest-address BB as InsertBefore
+  // (so the entry sorts above the kernel body in IR), which we capture
+  // explicitly during the create loop.
+  llvm::DenseMap<uint64_t, BasicBlock *> offsetToBB;
+  BasicBlock *firstBodyBB = nullptr;
+  for (uint64_t addr : blockStarts) {
+    BasicBlock *bb =
+        BasicBlock::Create(C, "bb_0x" + utohexstr(addr - kernelOffset), F);
+    offsetToBB[addr] = bb;
+    if (!firstBodyBB)
+      firstBodyBB = bb;
+  }
+  BasicBlock *entryBB = useThreadLoop
+                            ? BasicBlock::Create(C, "entry", F, firstBodyBB)
+                            : offsetToBB[kernelOffset];
 
   // ==== Phase 4: Init entry registers ====
   IRBuilder<> B(entryBB);
