@@ -52,6 +52,11 @@ def _max_per_kernel() -> int:
     return int(raw) if raw else 1
 
 
+def _skip_per_kernel() -> int:
+    raw = os.environ.get("GPT_OSS_KERNEL_FIXTURE_SKIP_PER_KERNEL", "").strip()
+    return int(raw) if raw else 0
+
+
 def _max_tensor_bytes() -> int:
     raw = os.environ.get("GPT_OSS_KERNEL_FIXTURE_MAX_TENSOR_BYTES", "").strip()
     # Large enough for the first GPT-OSS fixtures, but finite so accidental
@@ -346,9 +351,10 @@ def install() -> None:
 
         with _LOCK:
             seen = _COUNTS.get(kernel_name, 0)
-            if seen >= _max_per_kernel():
-                return original_run(self, *args, **kwargs)
             _COUNTS[kernel_name] = seen + 1
+            skip = _skip_per_kernel()
+            if seen < skip or seen >= skip + _max_per_kernel():
+                return original_run(self, *args, **kwargs)
             ordinal = seen
 
         before = [

@@ -40,6 +40,20 @@ DEFAULT_LIBSALMON = HERE / "libsalmon_intercept.so"
 DEFAULT_RULES = TRITON_CORPUS_RUNNER / "_empty_rules.json"
 
 
+def _salmon_libhsa() -> Path:
+    override = os.environ.get("GPT_OSS_FIXTURE_REPLAY_LIBHSA", "").strip()
+    if override:
+        return Path(override)
+    return DEFAULT_LIBHSA
+
+
+def _salmon_intercept() -> Path:
+    override = os.environ.get("GPT_OSS_FIXTURE_REPLAY_LIBSALMON", "").strip()
+    if override:
+        return Path(override)
+    return DEFAULT_LIBSALMON
+
+
 def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -340,8 +354,10 @@ def _mode_env(mode: str) -> dict[str, str]:
     env["HSA_HOTSWAP_RULES"] = str(DEFAULT_RULES)
     env["HSA_HOTSWAP_IR_RAISER"] = "1"
     env["HSA_SALMON_STRICT"] = "1"
-    env["LD_PRELOAD"] = f"{DEFAULT_LIBHSA}:{DEFAULT_LIBSALMON}"
-    env["LD_LIBRARY_PATH"] = f"{DEFAULT_LIBHSA.parent}:{env.get('LD_LIBRARY_PATH', '')}"
+    libhsa = _salmon_libhsa()
+    libsalmon = _salmon_intercept()
+    env["LD_PRELOAD"] = f"{libhsa}:{libsalmon}"
+    env["LD_LIBRARY_PATH"] = f"{libhsa.parent}:{env.get('LD_LIBRARY_PATH', '')}"
     return env
 
 

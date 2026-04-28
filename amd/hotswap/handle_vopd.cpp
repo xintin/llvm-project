@@ -26,8 +26,10 @@ namespace {
 
 ParsedReg applyVopdVGPRMsb(const RaiseContext &ctx, ParsedReg pr,
                            unsigned slot) {
-  if (pr.kind == ParsedReg::VGPR || pr.kind == ParsedReg::AGPR)
-    pr.baseIdx += ((ctx.vgprMSBs >> (slot * 2)) & 0x3) * 256;
+  if (pr.kind != ParsedReg::VGPR && pr.kind != ParsedReg::AGPR)
+    return pr;
+
+  pr.baseIdx += ((ctx.vgprMSBs >> (slot * 2)) & 0x3) * 256;
   return pr;
 }
 
@@ -155,7 +157,7 @@ bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
                    SmallVectorImpl<std::pair<ParsedReg, Value *>> &writes,
                    HandlerResult &hr) {
   ParsedReg dst = applyVopdVGPRMsb(
-      ctx, ctx.parseReg(half.dstReg, AMDGPU::VOPD::Component::DST),
+      ctx, ctx.parseReg(half.dstReg, /*mciOpIdx=*/-1),
       /*slot=*/3);
   auto queue = [&](Value *v) {
     writes.emplace_back(dst, v);
