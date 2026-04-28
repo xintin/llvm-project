@@ -475,6 +475,15 @@ enum class SemOp : uint16_t {
   // Both SemOps share the op_sel/op_sel_hi parser and write-back shape
   // in handle_valu_vop3p.cpp; only the narrow element type differs.
   V_FMA_MIX_F32, V_FMA_MIX_F32_BF16,
+  // VOP3P BF16 destination mixed FMA (gfx1250
+  // VOP3PInstructions.td:464): compute
+  //   fptrunc_bf16(fma(cvt_f32(src0_part),
+  //                    cvt_f32(src1_part),
+  //                    cvt_f32(src2_part)))
+  // and write the rounded BF16 result into the low 16 bits of `vdst`.
+  // The high 16 bits are the tied-output input (`vdst_in`) and must be
+  // preserved explicitly in IR; this is not a plain 32-bit f32 write.
+  V_FMA_MIXLO_BF16,
   V_ADD_F16, V_MUL_F16, V_SUB_F16, V_SUBREV_F16, V_MAC_F16, V_FMAC_F16,
   // VOP2 F16 multiply-add-with-literal pseudos (mirror of
   // V_FMAMK_F32 / V_FMAAK_F32 for the f16 lane). Defined in

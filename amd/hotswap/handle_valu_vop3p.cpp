@@ -788,6 +788,110 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
 
+  // ---- v_fma_mixlo_bf16: BF16-result mixed-precision FMA (VOP3P) ----
+  //
+  // LLVM's RDNA4 TableGen definition declares V_FMA_MIXLO_BF16 with
+  // VOP_BF16_BF16_BF16_BF16 and FPDPRounding=1. The generated selection
+  // patterns model it as:
+  //
+  //   fptrunc_bf16(llvm.fma.f32(cvt_f32(src0_part),
+  //                             cvt_f32(src1_part),
+  //                             cvt_f32(src2_part)))
+  //
+  // and the ISA family writes only the low 16 bits of vdst (the high
+  // half is the tied vdst_in input). The source `*_part` selection
+  // matches V_FMA_MIX_F32_BF16 below: op_sel_hi chooses narrow-bf16 vs
+  // full-f32, and op_sel chooses the high half when a register source is
+  // interpreted as narrow.
+  case SemOp::V_FMA_MIXLO_BF16: {
+    if (op.nSrcs() < 3) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P",
+          "v_fma_mixlo_bf16 requires three explicit source operands");
+      return hr;
+    }
+
+    bool clampResult = false;
+    int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                              AMDGPU::OpName::clamp);
+    if (clampIdx >= 0) {
+      if (!di.isImm(static_cast<unsigned>(clampIdx))) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3P",
+            "v_fma_mixlo_bf16 clamp operand is not an immediate");
+        return hr;
+      }
+      clampResult = di.getImm(static_cast<unsigned>(clampIdx)) != 0;
+    }
+
+    Type *bf16Ty = Type::getBFloatTy(ctx.C);
+    Type *i16Ty = Type::getInt16Ty(ctx.C);
+
+    int opSel[3] = {0, 0, 0};
+    int opSelHi[3] = {0, 0, 0};
+    StringRef text(di.fullText);
+    parseBracketList3(text, "op_sel:", opSel);
+    parseBracketList3(text, "op_sel_hi:", opSelHi);
+
+    auto readMixBf16Src = [&](unsigned i) -> Value * {
+      Value *raw = op.srcF(i);
+      if (opSelHi[i] == 0) {
+        if (raw->getType() != ctx.f32Ty)
+          raw = ctx.B.CreateBitCast(raw, ctx.f32Ty);
+        return raw;
+      }
+
+      if (raw->getType() == ctx.f32Ty)
+        raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
+
+      Value *bits = nullptr;
+      bool isImmediateOperand = !op.isSrcReg(i);
+      if (!isImmediateOperand && opSel[i] == 1)
+        bits = ctx.B.CreateTrunc(ctx.B.CreateLShr(raw, 16),
+                                  i16Ty);
+      else
+        bits = ctx.B.CreateTrunc(raw, i16Ty);
+
+      Value *narrowVal = ctx.B.CreateBitCast(bits, bf16Ty);
+      return ctx.B.CreateFPExt(narrowVal, ctx.f32Ty, "mixlo_cvt_bf16");
+    };
+
+    Value *s0 = readMixBf16Src(0);
+    Value *s1 = readMixBf16Src(1);
+    Value *s2 = readMixBf16Src(2);
+    Function *fmaFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::fma, {ctx.f32Ty});
+    Value *fma = ctx.B.CreateCall(fmaFn, {s0, s1, s2}, "fma_mixlo_bf16");
+    Value *rounded = ctx.B.CreateFPTrunc(fma, bf16Ty, "fma_mixlo_bf16_round");
+    if (clampResult) {
+      // AMDGPUclamp clamps to [0, 1] and maps NaN to 0 (SIInstrInfo.td).
+      // V_FMA_MIXLO_BF16 applies it after the destination BF16 rounding.
+      Function *maxFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::maxnum, {bf16Ty});
+      Function *minFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::minnum, {bf16Ty});
+      rounded = ctx.B.CreateCall(
+          minFn,
+          {ctx.B.CreateCall(maxFn,
+                            {rounded, ConstantFP::get(bf16Ty, 0.0)},
+                            "fma_mixlo_bf16_clamp_lo"),
+           ConstantFP::get(bf16Ty, 1.0)},
+          "fma_mixlo_bf16_clamp");
+    }
+    Value *loBits =
+        ctx.B.CreateZExt(ctx.B.CreateBitCast(rounded, i16Ty), ctx.i32Ty);
+
+    ParsedReg dest = op.dst();
+    Value *oldDest = ctx.regs.readReg32(ctx.B, dest);
+    Value *oldHi = ctx.B.CreateAnd(
+        oldDest, ConstantInt::get(ctx.i32Ty, 0xFFFF0000u),
+        "fma_mixlo_bf16_old_hi");
+    ctx.writeReg32(dest, ctx.B.CreateOr(oldHi, loBits,
+                                        "fma_mixlo_bf16_pack"));
+    hr.handled = true;
+    return hr;
+  }
+
   // ---- v_fma_mix_f32 / v_fma_mix_f32_bf16: mixed-precision FMA (VOP3P) ----
   //
   // dst = fma(cvt_f32(src0_part), cvt_f32(src1_part), cvt_f32(src2_part))
