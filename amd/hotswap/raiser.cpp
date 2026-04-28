@@ -1232,10 +1232,10 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
 
     // The hotswap caller still launches with the source kernel's host-side
     // kernarg buffer.  Salmon materialises every source-visible value either
-    // as a formal parameter (`inreg`, so AMDGPU may preload the same leading
-    // kernarg dwords Triton preloads) or as an intrinsic for architected
-    // dispatch state.  Suppress backend-invented implicit kernarg slots so the
-    // emitted descriptor keeps the source kernarg size instead of appending a
+    // as a normal formal parameter, as source-ABI preloaded SGPR state seeded
+    // explicitly in IR below, or as an intrinsic for architected dispatch
+    // state.  Suppress backend-invented implicit kernarg slots so the emitted
+    // descriptor keeps the source kernarg size instead of appending a
     // target-default hidden-arg block that the host never populated.
     F->addFnAttr("amdgpu-no-cluster-id-x");
     F->addFnAttr("amdgpu-no-cluster-id-y");

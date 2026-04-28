@@ -380,12 +380,12 @@ IntrinsicRole classifyIntrinsicUse(CallBase *CB, Value *V,
   if (operandForcesSGPR(id, operandIdx))
     return IntrinsicRole::SGPRForced;
 
-  // Raw-buffer intrinsics have scalar descriptor / soffset operands, but LLVM
-  // has a dedicated waterfall lowering for divergent values there. The MUBUF
-  // raiser deliberately preserves source-wave-divergent descriptors under
-  // cross-widening (see buildMubufSRD), so these are safe sinks for the
-  // cross-lane rewrite use-chain: the loaded value is fresh memory data rather
-  // than a continuation of the descriptor's per-source-wave identity.
+  // Raw-buffer intrinsics produce fresh memory data, so their results do not
+  // continue a cross-lane value's per-source-wave identity.  Cross-widening
+  // MUBUF loads are emitted through the addrspace(8) raw-pointer form so LLVM
+  // can preserve the source resource abstraction; the legacy <4 x i32> raw
+  // buffer form remains a same-wave path where the descriptor is already
+  // target-wave scalar.
   if (id == Intrinsic::amdgcn_raw_buffer_load) {
     return IntrinsicRole::VGPRSafeSink;
   }
