@@ -727,7 +727,7 @@ std::vector<uint8_t> buildPaddedStoreRowAdvanceCanaryHsaco() {
   Type *i32Ty = Type::getInt32Ty(C);
   Type *i64Ty = Type::getInt64Ty(C);
   PointerType *globalPtrTy = PointerType::get(C, 1);
-  ArrayType *ldsTy = ArrayType::get(i32Ty, 10);
+  ArrayType *ldsTy = ArrayType::get(i32Ty, 20);
   auto *lds = new GlobalVariable(
       M, ldsTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
       PoisonValue::get(ldsTy), "tdm_padded_store_lds", nullptr,
@@ -755,18 +755,18 @@ std::vector<uint8_t> buildPaddedStoreRowAdvanceCanaryHsaco() {
   Value *laneLo =
       B.CreateCall(mbcntLo, {B.getInt32(-1), B.getInt32(0)}, "lane_lo");
   Value *lane = B.CreateCall(mbcntHi, {B.getInt32(-1), laneLo}, "lane");
-  Value *laneLt8 = B.CreateICmpULT(lane, B.getInt32(8), "lane_lt_8");
-  Value *laneLt4 = B.CreateICmpULT(lane, B.getInt32(4), "lane_lt_4");
-  Value *row1Lane = B.CreateSub(lane, B.getInt32(4), "row1_lane");
-  Value *ldsIdx = B.CreateSelect(laneLt4, lane, B.CreateAdd(row1Lane, B.getInt32(5)),
+  Value *laneLt20 = B.CreateICmpULT(lane, B.getInt32(20), "lane_lt_20");
+  Value *laneLt10 = B.CreateICmpULT(lane, B.getInt32(10), "lane_lt_10");
+  Value *row1Lane = B.CreateSub(lane, B.getInt32(10), "row1_lane");
+  Value *ldsIdx = B.CreateSelect(laneLt10, lane, B.CreateAdd(row1Lane, B.getInt32(10)),
                                  "lds_idx");
   Value *row0Pattern = B.CreateAdd(B.getInt32(0x71000000u), lane, "row0_pattern");
   Value *row1Pattern = B.CreateAdd(B.getInt32(0x72000000u), row1Lane, "row1_pattern");
-  Value *pattern = B.CreateSelect(laneLt4, row0Pattern, row1Pattern, "pattern");
+  Value *pattern = B.CreateSelect(laneLt10, row0Pattern, row1Pattern, "pattern");
 
   BasicBlock *fillBB = BasicBlock::Create(C, "fill_lds", F);
   BasicBlock *afterFillBB = BasicBlock::Create(C, "after_fill", F);
-  B.CreateCondBr(laneLt8, fillBB, afterFillBB);
+  B.CreateCondBr(laneLt20, fillBB, afterFillBB);
 
   B.SetInsertPoint(fillBB);
   Value *ldsPtr = B.CreateInBoundsGEP(ldsTy, lds, {B.getInt32(0), ldsIdx},
@@ -789,14 +789,18 @@ std::vector<uint8_t> buildPaddedStoreRowAdvanceCanaryHsaco() {
   g0 = B.CreateInsertElement(g0, outHi, B.getInt32(3), "g0");
 
   Value *g1 = PoisonValue::get(v8i);
-  // DS=4 bytes, padding enabled, interval=16 bytes, amount=4 bytes.
+  // DS=4 bytes, padding enabled, interval=16 bytes, amount=4 bytes.  tile_dim0
+  // is 10 dwords = two complete padded periods: (4 logical + 1 padding) * 2.
+  // The descriptor's global tensor dim is 8 dwords, so padding positions are
+  // OOB-dropped by the MUBUF store while row advancement must still skip over
+  // both encoded padding slots exactly once.
   g1 = B.CreateInsertElement(g1, B.getInt32((2u << 16) | (1u << 20) | (1u << 22)),
                              B.getInt32(0), "g1");
-  g1 = B.CreateInsertElement(g1, B.getInt32(4u << 16), B.getInt32(1), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(8u << 16), B.getInt32(1), "g1");
   g1 = B.CreateInsertElement(g1, B.getInt32(2u << 16), B.getInt32(2), "g1");
-  g1 = B.CreateInsertElement(g1, B.getInt32(5u << 16), B.getInt32(3), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(10u << 16), B.getInt32(3), "g1");
   g1 = B.CreateInsertElement(g1, B.getInt32(2), B.getInt32(4), "g1");
-  g1 = B.CreateInsertElement(g1, B.getInt32(4), B.getInt32(5), "g1");
+  g1 = B.CreateInsertElement(g1, B.getInt32(8), B.getInt32(5), "g1");
   g1 = B.CreateInsertElement(g1, B.getInt32(8u << 16), B.getInt32(6), "g1");
   g1 = B.CreateInsertElement(g1, B.getInt32(0), B.getInt32(7), "g1");
 
@@ -1352,8 +1356,8 @@ TEST_F(TdmGpu, PaddedStoreRowAdvance) {
   ASSERT_FALSE(hsaco.empty()) << "failed to build padded-store TDM canary";
 
   uint32_t *d_out = nullptr;
-  HIP_ASSERT(hipMalloc(&d_out, 8 * sizeof(uint32_t)));
-  HIP_ASSERT(hipMemset(d_out, 0xcd, 8 * sizeof(uint32_t)));
+  HIP_ASSERT(hipMalloc(&d_out, 16 * sizeof(uint32_t)));
+  HIP_ASSERT(hipMemset(d_out, 0xcd, 16 * sizeof(uint32_t)));
 
   hipModule_t mod;
   HIP_ASSERT(hipModuleLoadData(&mod, hsaco.data()));
@@ -1372,11 +1376,11 @@ TEST_F(TdmGpu, PaddedStoreRowAdvance) {
                                    nullptr, config));
   HIP_ASSERT(hipDeviceSynchronize());
 
-  std::vector<uint32_t> host(8);
+  std::vector<uint32_t> host(16);
   HIP_ASSERT(
-      hipMemcpy(host.data(), d_out, 8 * sizeof(uint32_t), hipMemcpyDeviceToHost));
+      hipMemcpy(host.data(), d_out, 16 * sizeof(uint32_t), hipMemcpyDeviceToHost));
   int mism = 0;
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 8; ++i) {
     uint32_t expected = 0x71000000u + i;
     if (host[i] != expected) {
       if (mism < 4)
@@ -1386,13 +1390,13 @@ TEST_F(TdmGpu, PaddedStoreRowAdvance) {
       ++mism;
     }
   }
-  for (uint32_t i = 0; i < 4; ++i) {
+  for (uint32_t i = 0; i < 8; ++i) {
     uint32_t expected = 0x72000000u + i;
-    if (host[4 + i] != expected) {
+    if (host[8 + i] != expected) {
       if (mism < 4)
         fprintf(stderr,
                 "  [padded-store] row1 mismatch at %u: got 0x%08x expected 0x%08x\n",
-                i, host[4 + i], expected);
+                i, host[8 + i], expected);
       ++mism;
     }
   }

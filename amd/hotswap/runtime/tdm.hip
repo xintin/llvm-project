@@ -153,6 +153,28 @@ __device__ __forceinline__ uint32_t gather_index(v4i g2, v4i g3,
   return (i & 1) ? (w >> 16) : (w & 0xffffu);
 }
 
+__device__ __forceinline__ bool row_span_already_padded(uint32_t row_bytes,
+                                                        uint32_t interval_bytes,
+                                                        uint32_t amount_bytes) {
+  if (interval_bytes == 0 || amount_bytes == 0)
+    return false;
+  // Descriptor producers use two equivalent encodings for an LDS row:
+  //
+  //   A. logical row bytes in tile_dim0, plus interval/amount padding fields;
+  //      the helper must synthesize padding as the walk advances.
+  //   B. already-padded LDS row span in tile_dim0, with the same padding fields
+  //      retained so hardware knows which positions are padding; advancing by
+  //      tile_dim0 already lands at the next row.
+  //
+  // A padded row span is made of whole periods, where each period is one
+  // logical interval plus its padding amount. If row_bytes is not an integer
+  // number of periods, it is a logical row width and padding still needs to be
+  // inserted by the emulation walk. This keeps the 64B+16B input-tile form in
+  // path A while covering 1+ period output/store rows in path B.
+  const uint32_t period = interval_bytes + amount_bytes;
+  return period != 0 && row_bytes >= period && (row_bytes % period) == 0;
+}
+
 // V# for raw byte addressing with hardware bounds check.
 // flags=0x00020000 = data_format=BUF_DATA_FORMAT_32, num_format=UINT,
 // type=BUFFER (the canonical "raw byte access" gfx9 layout). With
@@ -314,16 +336,8 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
       const uint32_t row_bytes = T0 * DS;
       lds_byte_off += row_bytes;
       if (pad_interval_bytes) {
-        // Some TensorDescriptor encodings make `tile_dim0` the logical row
-        // width and carry the LDS padding only in the interval/amount fields
-        // (GPT-OSS input tile: 64 bytes + 16 bytes padding). Others make
-        // `tile_dim0` the already-padded LDS row span and still carry the
-        // interval fields (GPT-OSS output tile: 136 bf16 = 256 + 16 bytes).
-        // Do not apply the same padding twice when the row width already
-        // equals one padded interval.
-        const bool row_bytes_include_one_pad_interval =
-            row_bytes == pad_interval_bytes + pad_amount_bytes;
-        if (!row_bytes_include_one_pad_interval) {
+        if (!row_span_already_padded(row_bytes, pad_interval_bytes,
+                                     pad_amount_bytes)) {
           bytes_since_pad += row_bytes;
           while (bytes_since_pad >= pad_interval_bytes) {
             bytes_since_pad -= pad_interval_bytes;
