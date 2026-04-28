@@ -12,9 +12,11 @@ namespace transpiler {
 // Decoded addressing shape of a MUBUF / VBUFFER load or store.
 //
 // `srd` is a <4 x i32> raw buffer descriptor built from the SRSRC
-// 128-bit SGPR tuple, routed through `amdgcn.readfirstlane` so each
-// word lands in an SGPR (avoiding the waterfall loop the backend
-// would otherwise insert). `voffset` is the per-lane i32 byte offset
+// 128-bit SGPR tuple. `rawPtrRsrc` is the same resource expressed as
+// LLVM's addrspace(8) buffer-resource pointer via
+// `llvm.amdgcn.make.buffer.rsrc`; cross-widening MUBUF loads use that
+// form so LLVM preserves raw-pointer buffer semantics instead of
+// consuming Salmon-synthesised descriptor dwords. `voffset` is the per-lane i32 byte offset
 // (vaddr + imm). `soffset` is the SGPR byte offset (defaults to 0).
 // `auxFlags` is always a zero i32 — the raw buffer intrinsics take it
 // but today's raiser doesn't surface cpol/th/scope (see the
@@ -35,6 +37,7 @@ namespace transpiler {
 // guard (lit_tests/buffer_store_no_scratch_alloca/).
 struct MubufAddr {
   llvm::Value *srd = nullptr;
+  llvm::Value *rawPtrRsrc = nullptr;
   llvm::Value *voffset = nullptr;
   llvm::Value *soffset = nullptr;
   llvm::Value *auxFlags = nullptr;

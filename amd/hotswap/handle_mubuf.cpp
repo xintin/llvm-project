@@ -73,6 +73,13 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
     Value *voffset = mbuf.voffset;
     Value *soffset = mbuf.soffset;
     Value *auxFlags = mbuf.auxFlags;
+    auto rawPtrBufferLoad = [&](Type *loadTy) -> Value * {
+      Function *bufLd = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_raw_ptr_buffer_load, {loadTy});
+      return ctx.B.CreateCall(
+          bufLd, {mbuf.rawPtrRsrc, voffset, soffset, auxFlags},
+          "buf_ld_rawptr");
+    };
 
     if (isLoad) {
       if (isSubDword) {
@@ -82,10 +89,15 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
         // prior dst (see comment block above mubufClassify).
         Type *memTy = (loadBits == 8) ? Type::getInt8Ty(ctx.C)
                                       : Type::getInt16Ty(ctx.C);
-        Function *bufLd = Intrinsic::getOrInsertDeclaration(
-            &ctx.M, Intrinsic::amdgcn_raw_buffer_load, {memTy});
-        Value *loaded = ctx.B.CreateCall(bufLd,
-            {srd, voffset, soffset, auxFlags}, "buf_ld");
+        Value *loaded = nullptr;
+        if (ctx.targetIsa.waveSize > ctx.isa.waveSize) {
+          loaded = rawPtrBufferLoad(memTy);
+        } else {
+          Function *bufLd = Intrinsic::getOrInsertDeclaration(
+              &ctx.M, Intrinsic::amdgcn_raw_buffer_load, {memTy});
+          loaded = ctx.B.CreateCall(bufLd,
+              {srd, voffset, soffset, auxFlags}, "buf_ld");
+        }
         if (d16Half == 0) {
           Value *ext = isBufSigned ? ctx.B.CreateSExt(loaded, ctx.i32Ty)
                                    : ctx.B.CreateZExt(loaded, ctx.i32Ty);
@@ -119,21 +131,31 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
           ctx.writeReg32(vdata, merged);
         }
       } else if (dwords == 1) {
-        Function *bufLd = Intrinsic::getOrInsertDeclaration(
-            &ctx.M,
-            Intrinsic::amdgcn_raw_buffer_load,
-            {ctx.i32Ty});
-        Value *loaded = ctx.B.CreateCall(bufLd,
-            {srd, voffset, soffset, auxFlags}, "buf_ld");
+        Value *loaded = nullptr;
+        if (ctx.targetIsa.waveSize > ctx.isa.waveSize) {
+          loaded = rawPtrBufferLoad(ctx.i32Ty);
+        } else {
+          Function *bufLd = Intrinsic::getOrInsertDeclaration(
+              &ctx.M,
+              Intrinsic::amdgcn_raw_buffer_load,
+              {ctx.i32Ty});
+          loaded = ctx.B.CreateCall(bufLd,
+              {srd, voffset, soffset, auxFlags}, "buf_ld");
+        }
         ctx.writeReg32(vdata, loaded);
       } else {
         auto *vecTy = FixedVectorType::get(ctx.i32Ty, dwords);
-        Function *bufLd = Intrinsic::getOrInsertDeclaration(
-            &ctx.M,
-            Intrinsic::amdgcn_raw_buffer_load,
-            {vecTy});
-        Value *loaded = ctx.B.CreateCall(bufLd,
-            {srd, voffset, soffset, auxFlags}, "buf_ld");
+        Value *loaded = nullptr;
+        if (ctx.targetIsa.waveSize > ctx.isa.waveSize) {
+          loaded = rawPtrBufferLoad(vecTy);
+        } else {
+          Function *bufLd = Intrinsic::getOrInsertDeclaration(
+              &ctx.M,
+              Intrinsic::amdgcn_raw_buffer_load,
+              {vecTy});
+          loaded = ctx.B.CreateCall(bufLd,
+              {srd, voffset, soffset, auxFlags}, "buf_ld");
+        }
         ctx.writeRegVec(vdata, loaded);
       }
       hr.handled = true;

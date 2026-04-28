@@ -108,6 +108,7 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   case Intrinsic::amdgcn_ds_bpermute:
   case Intrinsic::amdgcn_ds_swizzle:
   case Intrinsic::amdgcn_update_dpp:
+  case Intrinsic::amdgcn_make_buffer_rsrc:
   case Intrinsic::amdgcn_mbcnt_lo:
   case Intrinsic::amdgcn_mbcnt_hi:
   case Intrinsic::amdgcn_perm:
@@ -245,6 +246,10 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   case Intrinsic::smax:
   case Intrinsic::umin:
   case Intrinsic::umax:
+  case Intrinsic::sadd_with_overflow:
+  case Intrinsic::uadd_with_overflow:
+  case Intrinsic::usub_with_overflow:
+  case Intrinsic::umul_with_overflow:
   case Intrinsic::abs:
   case Intrinsic::ctpop:
   case Intrinsic::ctlz:
@@ -269,6 +274,8 @@ bool isIntrinsicVGPRSafeSink(Intrinsic::ID id) {
   switch (id) {
   // Stores: value consumed, no IR result to propagate.
   case Intrinsic::amdgcn_raw_buffer_store:
+  case Intrinsic::amdgcn_raw_ptr_buffer_load:
+  case Intrinsic::amdgcn_raw_ptr_buffer_store:
   case Intrinsic::amdgcn_tensor_store_from_lds:
   case Intrinsic::amdgcn_global_load_async_to_lds_b8:
   case Intrinsic::amdgcn_global_load_async_to_lds_b32:
@@ -373,21 +380,16 @@ IntrinsicRole classifyIntrinsicUse(CallBase *CB, Value *V,
   if (operandForcesSGPR(id, operandIdx))
     return IntrinsicRole::SGPRForced;
 
-  // `raw_buffer_load` is the one mixed intrinsic in the raiser's
-  // emission set: arg 0 (rsrc) is SGPR-forced, arg 3 (soffset) is
-  // SGPR-forced, args 1 / 2 / 4 are VGPR-safe. Handled here so the
-  // enumeration in `operandForcesSGPR` / `isIntrinsicVGPRSafeSink`
-  // does not duplicate the per-operand conditional.
+  // Raw-buffer intrinsics have scalar descriptor / soffset operands, but LLVM
+  // has a dedicated waterfall lowering for divergent values there. The MUBUF
+  // raiser deliberately preserves source-wave-divergent descriptors under
+  // cross-widening (see buildMubufSRD), so these are safe sinks for the
+  // cross-lane rewrite use-chain: the loaded value is fresh memory data rather
+  // than a continuation of the descriptor's per-source-wave identity.
   if (id == Intrinsic::amdgcn_raw_buffer_load) {
-    if (operandIdx == 0 || operandIdx == 3)
-      return IntrinsicRole::SGPRForced;
-    // The result is a fresh value (loaded from memory) that no
-    // longer carries our per-source-wave identity; stop walking.
     return IntrinsicRole::VGPRSafeSink;
   }
   if (id == Intrinsic::amdgcn_raw_buffer_store) {
-    if (operandIdx == 1 || operandIdx == 4)
-      return IntrinsicRole::SGPRForced;
     return IntrinsicRole::VGPRSafeSink;
   }
 
@@ -417,13 +419,6 @@ SgprForcedConsumerKind classifySgprForcedIntrinsicUse(CallBase *CB,
     return SgprForcedConsumerKind::ExplicitReadFirstLane;
   if (id == Intrinsic::amdgcn_s_sendmsg && operandIdx <= 1)
     return SgprForcedConsumerKind::ScalarSendMsg;
-  if (id == Intrinsic::amdgcn_raw_buffer_load &&
-      (operandIdx == 0 || operandIdx == 3))
-    return SgprForcedConsumerKind::ScalarMemoryOperand;
-  if (id == Intrinsic::amdgcn_raw_buffer_store &&
-      (operandIdx == 1 || operandIdx == 4))
-    return SgprForcedConsumerKind::ScalarMemoryOperand;
-
   return SgprForcedConsumerKind::Unknown;
 }
 
@@ -477,9 +472,10 @@ std::string describeUser(const Instruction *I) {
 // every transitive user is a proven-safe consumer; otherwise writes
 // a single-line description of the first blocking user to
 // `blockingDetail` and returns SGPRForced.
-UseChainVerdict
-classifyForwardUseChain(Value *root, std::string &blockingDetail,
-                        SgprForcedConsumerKind &blockingKind) {
+UseChainVerdict classifyForwardUseChain(
+    Value *root, std::string &blockingDetail,
+    SgprForcedConsumerKind &blockingKind,
+    SmallPtrSetImpl<CallInst *> *sourceWaveReadFirstLaneSites = nullptr) {
   SmallPtrSet<Value *, 32> visited;
   SmallVector<Value *, 16> worklist;
   worklist.push_back(root);
@@ -560,6 +556,19 @@ classifyForwardUseChain(Value *root, std::string &blockingDetail,
 
       if (auto *CB = dyn_cast<CallBase>(I)) {
         unsigned operandIdx = U.getOperandNo();
+        if (Function *callee = CB->getCalledFunction();
+            callee && callee->getIntrinsicID() ==
+                          Intrinsic::amdgcn_readfirstlane) {
+          if (auto *CI = dyn_cast<CallInst>(CB)) {
+            if (sourceWaveReadFirstLaneSites)
+              sourceWaveReadFirstLaneSites->insert(CI);
+            worklist.push_back(CI);
+            continue;
+          }
+          blockingDetail = describeUser(I);
+          blockingKind = SgprForcedConsumerKind::ExplicitReadFirstLane;
+          return UseChainVerdict::SGPRForced;
+        }
         switch (classifyIntrinsicUse(CB, V, operandIdx)) {
         case IntrinsicRole::SGPRForced:
           blockingDetail = describeUser(I);
@@ -663,6 +672,33 @@ void rewriteReadlaneCall(CallInst *CI, Value *laneId,
       M, Intrinsic::amdgcn_ds_bpermute);
   Value *broadcast = B.CreateCall(bpermute, {selector, src},
                                    "cwd_readlane_rewritten");
+  CI->replaceAllUsesWith(broadcast);
+  CI->eraseFromParent();
+}
+
+// Rewrite a reachable explicit `amdgcn.readfirstlane(src)` to a source-wave
+// broadcast.  This preserves two independent wave32 scalar values inside one
+// wave64 target wave instead of collapsing both halves through a single
+// hardware SGPR.
+void rewriteReadfirstlaneCall(CallInst *CI, Value *laneId,
+                              unsigned sourceWaveSize) {
+  IRBuilder<> B(CI);
+  B.SetCurrentDebugLocation(CI->getDebugLoc());
+  Module *M = CI->getModule();
+  Type *i32Ty = B.getInt32Ty();
+  Value *src = CI->getArgOperand(0);
+
+  uint32_t baseMaskImm =
+      ~(static_cast<uint32_t>(sourceWaveSize) - 1u);
+  Value *baseMask = ConstantInt::get(i32Ty, baseMaskImm);
+  Value *srcWaveBase = B.CreateAnd(laneId, baseMask,
+                                   "cwd_rfl_src_wave_base");
+  Value *selector = B.CreateShl(srcWaveBase, ConstantInt::get(i32Ty, 2),
+                                "cwd_rfl_selector");
+  Function *bpermute = Intrinsic::getOrInsertDeclaration(
+      M, Intrinsic::amdgcn_ds_bpermute);
+  Value *broadcast = B.CreateCall(bpermute, {selector, src},
+                                  "cwd_readfirstlane_rewritten");
   CI->replaceAllUsesWith(broadcast);
   CI->eraseFromParent();
 }
@@ -1054,6 +1090,7 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
   SmallVector<CallInst *, 16> writelaneSites;
   SmallVector<CallInst *, 16> readlaneSites;
   SmallVector<CallInst *, 16> dppI32Sites;
+  SmallPtrSet<CallInst *, 16> readfirstlaneSites;
   for (Instruction &I : instructions(F)) {
     auto *CI = dyn_cast<CallInst>(&I);
     if (!CI)
@@ -1098,7 +1135,8 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
                           const char *kind) -> bool {
     std::string detail;
     SgprForcedConsumerKind consumerKind = SgprForcedConsumerKind::None;
-    if (classifyForwardUseChain(CI, detail, consumerKind) ==
+    if (classifyForwardUseChain(CI, detail, consumerKind,
+                                &readfirstlaneSites) ==
         UseChainVerdict::VGPRSafe)
       return true;
     std::string msg;
@@ -1198,6 +1236,8 @@ CrossLaneDivergentRewriteReport rewriteCrossLaneDivergent(
     rewriteReadlaneCall(CI, getLaneId(), sourceWaveSize);
     ++report.readlaneRewritten;
   }
+  for (CallInst *CI : readfirstlaneSites)
+    rewriteReadfirstlaneCall(CI, getLaneId(), sourceWaveSize);
   for (CallInst *CI : dppI32Sites) {
     // Phase B above guaranteed `isDppCtrlRewritable(ctrl)`, and
     // `rewriteUpdateDppI32Call` re-checks and `report_fatal_error`s

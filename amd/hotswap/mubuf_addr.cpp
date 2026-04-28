@@ -138,9 +138,13 @@ bool constantI32(Value *v, uint32_t &out) {
 }
 
 // Build a gfx942-compatible raw buffer descriptor <4 x i32> from the
-// source SRSRC dwords. Each word is routed through
-// `amdgcn.readfirstlane` so it lands in an SGPR — the backend would
-// otherwise emit a waterfall loop around the intrinsic call.
+// source SRSRC dwords. Same-wave descriptors are routed through
+// `amdgcn.readfirstlane` so they land in SGPRs directly. Cross-widening MUBUF
+// loads use the parallel addrspace(8) `rawPtrRsrc` built in decodeMubufAddr
+// below, because LLVM's raw-pointer buffer intrinsic preserves the same
+// high-level resource form Triton emitted (`make.buffer.rsrc` +
+// `raw.ptr.buffer.load`) and avoids hand-translating gfx1250 raw-pointer
+// descriptor bits into a target SRD.
 //
 // dw1/dw2/dw3 are target-normalised rather than blindly copied from the
 // source SGPRs. gfx1250 raw-pointer descriptors carry high descriptor
@@ -201,8 +205,16 @@ Value *buildMubufSRD(RaiseContext &ctx, const SRSRCDwords &dw) {
   constexpr uint32_t kGfx942RawBufferFormat32Uint = 0x00024000u;
   constexpr uint32_t kGfx942RawBufferFormat32Float = 0x00027000u;
 
-  Function *readfirstlane = Intrinsic::getOrInsertDeclaration(
-      &ctx.M, Intrinsic::amdgcn_readfirstlane, {ctx.i32Ty});
+  const bool crossWidening = ctx.targetIsa.waveSize > ctx.isa.waveSize;
+  Function *readfirstlane =
+      crossWidening ? nullptr
+                    : Intrinsic::getOrInsertDeclaration(
+                          &ctx.M, Intrinsic::amdgcn_readfirstlane, {ctx.i32Ty});
+  auto scalarizeDescriptorWord = [&](Value *word, const char *name) -> Value * {
+    if (crossWidening)
+      return word;
+    return ctx.B.CreateCall(readfirstlane, {word}, name);
+  };
   Value *dw1NonBaseBits =
       ctx.B.CreateAnd(dw.dw1, ConstantInt::get(ctx.i32Ty, 0xFFFF0000u),
                       "srd_dw1_nonbase_bits");
@@ -255,8 +267,8 @@ Value *buildMubufSRD(RaiseContext &ctx, const SRSRCDwords &dw) {
 
   Value *cleanDw1 = ctx.B.CreateAnd(dw.dw1,
                                      ConstantInt::get(ctx.i32Ty, 0xFFFF));
-  Value *srdW0 = ctx.B.CreateCall(readfirstlane, {dw.dw0}, "srd_w0");
-  Value *srdW1 = ctx.B.CreateCall(readfirstlane, {cleanDw1}, "srd_w1");
+  Value *srdW0 = scalarizeDescriptorWord(dw.dw0, "srd_w0");
+  Value *srdW1 = scalarizeDescriptorWord(cleanDw1, "srd_w1");
   Value *sourceMax = ConstantInt::get(ctx.i32Ty, kGfx1250RawBufferMaxRecords);
   Value *targetMax = ConstantInt::get(ctx.i32Ty, kGfx942RawBufferMaxRecords);
   Value *isSourceMax = ctx.B.CreateICmpEQ(dw.dw2, sourceMax, "srd_is_gfx125_max");
@@ -264,8 +276,7 @@ Value *buildMubufSRD(RaiseContext &ctx, const SRSRCDwords &dw) {
       ctx.B.CreateAnd(isSourceMax, rawPointerShape, "srd_map_gfx125_max");
   Value *mappedDw2 = ctx.B.CreateSelect(shouldMapMax, targetMax, dw.dw2,
                                         "srd_num_records");
-  Value *srdW2 =
-      ctx.B.CreateCall(readfirstlane, {mappedDw2}, "srd_w2");
+  Value *srdW2 = scalarizeDescriptorWord(mappedDw2, "srd_w2");
   Value *word3 = ConstantInt::get(ctx.i32Ty, kGfx942RawBufferFormat32Float);
   Value *srd = UndefValue::get(FixedVectorType::get(ctx.i32Ty, 4));
   srd = ctx.B.CreateInsertElement(srd, srdW0, static_cast<uint64_t>(0));
@@ -311,6 +322,30 @@ MubufAddr decodeMubufAddr(RaiseContext &ctx, const DecodedInst &di,
 
   out.soffset = m.haveSoff ? ctx.regs.readReg32(ctx.B, m.soff)
                            : ConstantInt::get(ctx.i32Ty, 0);
+  constexpr uint32_t kGfx1250RawBufferMaxRecords = 0x00ffffffu;
+  constexpr uint32_t kGfx942RawBufferMaxRecords = 0x7ffffffeu;
+  Value *sourceMax = ConstantInt::get(ctx.i32Ty, kGfx1250RawBufferMaxRecords);
+  Value *targetMax = ConstantInt::get(ctx.i32Ty, kGfx942RawBufferMaxRecords);
+  Value *isSourceMax = ctx.B.CreateICmpEQ(dw.dw2, sourceMax,
+                                          "mubuf_raw_is_gfx125_max");
+  Value *numRecords = ctx.B.CreateSelect(isSourceMax, targetMax, dw.dw2,
+                                         "mubuf_raw_num_records");
+  Value *cleanDw1 =
+      ctx.B.CreateAnd(dw.dw1, ConstantInt::get(ctx.i32Ty, 0xFFFF));
+  Value *baseLo = ctx.B.CreateZExt(dw.dw0, ctx.i64Ty);
+  Value *baseHi = ctx.B.CreateShl(ctx.B.CreateZExt(cleanDw1, ctx.i64Ty), 32);
+  Value *base = ctx.B.CreateOr(baseLo, baseHi, "mubuf_raw_base");
+  Value *basePtr =
+      ctx.B.CreateIntToPtr(base, PointerType::get(ctx.C, 1), "mubuf_raw_base_ptr");
+  Function *makeRsrc = Intrinsic::getOrInsertDeclaration(
+      &ctx.M, Intrinsic::amdgcn_make_buffer_rsrc,
+      {PointerType::get(ctx.C, 8), PointerType::get(ctx.C, 1)});
+  out.rawPtrRsrc = ctx.B.CreateCall(
+      makeRsrc,
+      {basePtr, ConstantInt::get(Type::getInt16Ty(ctx.C), 0),
+       ctx.B.CreateZExt(numRecords, ctx.i64Ty),
+       ConstantInt::get(ctx.i32Ty, 0x27000)},
+      "mubuf_raw_ptr_rsrc");
   out.auxFlags = ConstantInt::get(ctx.i32Ty, 0);
   return out;
 }

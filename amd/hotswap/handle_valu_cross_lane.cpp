@@ -583,35 +583,42 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
   }
 
   // ---- v_readfirstlane_b32 sDST, vSRC ----
-  // Broadcast the value of vSRC from the lowest-numbered active source
-  // lane (or lane 0 if EXEC==0) to sDST.  Same-wave lowering can use the
-  // native intrinsic directly.  Under cross-widening, however, native
-  // `readfirstlane` would pick one lane for the entire target wave64 and
-  // collapse the two source-wave halves together.  Emulate the source
-  // operation with `ds_bpermute`: compute the first active bit in the
-  // source-width modeled EXEC mask, add it to the current target lane's
-  // source-wave base (`lane_id & ~(W_s-1)`), and fetch that lane's VGPR.
+  // Broadcast the value of vSRC from the lowest-numbered active source lane
+  // (or lane 0 if EXEC==0) to sDST.  Same-wave lowering can use the native
+  // intrinsic directly.  Under cross-widening, however, native readfirstlane
+  // would pick one lane for the entire target wave64 and collapse the two
+  // source-wave halves together.  Emulate the source operation with
+  // `ds_bpermute`: select the source-width slice of the modeled EXEC mask for
+  // the current target lane's source-wave half, find that slice's first set
+  // bit, and fetch the corresponding lane's VGPR.
+  //
   // This is an explicit semantic translation, not a readfirstlane allow-list:
-  // downstream SGPR-forced uses now consume the already-broadcast source-wave
-  // value rather than forcing the backend to scalarise a divergent value.
+  // downstream scalar-looking uses now consume an already-broadcast
+  // source-wave value that may differ between the two packed source waves.
   case SemOp::V_READFIRSTLANE_B32: {
     Value *src = ctx.B.CreateZExtOrTrunc(op.src(0), ctx.i32Ty, "rfl_src");
     Value *val = nullptr;
-    if (ctx.projection.sourceWaveScopedLaneOps()) {
-      Value *exec = ctx.regs.loadExec(ctx.B);
-      exec = ctx.B.CreateZExtOrTrunc(exec, ctx.i32Ty, "rfl_exec");
-      Function *cttz = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::cttz, {ctx.i32Ty});
-      Value *firstSet = ctx.B.CreateCall(
-          cttz, {exec, ConstantInt::getFalse(ctx.i1Ty)}, "rfl_first_set");
-      Value *execIsZero = ctx.B.CreateICmpEQ(exec, ctx.B.getInt32(0),
-                                             "rfl_exec_is_zero");
-      Value *sourceLane = ctx.B.CreateSelect(execIsZero, ctx.B.getInt32(0),
-                                             firstSet, "rfl_source_lane");
+    if (ctx.targetIsa.waveSize > ctx.isa.waveSize) {
       Value *laneId = ctx.emitLaneIdx();
       uint32_t sourceMask = ctx.isa.waveSize - 1;
       Value *groupBase = ctx.B.CreateAnd(laneId, ctx.B.getInt32(~sourceMask),
                                          "rfl_source_wave_base");
+
+      Value *exec = ctx.regs.loadExec(ctx.B);
+      Value *shiftAmt = ctx.B.CreateZExtOrTrunc(groupBase, exec->getType(),
+                                                "rfl_exec_shift");
+      Value *sourceExecWide = ctx.B.CreateLShr(exec, shiftAmt,
+                                               "rfl_exec_at_srcwave");
+      Value *sourceExec = ctx.B.CreateTrunc(sourceExecWide, ctx.i32Ty,
+                                            "rfl_exec");
+      Function *cttz = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::cttz, {ctx.i32Ty});
+      Value *firstSet = ctx.B.CreateCall(
+          cttz, {sourceExec, ConstantInt::getFalse(ctx.i1Ty)}, "rfl_first_set");
+      Value *execIsZero = ctx.B.CreateICmpEQ(sourceExec, ctx.B.getInt32(0),
+                                             "rfl_exec_is_zero");
+      Value *sourceLane = ctx.B.CreateSelect(execIsZero, ctx.B.getInt32(0),
+                                             firstSet, "rfl_source_lane");
       Value *targetLane = ctx.B.CreateOr(groupBase, sourceLane,
                                          "rfl_target_lane");
       Value *addr = ctx.B.CreateShl(targetLane, ctx.B.getInt32(2),

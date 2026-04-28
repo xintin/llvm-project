@@ -17,7 +17,10 @@
 ;
 ; Invariants pinned below:
 ;
-;   1. The byte load lifts to `@llvm.amdgcn.raw.buffer.load.i8` —
+;   1. The byte load lifts to a raw-buffer byte load.  On cross-widening
+;      targets Salmon uses the addrspace(8) raw-pointer form to preserve
+;      Triton's raw-pointer descriptor semantics; same-wave paths may use
+;      the legacy `<4 x i32>` descriptor form.
 ;      not to a flat / global load, and not to a wider type.
 ;   2. Each merge produces an `and` against the half-preserve mask
 ;      (0xFFFF0000 for `_d16`, 0x0000FFFF for `_d16_hi`) followed by
@@ -34,10 +37,10 @@
 
 ; CHECK-LABEL: define amdgpu_kernel void @buffer_load_d16_u8_kernel(
 
-; The byte loads themselves: i8-typed raw_buffer_load, one per asm
+; The byte loads themselves: i8-typed raw pointer buffer load, one per asm
 ; block.  Both must be present.
-; CHECK-DAG: call i8 @llvm.amdgcn.raw.buffer.load.i8
-; CHECK-DAG: call i8 @llvm.amdgcn.raw.buffer.load.i8
+; CHECK-DAG: call i8 @llvm.amdgcn.raw.ptr.buffer.load.i8
+; CHECK-DAG: call i8 @llvm.amdgcn.raw.ptr.buffer.load.i8
 
 ; The lo-half merge: AND against 0xFFFF0000 to keep prior hi bits,
 ; then OR with the zero-extended byte (low 16 bits, hi 16 zeros).
@@ -52,8 +55,8 @@
 
 ; Negative pin: the handler must NOT route the byte load through a
 ; wider buffer-load type (which would corrupt adjacent bytes).
-; CHECK-NOT: call i16 @llvm.amdgcn.raw.buffer.load
-; CHECK-NOT: call i32 @llvm.amdgcn.raw.buffer.load
+; CHECK-NOT: call i16 @llvm.amdgcn.raw.ptr.buffer.load
+; CHECK-NOT: call i32 @llvm.amdgcn.raw.ptr.buffer.load
 
 ; Negative pin: the merge must NOT use a full-VGPR overwrite shape
 ; (the legacy bug for SHORT_D16 zext'd loaded -> i32 and stored the

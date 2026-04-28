@@ -1,21 +1,21 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
-; RUN:   && %not %raise_cli %t.hsaco --target-isa=gfx942 \
+; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 \
 ; RUN:     --enable-writelane-rewrite \
 ; RUN:     --emit-ir=writelane_threadloop_barrier_refuse_kernel 2>&1 \
-; RUN:   | %FileCheck %s --check-prefix=STDERR
+; RUN:   | %FileCheck %s --check-prefix=IR
 ;
-; A readlane/writelane -> readfirstlane chain is normally eligible for the
-; analysis-triggered ThreadLoopProjection retry.  That retry is not yet safe
-; for kernels with workgroup barriers/LDS because barrier hoisting and LDS
-; aliasing checks are unimplemented.  Keep this as a loud refusal instead of
-; launching a translated kernel that can fault.
+; A readlane/writelane -> readfirstlane chain used to fall back to
+; ThreadLoopProjection; with workgroup barriers/LDS that was unsafe.  The
+; explicit readfirstlane is now rewritten to a source-wave `ds_bpermute`
+; broadcast under WaveNative, so the barrier-bearing kernel no longer needs
+; ThreadLoop.
 ;
-; STDERR: thread-loop fallback not eligible for kernel 'writelane_threadloop_barrier_refuse_kernel'
-; STDERR-SAME: workgroup barrier
-; STDERR-SAME: S_BARRIER_SIGNAL
-; STDERR: post-raise abort: cross-wave-lane-id-leak
-; STDERR-SAME: ThreadLoopProjection is not yet safe
-; STDERR-NOT: selected ThreadLoopProjection
+; IR-NOT: ThreadLoopProjection
+; IR-LABEL: define amdgpu_kernel void @writelane_threadloop_barrier_refuse_kernel(
+; IR: call void @llvm.amdgcn.s.barrier()
+; IR: cwd_writelane_rewritten = select i1
+; IR: readfirstlane_srcwave = call i32 @llvm.amdgcn.ds.bpermute
+; IR-NOT: call i32 @llvm.amdgcn.readfirstlane
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

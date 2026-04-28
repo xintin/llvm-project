@@ -1229,6 +1229,31 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
     // occupancy freely keeps register pressure safe.
     // TODO(gfx1250→gfx942): revisit once the raiser emits tighter IR; we may
     // want to propagate the source kernel's waves-per-eu for parity.
+
+    // The hotswap caller still launches with the source kernel's host-side
+    // kernarg buffer.  Salmon materialises every source-visible value either
+    // as a formal parameter (`inreg`, so AMDGPU may preload the same leading
+    // kernarg dwords Triton preloads) or as an intrinsic for architected
+    // dispatch state.  Suppress backend-invented implicit kernarg slots so the
+    // emitted descriptor keeps the source kernarg size instead of appending a
+    // target-default hidden-arg block that the host never populated.
+    F->addFnAttr("amdgpu-no-cluster-id-x");
+    F->addFnAttr("amdgpu-no-cluster-id-y");
+    F->addFnAttr("amdgpu-no-cluster-id-z");
+    F->addFnAttr("amdgpu-no-completion-action");
+    F->addFnAttr("amdgpu-no-default-queue");
+    F->addFnAttr("amdgpu-no-dispatch-id");
+    F->addFnAttr("amdgpu-no-dispatch-ptr");
+    F->addFnAttr("amdgpu-no-heap-ptr");
+    F->addFnAttr("amdgpu-no-hostcall-ptr");
+    F->addFnAttr("amdgpu-no-implicitarg-ptr");
+    F->addFnAttr("amdgpu-no-lds-kernel-id");
+    F->addFnAttr("amdgpu-no-multigrid-sync-arg");
+    F->addFnAttr("amdgpu-no-queue-ptr");
+    F->addFnAttr("amdgpu-no-workitem-id-x");
+    F->addFnAttr("amdgpu-no-workitem-id-y");
+    F->addFnAttr("amdgpu-no-workitem-id-z");
+    F->addFnAttr("uniform-work-group-size", "true");
   }
 
   // Propagate static LDS allocation from the source kernel descriptor.
