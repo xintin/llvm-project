@@ -62,6 +62,8 @@ def _next_action(status: str) -> str:
         return "Assign as Salmon correctness bug; inspect mismatching tensor path and reduce fixture."
     if status == "salmon-translate-fail":
         return "Assign as Salmon opcode/translation coverage bug."
+    if status == "target-resource-limit":
+        return "Generated kernel exceeds the target hardware resource limit; change kernel options or keep as documented impossible fixture."
     if status == "salmon-runtime-fail":
         return "Assign as Salmon runtime/ABI/codegen bug; rerun with serialized HIP if needed."
     if status == "native-runtime-fail":
@@ -81,6 +83,17 @@ def _detail(result: dict[str, Any] | None) -> str:
         return (
             f"mismatches={result.get('mismatches')} "
             f"max_abs={result.get('max_abs')} tensor={result.get('tensor_path')}"
+        )
+    if status == "target-resource-limit":
+        resource = result.get("resource", "resource")
+        required = result.get("required_bytes")
+        limit = result.get("hardware_limit_bytes")
+        generated = result.get("generated_target") or {}
+        execution = result.get("execution_target") or {}
+        return (
+            f"{resource} required={required} limit={limit} "
+            f"generated={generated.get('arch', 'unknown')} "
+            f"execution={execution.get('arch', 'unknown')}"
         )
     log = result.get("log", "")
     for line in log.splitlines():

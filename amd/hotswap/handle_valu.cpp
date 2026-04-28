@@ -1585,7 +1585,7 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
-  // VOP3 v_minmax_num_f32: dst = minnum(maxnum(s0, s1), s2).
+  // VOP3 v_minmax_num_f32: dst = maxnum(minnum(s0, s1), s2).
   // gfx11 emitted this as v_minmax_f32; gfx12 renamed it to
   // v_minmax_num_f32 once the IEEE-2019 NaN-propagating
   // V_MINIMUMMAXIMUM_F32 (opcode 0x26c) needed an unambiguous
@@ -1602,8 +1602,8 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
         &ctx.M, Intrinsic::maxnum, {ctx.f32Ty});
     Function *minFn = Intrinsic::getOrInsertDeclaration(
         &ctx.M, Intrinsic::minnum, {ctx.f32Ty});
-    Value *mx = ctx.B.CreateCall(maxFn, {s0, s1}, "vminmax_inner");
-    Value *r = ctx.B.CreateCall(minFn, {mx, s2}, "vminmax_num");
+    Value *mn = ctx.B.CreateCall(minFn, {s0, s1}, "vminmax_inner");
+    Value *r = ctx.B.CreateCall(maxFn, {mn, s2}, "vminmax_num");
     ctx.writeReg32(op.dst(), ctx.B.CreateBitCast(r, ctx.i32Ty));
     hr.handled = true;
     return hr;

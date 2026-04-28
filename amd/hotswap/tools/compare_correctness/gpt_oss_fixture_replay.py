@@ -22,6 +22,7 @@ import fnmatch
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -246,7 +247,7 @@ def _as_grid(value: Any) -> tuple[int, int, int] | tuple[int] | Any:
     return value
 
 
-def _run_child(fixture: Path, out_path: Path) -> int:
+def _run_child(fixture: Path, out_path: Path, num_stages: int | None = None) -> int:
     import torch
 
     data = _load_fixture(fixture)
@@ -258,6 +259,8 @@ def _run_child(fixture: Path, out_path: Path) -> int:
     fn = _load_kernel_from_fixture(data)
     args = [_restore_value(r) for r in data["args_before"]]
     kwargs = dict(data.get("kwargs") or {})
+    if num_stages is not None:
+        kwargs["num_stages"] = num_stages
     grid = _as_grid(data["grid"])
     if grid is None:
         raise RuntimeError(f"{fixture}: fixture missing launch grid")
@@ -342,7 +345,14 @@ def _mode_env(mode: str) -> dict[str, str]:
     return env
 
 
-def _spawn(mode: str, fixture: Path, out_path: Path, timeout_s: int) -> tuple[int, str]:
+def _spawn(
+    mode: str,
+    fixture: Path,
+    out_path: Path,
+    timeout_s: int,
+    *,
+    num_stages: int | None = None,
+) -> tuple[int, str]:
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -352,6 +362,8 @@ def _spawn(mode: str, fixture: Path, out_path: Path, timeout_s: int) -> tuple[in
         "--out",
         str(out_path),
     ]
+    if num_stages is not None:
+        cmd += ["--num-stages", str(num_stages)]
     proc = subprocess.run(
         cmd,
         env=_mode_env(mode),
@@ -363,7 +375,50 @@ def _spawn(mode: str, fixture: Path, out_path: Path, timeout_s: int) -> tuple[in
     return proc.returncode, proc.stdout
 
 
+_OUT_OF_RESOURCES_RE = re.compile(
+    r"OutOfResources: out of resource: (?P<resource>[^,]+), "
+    r"Required: (?P<required>\d+), Hardware limit: (?P<limit>\d+)"
+)
+_FORCED_TARGET_RE = re.compile(
+    r"forced Triton target = GPUTarget\(backend='(?P<backend>[^']+)', "
+    r"arch='(?P<arch>[^']+)', warp_size=(?P<warp_size>\d+)\)"
+)
+_SALMON_TARGET_RE = re.compile(
+    r"salmon_intercept: active, target=(?P<arch>\S+) "
+    r"\(wave_size=(?P<wave_size>\d+),"
+)
+
+
+def _resource_limit_failure(mode: str, log: str) -> dict[str, Any] | None:
+    match = _OUT_OF_RESOURCES_RE.search(log)
+    if not match:
+        return None
+    result: dict[str, Any] = {
+        "status": "target-resource-limit",
+        "mode": mode,
+        "resource": match.group("resource"),
+        "required_bytes": int(match.group("required")),
+        "hardware_limit_bytes": int(match.group("limit")),
+    }
+    forced = _FORCED_TARGET_RE.search(log)
+    if forced:
+        result["generated_target"] = {
+            "backend": forced.group("backend"),
+            "arch": forced.group("arch"),
+            "warp_size": int(forced.group("warp_size")),
+        }
+    salmon_target = _SALMON_TARGET_RE.search(log)
+    if salmon_target:
+        result["execution_target"] = {
+            "arch": salmon_target.group("arch"),
+            "wave_size": int(salmon_target.group("wave_size")),
+        }
+    return result
+
+
 def _classify_child_failure(mode: str, log: str) -> str:
+    if _resource_limit_failure(mode, log):
+        return "target-resource-limit"
     if "ReplayUnsupported" in log:
         return "replay-unsupported"
     if "ModuleNotFoundError" in log or "failed to specialize argument of type" in log:
@@ -448,15 +503,26 @@ def main() -> int:
     ap.add_argument("--atol", type=float, default=1e-2)
     ap.add_argument("--rtol", type=float, default=1e-2)
     ap.add_argument("--json", default="", help="optional JSONL result path")
+    ap.add_argument(
+        "--native-num-stages",
+        type=int,
+        help="override Triton num_stages for native replay",
+    )
+    ap.add_argument(
+        "--salmon-num-stages",
+        type=int,
+        help="override Triton num_stages for forced-target Salmon replay",
+    )
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--fixture", default="", help=argparse.SUPPRESS)
     ap.add_argument("--out", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--num-stages", type=int, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.child:
         if not args.fixture or not args.out:
             raise SystemExit("--child requires --fixture and --out")
-        return _run_child(Path(args.fixture), Path(args.out))
+        return _run_child(Path(args.fixture), Path(args.out), args.num_stages)
 
     if not args.fixtures:
         raise SystemExit("fixture file or directory is required")
@@ -477,14 +543,25 @@ def main() -> int:
             kernel = f"{data.get('module_name', '')}.{data.get('kernel_name', fixture.stem)}"
             native_out = tmpdir / f"{fixture.stem}.native.pt"
             salmon_out = tmpdir / f"{fixture.stem}.salmon.pt"
-            n_rc, n_log = _spawn("native", fixture, native_out, args.timeout)
+            n_rc, n_log = _spawn(
+                "native",
+                fixture,
+                native_out,
+                args.timeout,
+                num_stages=args.native_num_stages,
+            )
             if n_rc != 0:
                 result = {
                     "fixture": str(fixture),
                     "kernel": kernel,
-                    "status": _classify_child_failure("native", n_log),
+                    "native_num_stages": args.native_num_stages,
+                    "salmon_num_stages": args.salmon_num_stages,
                     "log": n_log[-4000:],
                 }
+                result.update(
+                    _resource_limit_failure("native", n_log)
+                    or {"status": _classify_child_failure("native", n_log)}
+                )
                 failures += 1
                 print(json.dumps(_jsonable(result), sort_keys=True))
                 if out_json:
@@ -492,18 +569,35 @@ def main() -> int:
                         f.write(json.dumps(_jsonable(result), sort_keys=True) + "\n")
                 continue
 
-            s_rc, s_log = _spawn("salmon", fixture, salmon_out, args.timeout)
+            s_rc, s_log = _spawn(
+                "salmon",
+                fixture,
+                salmon_out,
+                args.timeout,
+                num_stages=args.salmon_num_stages,
+            )
             if s_rc != 0:
                 result = {
                     "fixture": str(fixture),
                     "kernel": kernel,
-                    "status": _classify_child_failure("salmon", s_log),
+                    "native_num_stages": args.native_num_stages,
+                    "salmon_num_stages": args.salmon_num_stages,
                     "log": s_log[-4000:],
                 }
+                result.update(
+                    _resource_limit_failure("salmon", s_log)
+                    or {"status": _classify_child_failure("salmon", s_log)}
+                )
                 failures += 1
             else:
                 cmp_result = _compare_tensors(native_out, salmon_out, atol=args.atol, rtol=args.rtol)
-                result = {"fixture": str(fixture), "kernel": kernel, **cmp_result}
+                result = {
+                    "fixture": str(fixture),
+                    "kernel": kernel,
+                    "native_num_stages": args.native_num_stages,
+                    "salmon_num_stages": args.salmon_num_stages,
+                    **cmp_result,
+                }
                 failures += int(cmp_result["status"] != "pass")
             print(json.dumps(_jsonable(result), sort_keys=True))
             if out_json:

@@ -190,9 +190,15 @@ target_include_directories(hotswap-transpiler PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
 )
 
-# `llvm-mc`, `llvm-objdump` etc. live in the build tree's bin/.
+# `llc`, `llvm-mc`, `llvm-objdump` etc. live in the build tree's bin/.
+# ROCR's trap-handler subproject may require a ROCm Clang package even when
+# Salmon itself is validated against a local LLVM build, so keep the tool path
+# overrideable rather than deriving it unconditionally from the LLVM package
+# used for in-process linkage.
+set(HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR "${LLVM_TOOLS_BINARY_DIR}" CACHE PATH
+  "Directory containing llc, llvm-mc, llvm-objdump, and related LLVM tools used by Salmon")
 target_compile_definitions(hotswap-transpiler PRIVATE
-  LLVM_TOOLS_DIR="${LLVM_TOOLS_BINARY_DIR}"
+  LLVM_TOOLS_DIR="${HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR}"
 )
 
 target_link_libraries(hotswap-transpiler
