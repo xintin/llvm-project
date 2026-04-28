@@ -86,7 +86,13 @@ __device__ __forceinline__ v8i rfl_v8(v8i v) {
 __device__ __forceinline__ uint32_t count(v4i g0)               { return bits(g0[0], 0, 2); }
 __device__ __forceinline__ bool     gather_mode(v4i g0)         { return bits(g0[0], 31, 1); }
 __device__ __forceinline__ bool     gather_index_size32(v4i g0) { return bits(g0[0], 30, 1); }
-__device__ __forceinline__ uint32_t lds_addr(v4i g0)            { return (uint32_t)g0[1]; } // bytes
+// Group0 word1 carries the LDS byte address in its low 19 bits (MI450 SPG
+// Tensor DMA Resource Descriptor table for Dword1.BASE_ADDRESS). Higher bits
+// are descriptor control state, not address. Hardware masks them before
+// touching LDS; the emulation must do the same or a descriptor with bit 19 set
+// targets byte 0x80000 instead of byte 0. GPT-OSS upcast emits exactly that
+// flag combination while allocating only ~17 KiB of dynamic LDS.
+__device__ __forceinline__ uint32_t lds_addr(v4i g0)            { return (uint32_t)g0[1] & 0x7ffffu; }
 __device__ __forceinline__ uint64_t global_addr(v4i g0) {
   return (uint64_t)(uint32_t)g0[2] | ((uint64_t)bits(g0[3], 0, 25) << 32);
 }
@@ -205,7 +211,8 @@ __device__ __forceinline__ unsigned lane_id() {
 template <bool IsLoad, unsigned DS>
 __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
                                       unsigned group_base,
-                                      unsigned source_wave_size) {
+                                      unsigned source_wave_size,
+                                      unsigned target_lane) {
   // Coerce the wave-uniform descriptor into SGPRs so all derived
   // computations (V#, dims, strides, padding, lds_byte_off) stay in
   // the scalar pipe. The caller has already restricted hardware EXEC
@@ -220,7 +227,7 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
   if (count(g0) == 0)
     return;
 
-  const unsigned local_lane = lane_id() - group_base;
+  const unsigned local_lane = target_lane - group_base;
 
   const bool gm      = gather_mode(g0);
   const bool itr     = iterate_en(g1) && !gm;
@@ -315,11 +322,16 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
     }
   }
 
-  // Atomic barrier: the field stores bits [18:3] of a 64-bit-aligned
-  // LDS pointer, low 3 bits implied zero.
-  if (atomic_barrier_en(g1) && local_lane == 0) {
+  // Atomic barrier: the field stores bits [18:3] of a 64-bit-aligned LDS
+  // pointer, low 3 bits implied zero. The all-ones 16-bit field is the
+  // descriptor sentinel for "no per-tensor LDS mbarrier"; Triton uses it when
+  // the tensor op is synchronized by the surrounding `s_barrier_signal/wait`
+  // sequence instead. Treating the sentinel as a real address would issue an
+  // LDS atomic at byte 0x7fff8, far outside the dynamic LDS allocation.
+  const uint32_t barrier_addr = atomic_barrier_addr(g1);
+  if (atomic_barrier_en(g1) && barrier_addr != 0xffffu && local_lane == 0) {
     auto *bar = (__attribute__((address_space(3))) uint32_t *)
-                (uintptr_t)(atomic_barrier_addr(g1) << 3);
+                (uintptr_t)(barrier_addr << 3);
     __atomic_fetch_add(bar, 1u, __ATOMIC_RELEASE);
   }
 }
@@ -330,12 +342,13 @@ __device__ __forceinline__ void walk(v4i g0, v8i g1, v4i g2, v4i g3,
 template <bool IsLoad>
 __device__ __forceinline__ void dispatch_group(v4i g0, v8i g1, v4i g2, v4i g3,
                                                 unsigned group_base,
-                                                unsigned source_wave_size) {
+                                                unsigned source_wave_size,
+                                                unsigned target_lane) {
   switch (((unsigned)g1[0] >> 16) & 3u) {
-  case 0: walk<IsLoad, 1>(g0, g1, g2, g3, group_base, source_wave_size); return;
-  case 1: walk<IsLoad, 2>(g0, g1, g2, g3, group_base, source_wave_size); return;
-  case 2: walk<IsLoad, 4>(g0, g1, g2, g3, group_base, source_wave_size); return;
-  case 3: walk<IsLoad, 8>(g0, g1, g2, g3, group_base, source_wave_size); return;
+  case 0: walk<IsLoad, 1>(g0, g1, g2, g3, group_base, source_wave_size, target_lane); return;
+  case 1: walk<IsLoad, 2>(g0, g1, g2, g3, group_base, source_wave_size, target_lane); return;
+  case 2: walk<IsLoad, 4>(g0, g1, g2, g3, group_base, source_wave_size, target_lane); return;
+  case 3: walk<IsLoad, 8>(g0, g1, g2, g3, group_base, source_wave_size, target_lane); return;
   }
   __builtin_unreachable();
 }
@@ -344,8 +357,9 @@ template <bool IsLoad>
 __device__ __forceinline__ void dispatch(v4i g0, v8i g1, v4i g2, v4i g3,
                                           unsigned source_wave_size) {
   const unsigned target_wave_size = __builtin_amdgcn_wavefrontsize();
+  const unsigned target_lane = lane_id();
   if (source_wave_size == target_wave_size) {
-    dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, source_wave_size);
+    dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, source_wave_size, target_lane);
     return;
   }
 
@@ -353,10 +367,10 @@ __device__ __forceinline__ void dispatch(v4i g0, v8i g1, v4i g2, v4i g3,
   // Split the target wave into two divergent regions before uniformising
   // the descriptor so `readfirstlane` sees one source wave at a time.
   if (source_wave_size == 32u && target_wave_size == 64u) {
-    if (lane_id() < 32u)
-      dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, 32u);
+    if (target_lane < 32u)
+      dispatch_group<IsLoad>(g0, g1, g2, g3, 0u, 32u, target_lane);
     else
-      dispatch_group<IsLoad>(g0, g1, g2, g3, 32u, 32u);
+      dispatch_group<IsLoad>(g0, g1, g2, g3, 32u, 32u, target_lane);
     return;
   }
 

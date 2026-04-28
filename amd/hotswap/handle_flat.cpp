@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -68,6 +69,88 @@ int64_t firstScratchImm(const DecodedInst &di, OpResolver &op,
       return di.getImm(op.srcIdx(k));
   }
   return 0;
+}
+
+struct KernargGlobalLoad {
+  enum class Status { NotKernarg, Handled, Failed };
+  Status status = Status::NotKernarg;
+  Value *value = nullptr;
+};
+
+KernargGlobalLoad tryExtractKernargSaddrGlobalLoad(RaiseContext &ctx,
+                                                   const DecodedInst &di,
+                                                   OpResolver &op,
+                                                   unsigned saddrIdx,
+                                                   unsigned vaddrIdx,
+                                                   unsigned immStart,
+                                                   unsigned byteWidth,
+                                                   int64_t extraByteOffset,
+                                                   HandlerResult &hr) {
+  KernargGlobalLoad out;
+  if (ctx.userSgprLayout == nullptr)
+    report_fatal_error(
+        "transpiler: handle_flat: RaiseContext::userSgprLayout is null");
+  if (saddrIdx >= op.nSrcs() || vaddrIdx >= op.nSrcs() ||
+      !op.isSrcReg(saddrIdx) || !op.isSrcReg(vaddrIdx))
+    return out;
+
+  ParsedReg saddrPr = op.srcReg(saddrIdx);
+  ParsedReg vaddrPr = op.srcReg(vaddrIdx);
+  const int kaLo = ctx.userSgprLayout->kernargSegmentPtrSgpr;
+  if (saddrPr.kind != ParsedReg::SGPR || kaLo < 0 || saddrPr.baseIdx != kaLo)
+    return out;
+
+  auto fail = [&](const Twine &detail) {
+    hr.failure = RaiseFailure::unsupportedShape(di, "FLAT", detail);
+    out.status = KernargGlobalLoad::Status::Failed;
+    return out;
+  };
+
+  if (ctx.kernargPtrDelta.baseKind ==
+      RaiseContext::KernargPtrDelta::BaseKind::Unknown) {
+    return fail("GLOBAL_LOAD SADDR uses the source kernarg SGPR pair, but "
+                "its provenance is unknown at this load site; refusing to "
+                "fall through to the sentinel SGPR value");
+  }
+  if (ctx.kernargPtrDelta.baseKind !=
+      RaiseContext::KernargPtrDelta::BaseKind::Kernarg) {
+    return out;
+  }
+  if (ctx.kernargPtrDelta.pendingLow || !ctx.kernargPtrDelta.valid) {
+    return fail("GLOBAL_LOAD SADDR uses the source kernarg SGPR pair while "
+                "the kernarg delta tracker is not in a committed valid state");
+  }
+  if (vaddrPr.kind != ParsedReg::VGPR) {
+    return fail("GLOBAL_LOAD SADDR kernarg fast path expected a VGPR vaddr "
+                "operand");
+  }
+
+  // Source-level VGPR zero provenance, not raised-IR alloca peeking. The source
+  // instruction is still EXEC-gated later by emitUnderExec; the fact we need
+  // here is exactly that every active source lane sees vaddr == 0.
+  if (!ctx.isVgprKnownZero(vaddrPr)) {
+    return fail("GLOBAL_LOAD SADDR through the kernarg pointer has a dynamic "
+                "VGPR offset; Salmon can only extract static kernarg bytes "
+                "from this sentinel-modeled pointer");
+  }
+
+  const int64_t byteOffset =
+      ctx.kernargPtrDelta.delta + firstScratchImm(di, op, immStart) +
+      extraByteOffset;
+  if (byteOffset < 0 || byteOffset > std::numeric_limits<int>::max()) {
+    return fail(Twine("GLOBAL_LOAD SADDR kernarg byte offset ") +
+                Twine(byteOffset) + " is outside the supported int range");
+  }
+
+  std::string why;
+  out.value = extractKernargBytesAsI32(ctx.kernargs, ctx.B, ctx.kernel,
+                                       static_cast<int>(byteOffset),
+                                       byteWidth, &why);
+  if (!out.value) {
+    return fail(Twine("GLOBAL_LOAD SADDR kernarg extraction failed: ") + why);
+  }
+  out.status = KernargGlobalLoad::Status::Handled;
+  return out;
 }
 
 std::string formatScratchAbiDetail(RaiseContext &ctx, const Twine &why) {
@@ -366,6 +449,25 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     FlatAddr fa = decodeGlobalLoadAddr(ctx, di, op, isByte ? 1 : 2,
                                         "GLOBAL_LOAD sub-dword");
     Value *addr = fa.ptr;
+    Value *kernargExt = nullptr;
+    if (fa.hasSaddr) {
+      auto ka = tryExtractKernargSaddrGlobalLoad(
+          ctx, di, op, /*saddrIdx=*/0, /*vaddrIdx=*/1, /*immStart=*/2,
+          isByte ? 1 : 2, /*extraByteOffset=*/0, hr);
+      if (ka.status == KernargGlobalLoad::Status::Failed)
+        return hr;
+      if (ka.status == KernargGlobalLoad::Status::Handled) {
+        kernargExt = ka.value;
+        bool isUnsigned = sop == SemOp::GLOBAL_LOAD_UBYTE ||
+                          sop == SemOp::GLOBAL_LOAD_USHORT;
+        if (!isUnsigned) {
+          unsigned shift = isByte ? 24 : 16;
+          kernargExt =
+              ctx.B.CreateAShr(ctx.B.CreateShl(kernargExt, shift), shift,
+                               "ka_sext");
+        }
+      }
+    }
     // SPE-gate the memory access itself, not just the VGPR write-back.
     // The store counterparts (GLOBAL_STORE_*, ~line 196 below) are
     // already wrapped in `emitUnderExec`; the asymmetric pre-2026-04-22
@@ -381,12 +483,17 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     // `ctx.writeReg32` (which would wrap the write in a nested
     // `emitUnderExec` — harmless but redundant IR).
     ctx.emitUnderExec([&] {
-      Value *loaded = ctx.B.CreateAlignedLoad(loadTy, addr, loadAlign,
-                                               "gload_sub");
       bool isUnsigned = sop == SemOp::GLOBAL_LOAD_UBYTE ||
                         sop == SemOp::GLOBAL_LOAD_USHORT;
-      Value *ext = isUnsigned ? ctx.B.CreateZExt(loaded, ctx.i32Ty)
-                              : ctx.B.CreateSExt(loaded, ctx.i32Ty);
+      Value *ext = nullptr;
+      if (kernargExt)
+        ext = kernargExt;
+      if (!ext) {
+        Value *loaded = ctx.B.CreateAlignedLoad(loadTy, addr, loadAlign,
+                                                "gload_sub");
+        ext = isUnsigned ? ctx.B.CreateZExt(loaded, ctx.i32Ty)
+                         : ctx.B.CreateSExt(loaded, ctx.i32Ty);
+      }
       if (sop == SemOp::GLOBAL_LOAD_SHORT_D16_HI) {
         Value *prev = ctx.regs.readReg32(ctx.B, dest);
         ext = ctx.B.CreateOr(
@@ -411,6 +518,24 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     FlatAddr fa = decodeGlobalLoadAddr(ctx, di, op, loadDwords * 4,
                                         "GLOBAL_LOAD dword");
     Value *addr = fa.ptr;
+    SmallVector<Value *, 4> kernargDwords;
+    bool useKernargDwords = false;
+    if (fa.hasSaddr) {
+      useKernargDwords = true;
+      for (int d = 0; d < loadDwords; d++) {
+        auto ka = tryExtractKernargSaddrGlobalLoad(
+            ctx, di, op, /*saddrIdx=*/0, /*vaddrIdx=*/1, /*immStart=*/2, 4,
+            /*extraByteOffset=*/d * 4, hr);
+        if (ka.status == KernargGlobalLoad::Status::Failed)
+          return hr;
+        if (ka.status == KernargGlobalLoad::Status::NotKernarg) {
+          useKernargDwords = false;
+          kernargDwords.clear();
+          break;
+        }
+        kernargDwords.push_back(ka.value);
+      }
+    }
 
     // Same SPE-gating rationale as the GLOBAL_LOAD sub-dword block
     // above: without `emitUnderExec` wrapping the `CreateLoad`, every
@@ -421,6 +546,15 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     // single load + N extract-write pairs all go inside one
     // emitUnderExec block so inactive lanes skip the whole sequence.
     ctx.emitUnderExec([&] {
+      if (useKernargDwords) {
+        for (int d = 0; d < loadDwords; d++) {
+          ParsedReg sub = dest;
+          sub.baseIdx = dest.baseIdx + d;
+          sub.width = 1;
+          ctx.regs.writeReg32(ctx.B, sub, kernargDwords[d]);
+        }
+        return;
+      }
       if (loadDwords == 1) {
         ctx.regs.writeReg32(
             ctx.B, dest,

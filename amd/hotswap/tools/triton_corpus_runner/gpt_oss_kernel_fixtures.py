@@ -7,6 +7,12 @@ module/function name, launch grid, constexpr kwargs, and CPU copies of tensor
 arguments before and after the launch.  They are intended to be replayed by
 ``tools/compare_correctness/gpt_oss_fixture_replay.py``.
 
+For kernels that fault before the normal post-launch capture can complete,
+``GPT_OSS_KERNEL_FIXTURE_PRELAUNCH_ONLY=1`` writes a fixture before executing
+the launch.  Such fixtures intentionally have ``capture_phase="prelaunch"``
+and an empty ``args_after`` list: they identify and replay the faulting launch,
+but they are not a post-launch correctness oracle by themselves.
+
 The hook is deliberately disabled by default.  When enabled, capture failures
 raise immediately: a partially written fixture is worse than no fixture because
 it can create false confidence in a correctness run.
@@ -51,6 +57,10 @@ def _max_tensor_bytes() -> int:
     # Large enough for the first GPT-OSS fixtures, but finite so accidental
     # full-model tensors fail loudly instead of filling /tmp.
     return int(raw) if raw else 512 * 1024 * 1024
+
+
+def _prelaunch_only() -> bool:
+    return _truthy("GPT_OSS_KERNEL_FIXTURE_PRELAUNCH_ONLY")
 
 
 def _sanitize(s: str) -> str:
@@ -345,12 +355,6 @@ def install() -> None:
             _arg_payload(arg, phase="before", kernel_name=kernel_name, arg_index=i)
             for i, arg in enumerate(args)
         ]
-        result = original_run(self, *args, **kwargs)
-        torch.cuda.synchronize()
-        after = [
-            _after_arg_payload(arg, before[i], kernel_name=kernel_name, arg_index=i)
-            for i, arg in enumerate(args)
-        ]
 
         payload = {
             "schema_version": SCHEMA_VERSION,
@@ -369,13 +373,26 @@ def install() -> None:
             "kwargs": {k: _jsonable(v) for k, v in kwargs.items() if k not in {"grid", "warmup"}},
             "warmup": _jsonable(kwargs.get("warmup")),
             "args_before": before,
-            "args_after": after,
+            "args_after": [],
         }
         base = f"{_sanitize(module_name)}.{_sanitize(kernel_name)}.{os.getpid()}.{ordinal:03d}"
         tmp = out_dir / f".{base}.tmp.pt"
         final = out_dir / f"{base}.pt"
-        torch.save(payload, tmp)
-        os.replace(tmp, final)
+        if _prelaunch_only():
+            payload["capture_phase"] = "prelaunch"
+            torch.save(payload, tmp)
+            os.replace(tmp, final)
+            after = []
+        else:
+            result = original_run(self, *args, **kwargs)
+            torch.cuda.synchronize()
+            after = [
+                _after_arg_payload(arg, before[i], kernel_name=kernel_name, arg_index=i)
+                for i, arg in enumerate(args)
+            ]
+            payload["args_after"] = after
+            torch.save(payload, tmp)
+            os.replace(tmp, final)
 
         manifest = out_dir / "manifest.jsonl"
         event = {
@@ -388,6 +405,8 @@ def install() -> None:
         }
         with manifest.open("a") as f:
             f.write(json.dumps(event, sort_keys=True) + "\n")
+        if _prelaunch_only():
+            return original_run(self, *args, **kwargs)
         return result
 
     JITFunction.run = _patched_run

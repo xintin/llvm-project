@@ -9,20 +9,20 @@
 ; The gfx1250 TENSOR cnt unit (`MIMGInstructions.td:2049-2113`,
 ; `let SubtargetPredicate = isGFX125xOnly`) has no native equivalent
 ; on gfx942 and the matching LLVM intrinsic is also gated
-; isGFX125xOnly. Cross-target lifts therefore call the link-merged
-; TDM runtime helper instead of emitting the intrinsic directly. This
+; isGFX125xOnly. Cross-target lifts therefore route through the
+; link-merged TDM runtime helper instead of emitting the intrinsic
+; directly. The helper is inlined before codegen so the final kernel
+; does not acquire a device-call/private-segment ABI dependency. This
 ; fixture is gated on `tdm-runtime`; no-runtime builds keep the
-; handler's loud refusal path and skip this helper-call test.
+; handler's loud refusal path and skip this helper test.
 ;
-; Cross-target helper call: _d2 supplies groups 0/1, zero-fills
-; groups 2/3, and passes the source wave size to the runtime helper.
-; IR-XT: call void @salmon_tdm_load_to_lds(
-; IR-XT-SAME: <4 x i32> %td_grp0
-; IR-XT-SAME: <8 x i32> %td_grp1
-; IR-XT-SAME: <4 x i32> zeroinitializer
-; IR-XT-SAME: <4 x i32> zeroinitializer
-; IR-XT-SAME: i32 32
-; IR-XT-SAME: )
+; Cross-target helper lowering: the helper bitcode is present, but the
+; kernel body contains the inlined TDM walk and no direct helper call.
+; IR-XT: @llvm.compiler.used
+; IR-XT-SAME: @salmon_tdm_load_to_lds
+; IR-XT-LABEL: define amdgpu_kernel void @tensor_load_to_lds_kernel
+; IR-XT-NOT: call void @salmon_tdm_load_to_lds(
+; IR-XT: salmon_tdm_load_to_lds.exit:
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx1250 --emit-ir=tensor_load_to_lds_kernel 2>&1 | %FileCheck %s --check-prefix=IR

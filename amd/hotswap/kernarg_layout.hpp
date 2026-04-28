@@ -95,6 +95,22 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
                                  int byteOffset,
                                  std::string *whyNot = nullptr);
 
+// Materialise an integer load of `byteWidth` bytes from the kernarg segment at
+// an arbitrary byte offset. This is stricter generalisation of
+// `extractKernargDword`: it assembles the low-order bytes from one or more
+// dword extractions and therefore supports unaligned GLOBAL_LOAD SADDR forms
+// that read descriptor fields directly from the kernarg buffer.
+//
+// `byteWidth` must be 1, 2, or 4. The returned value is always i32 with the
+// loaded bytes in little-endian low-bit order; callers perform sign/zero
+// extension interpretation as needed.
+llvm::Value *extractKernargBytesAsI32(const KernargLayout &layout,
+                                      llvm::IRBuilder<> &B,
+                                      llvm::Function *F,
+                                      int byteOffset,
+                                      unsigned byteWidth,
+                                      std::string *whyNot = nullptr);
+
 enum class PreloadedHiddenKernargDword {
   NotHidden,
   HiddenBlockCountX,

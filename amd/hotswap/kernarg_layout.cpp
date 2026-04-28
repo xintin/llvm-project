@@ -179,4 +179,47 @@ llvm::Value *extractKernargDword(const KernargLayout &layout,
   return nullptr;
 }
 
+llvm::Value *extractKernargBytesAsI32(const KernargLayout &layout,
+                                      llvm::IRBuilder<> &B,
+                                      llvm::Function *F,
+                                      int byteOffset,
+                                      unsigned byteWidth,
+                                      std::string *whyNot) {
+  Type *i32Ty = B.getInt32Ty();
+  if (byteWidth != 1 && byteWidth != 2 && byteWidth != 4) {
+    if (whyNot)
+      *whyNot = "unsupported kernarg byte load width " +
+                std::to_string(byteWidth) + " at byte offset " +
+                std::to_string(byteOffset);
+    return nullptr;
+  }
+
+  Value *assembled = ConstantInt::get(i32Ty, 0);
+  for (unsigned i = 0; i < byteWidth; ++i) {
+    const int absoluteByte = byteOffset + static_cast<int>(i);
+    const int dwordOffset = absoluteByte & ~3;
+    const unsigned byteInDword = static_cast<unsigned>(absoluteByte - dwordOffset);
+
+    std::string dwordWhy;
+    Value *dw = extractKernargDword(layout, B, F, dwordOffset, &dwordWhy);
+    if (!dw) {
+      if (whyNot) {
+        *whyNot = "failed to extract byte " + std::to_string(i) +
+                  " of " + std::to_string(byteWidth) +
+                  " for kernarg byte load at offset " +
+                  std::to_string(byteOffset) + ": " + dwordWhy;
+      }
+      return nullptr;
+    }
+
+    Value *byte = B.CreateAnd(
+        B.CreateLShr(dw, byteInDword * 8, "ka_byte_lshr"),
+        ConstantInt::get(i32Ty, 0xff), "ka_byte");
+    if (i != 0)
+      byte = B.CreateShl(byte, i * 8, "ka_byte_shl");
+    assembled = B.CreateOr(assembled, byte, "ka_bytes");
+  }
+  return assembled;
+}
+
 } // namespace transpiler

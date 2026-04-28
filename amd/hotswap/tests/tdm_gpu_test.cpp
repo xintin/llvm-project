@@ -194,6 +194,43 @@ TEST(TdmRuntime, LinkerWiring) {
          "— the embedded bitcode does not define it.";
 }
 
+TEST(TdmRuntime, LinkerInlinesKernelCallSites) {
+  if (!transpiler::tdmRuntimeAvailable())
+    GTEST_SKIP() << "TDM runtime bitcode not embedded "
+                    "(transpiler built without hipcc).";
+
+  llvm::LLVMContext C;
+  llvm::Module M("tdm_inline_probe", C);
+  M.setTargetTriple(llvm::Triple("amdgcn-amd-amdhsa"));
+
+  auto *kernelTy = llvm::FunctionType::get(llvm::Type::getVoidTy(C), false);
+  auto *kernel = llvm::Function::Create(
+      kernelTy, llvm::GlobalValue::ExternalLinkage, "tdm_inline_probe", M);
+  kernel->setCallingConv(llvm::CallingConv::AMDGPU_KERNEL);
+
+  llvm::IRBuilder<> B(llvm::BasicBlock::Create(C, "entry", kernel));
+  auto *i32 = llvm::Type::getInt32Ty(C);
+  auto *v4i = llvm::FixedVectorType::get(i32, 4);
+  auto *v8i = llvm::FixedVectorType::get(i32, 8);
+  B.CreateCall(transpiler::declareTDMLoad(M),
+               {llvm::Constant::getNullValue(v4i),
+                llvm::Constant::getNullValue(v8i),
+                llvm::Constant::getNullValue(v4i),
+                llvm::Constant::getNullValue(v4i), B.getInt32(32)});
+  B.CreateRetVoid();
+
+  ASSERT_TRUE(transpiler::linkTDMRuntime(M, "gfx942"))
+      << "linkTDMRuntime failed; check transpiler stderr above.";
+  ASSERT_FALSE(llvm::verifyModule(M, &llvm::errs()));
+
+  std::string ir;
+  llvm::raw_string_ostream os(ir);
+  M.print(os, nullptr);
+  EXPECT_EQ(ir.find("call void @salmon_tdm_load_to_lds"), std::string::npos)
+      << "TDM helper calls must be inlined before codegen so translated "
+         "kernels do not acquire a device-call private-segment ABI dependency.";
+}
+
 // ============================================================================
 // End-to-end: any gfx1250 test kernel that uses TDM must raise to gfx942
 // and the emitted IR must reference the helper symbol. When HIP is
@@ -350,13 +387,21 @@ TDMDescriptor buildDescriptor(uint64_t global_addr, int rank,
 
   // Group 0.
   d.g0[0] = 0x00000001u;                          // count=1
-  d.g0[1] = 0u;                                   // lds_byte_addr
+  // Bit 19 is a descriptor flag, not part of the LDS byte address. Keep it set
+  // in the regression descriptor so the emulation path must mask address bits
+  // the same way gfx1250 hardware does.
+  d.g0[1] = 0x80000u;                             // lds_byte_addr | flag
   d.g0[2] = (uint32_t)(global_addr & 0xffffffffu);
   d.g0[3] = (uint32_t)((global_addr >> 32) & 0x01ffffffu);
 
   // Group 1.
-  d.g1[0] = 2u << 16;                             // data_size_log2 = 2
-  d.g1[1] = (T0 & 0xffffu) << 16;                 // tensor_dim0 low 16
+  // Enable the descriptor barrier with the all-ones address sentinel. Triton
+  // emits this around tensor ops that use explicit s_barrier_signal/wait, and
+  // the emulation path must not turn the sentinel into an LDS atomic at
+  // byte 0x7fff8. SourceWaveLocalDescriptors below still covers a real LDS
+  // barrier address.
+  d.g1[0] = (2u << 16) | (1u << 18);              // data_size_log2 = 2, barrier sentinel
+  d.g1[1] = 0xffffu | ((T0 & 0xffffu) << 16);     // barrier sentinel + tensor_dim0 low 16
   d.g1[2] = ((T0 >> 16) & 0xffffu)                // tensor_dim0 high 16
           | ((T1 & 0xffffu) << 16);               // tensor_dim1 low 16
   d.g1[3] = ((T1 >> 16) & 0xffffu)                // tensor_dim1 high 16

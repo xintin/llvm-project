@@ -1970,6 +1970,10 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
       // See `RaiseContext::KernargPtrDelta` and
       // `resetKernargPtrDeltaAtBBBoundary` for the full contract.
       ctx.resetKernargPtrDeltaAtBBBoundary(di.offset);
+      // VGPR zero facts are source-BB local. They intentionally do not merge
+      // across control-flow joins; consumers that need a zero VGPR offset must
+      // see the defining zero write in the same source basic block.
+      ctx.clearVgprZeroProvenance();
     }
 
     ctx.computeVGPRAdjust(di);
@@ -2133,6 +2137,17 @@ static RaiseResult raiseToIRImpl(const std::vector<uint8_t> &textBytes,
         const int kaLo = ctx.userSgprLayout->kernargSegmentPtrSgpr;
         if (kaLo >= 0)
           KernargSgprProvenanceUpdater(ctx, di, op, kaLo).update();
+      }
+      if (di.numDefs > 0 && di.isReg(0)) {
+        ParsedReg dst = op.dst();
+        if (dst.kind == ParsedReg::VGPR) {
+          bool knownZero = false;
+          if (di.semOp == SemOp::V_MOV_B32 && di.numSrcs >= 1) {
+            unsigned src0 = di.srcMap[0];
+            knownZero = di.isImm(src0) && di.getImm(src0) == 0;
+          }
+          ctx.setVgprZeroProvenance(dst, knownZero);
+        }
       }
       raisedCount++;
       continue;

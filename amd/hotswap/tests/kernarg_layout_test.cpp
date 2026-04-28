@@ -7,6 +7,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <initializer_list>
 #include <string>
@@ -16,6 +17,7 @@ using transpiler::KernelArgMeta;
 using transpiler::KernargLayout;
 using transpiler::PreloadedHiddenKernargDword;
 using transpiler::classifyPreloadedHiddenKernargDword;
+using transpiler::extractKernargBytesAsI32;
 using transpiler::extractKernargDword;
 
 namespace {
@@ -135,4 +137,42 @@ TEST(KernargLayout, TreatsVectorLoadDwordAtSegmentEndAsUndefPadding) {
 
   ASSERT_NE(value, nullptr) << why;
   EXPECT_TRUE(llvm::isa<llvm::UndefValue>(value));
+}
+
+TEST(KernargLayout, ExtractsUnalignedBytesAcrossDwordBoundary) {
+  KernargDwordFixture ir({32, 32});
+  KernargLayout layout;
+  layout.params.push_back({0, 4, 0, false});
+  layout.params.push_back({4, 4, 1, false});
+  layout.kernargSegmentSize = 8;
+
+  std::string why;
+  llvm::Value *value =
+      extractKernargBytesAsI32(layout, ir.B, ir.F, 2, 4, &why);
+
+  ASSERT_NE(value, nullptr) << why;
+  EXPECT_TRUE(value->getType()->isIntegerTy(32));
+
+  std::string irText;
+  llvm::raw_string_ostream os(irText);
+  ir.M.print(os, nullptr);
+  os.flush();
+  EXPECT_NE(irText.find("%0"), std::string::npos)
+      << "low bytes should come from first dword";
+  EXPECT_NE(irText.find("%1"), std::string::npos)
+      << "high bytes should come from second dword";
+}
+
+TEST(KernargLayout, RefusesUnsupportedByteLoadWidth) {
+  KernargDwordFixture ir({32});
+  KernargLayout layout;
+  layout.params.push_back({0, 4, 0, false});
+  layout.kernargSegmentSize = 4;
+
+  std::string why;
+  llvm::Value *value =
+      extractKernargBytesAsI32(layout, ir.B, ir.F, 0, 3, &why);
+
+  EXPECT_EQ(value, nullptr);
+  EXPECT_NE(why.find("unsupported kernarg byte load width"), std::string::npos);
 }

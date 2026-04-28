@@ -4,17 +4,16 @@
 ;
 ; VIMAGE TENSOR `tensor_store_from_lds_d2` cross-target fixture. The load
 ; direction is covered by `tensor_load_to_lds.s`; this sibling pins that
-; the same `marshalTDMArgs` path dispatches stores to
-; `salmon_tdm_store_from_lds` rather than accidentally reusing the load
-; helper.
+; the same `marshalTDMArgs` path dispatches stores through the
+; `salmon_tdm_store_from_lds` runtime body rather than accidentally reusing
+; the load helper. The helper is inlined before codegen so the final kernel
+; does not acquire a device-call/private-segment ABI dependency.
 
-; IR: call void @salmon_tdm_store_from_lds(
-; IR-SAME: <4 x i32> %td_grp0
-; IR-SAME: <8 x i32> %td_grp1
-; IR-SAME: <4 x i32> zeroinitializer
-; IR-SAME: <4 x i32> zeroinitializer
-; IR-SAME: i32 32
-; IR-SAME: )
+; IR: @llvm.compiler.used
+; IR-SAME: @salmon_tdm_store_from_lds
+; IR-LABEL: define amdgpu_kernel void @tensor_store_from_lds_kernel
+; IR-NOT: call void @salmon_tdm_store_from_lds(
+; IR: salmon_tdm_store_from_lds.exit:
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

@@ -20,6 +20,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCRegister.h"
 
+#include <algorithm>
 #include <map>
 
 namespace transpiler {
@@ -211,6 +212,12 @@ struct RaiseContext {
     uint8_t subDword = 0; // 0 = low, 1 = high when kind == Kernarg.
   };
   llvm::SmallVector<SgprKernargProvenance> sgprKernargProvenance;
+  // Single-source-BB, source-lane-scoped VGPR zero facts. This is deliberately
+  // narrow: it exists so GLOBAL_LOAD SADDR can prove a kernarg-pointer load has
+  // a static zero VGPR offset without looking through raised-IR alloca
+  // dominance. Facts are cleared at source BB boundaries and updated only by
+  // the post-handler hook in raiser.cpp.
+  llvm::SmallVector<uint8_t> vgprKnownZero;
   // BB starts whose only predecessor is the immediately preceding block in
   // source address order. The raiser processes those blocks immediately after
   // their sole predecessor, so carrying the single-BB provenance state across
@@ -221,6 +228,7 @@ struct RaiseContext {
 
   void initializeSgprKernargProvenance() {
     sgprKernargProvenance.assign(regs.sgpr.size(), SgprKernargProvenance{});
+    vgprKnownZero.assign(regs.vgpr.size(), 0);
     if (userSgprLayout == nullptr)
       return;
 
@@ -238,6 +246,27 @@ struct RaiseContext {
             SgprKernargProvenance::Kind::NonKernarg;
       }
     }
+  }
+
+  void clearVgprZeroProvenance() {
+    std::fill(vgprKnownZero.begin(), vgprKnownZero.end(), 0);
+  }
+
+  void setVgprZeroProvenance(ParsedReg pr, bool knownZero) {
+    if (pr.kind != ParsedReg::VGPR)
+      return;
+    int width = std::max(pr.width, 1);
+    for (int i = 0; i < width; ++i) {
+      int idx = pr.baseIdx + i;
+      if (idx >= 0 && static_cast<size_t>(idx) < vgprKnownZero.size())
+        vgprKnownZero[idx] = knownZero ? 1 : 0;
+    }
+  }
+
+  bool isVgprKnownZero(ParsedReg pr) const {
+    return pr.kind == ParsedReg::VGPR && pr.width <= 1 && pr.baseIdx >= 0 &&
+           static_cast<size_t>(pr.baseIdx) < vgprKnownZero.size() &&
+           vgprKnownZero[pr.baseIdx] != 0;
   }
 
   void setKernargPairProvenance(KernargPtrDelta::BaseKind kind,
