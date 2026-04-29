@@ -4,10 +4,10 @@
 #include "decoded_inst.hpp"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
-#include <map>
 #include <set>
 #include <string>
 
@@ -102,7 +102,7 @@ struct SetPcCallSiteInfo {
 
 struct SetPcAnalysis {
   // Keyed by the s_set_pc_i64 instruction's absolute kernel offset.
-  std::map<uint64_t, SetPcSiteInfo> setpcSites;
+  llvm::DenseMap<uint64_t, SetPcSiteInfo> setpcSites;
 
   // Chain-terminator hooks: keyed by the absolute offset of the
   // s_add_co_ci_u32 (high-half add) that completes a call-site PC
@@ -123,7 +123,7 @@ struct SetPcAnalysis {
   // crashed AMDGPU ISel with `Cannot select: BlockAddress`; see
   // `emitEnumeratedDispatch` in handle_sop1.cpp for the full
   // rationale.)
-  std::map<uint64_t, SetPcCallSiteInfo> chainTerminators;
+  llvm::DenseMap<uint64_t, SetPcCallSiteInfo> chainTerminators;
 
   // Block-start offsets newly discovered by this analysis: Pattern A
   // direct targets + Pattern B return targets. Caller merges these
