@@ -5,6 +5,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
@@ -128,7 +129,7 @@ struct SetPcAnalysis {
   // Block-start offsets newly discovered by this analysis: Pattern A
   // direct targets + Pattern B return targets. Caller merges these
   // into the overall blockStarts BEFORE basic-block layout.
-  std::set<uint64_t> extraBlockStarts;
+  llvm::DenseSet<uint64_t> extraBlockStarts;
 };
 
 // Run the analysis. `blockStarts` is the set of leaders the decoder
