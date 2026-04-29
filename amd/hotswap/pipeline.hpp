@@ -1,6 +1,7 @@
 #ifndef HOTSWAP_TRANSPILER_PIPELINE_HPP
 #define HOTSWAP_TRANSPILER_PIPELINE_HPP
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -80,7 +81,7 @@ struct PipelineResult {
 /// under standard conversions).  Callers repeat the ISA string
 /// instead; the ~5 single-ISA call sites that did this pre-fix are
 /// all updated to the two-string form.
-PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
+PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
                            llvm::StringRef sourceISA,
                            llvm::StringRef targetISA,
                            llvm::StringRef kernelName,
@@ -91,7 +92,7 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
 /// HSACO containing every kernel.  Returns success only if every kernel was
 /// raised and compiled. On raise failure, the `fail*` fields carry the
 /// structured `RaiseFailure` details for proof logs and corpus summaries.
-PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
+PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      llvm::StringRef sourceISA,
                                      llvm::StringRef targetISA,
                                      bool enableWritelaneRewrite = true,

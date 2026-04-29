@@ -4,6 +4,7 @@
 #include "code_object_utils.hpp"
 #include "raise_failure.hpp"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <memory>
@@ -98,7 +99,7 @@ struct RaiseResult {
 // fixtures that pin MODREP-shape IR invariants) rely on. If a
 // future need for a global toggle arises, add a proper
 // `PipelineConfig` field.
-RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
+RaiseResult raiseToIR(llvm::ArrayRef<uint8_t> textBytes,
                       llvm::StringRef sourceISA,
                       llvm::StringRef kernelName,
                       const KernelMeta &meta,

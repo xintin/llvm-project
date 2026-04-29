@@ -1,6 +1,7 @@
 #ifndef HOTSWAP_TRANSPILER_CODE_OBJECT_UTILS_HPP
 #define HOTSWAP_TRANSPILER_CODE_OBJECT_UTILS_HPP
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <cstdint>
@@ -90,11 +91,11 @@ struct KernelMeta {
 };
 
 std::vector<uint8_t> readFile(llvm::StringRef path);
-TextSection extractTextSection(const std::vector<uint8_t> &elfData);
-std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData);
-KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
+TextSection extractTextSection(llvm::ArrayRef<uint8_t> elfData);
+std::vector<std::string> listKernelNames(llvm::ArrayRef<uint8_t> elfData);
+KernelMeta extractKernelMeta(llvm::ArrayRef<uint8_t> elfData,
                              llvm::StringRef kernelName);
-uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
+uint64_t findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
                                 llvm::StringRef kernelName);
 
 // Read the AMDGPU target ISA name (e.g. "gfx1250", "gfx942") encoded in
@@ -105,7 +106,7 @@ uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
 // codes), or when the file is not an AMDGPU ELF. Callers that have no
 // other ISA source (e.g. raise_cli when the filename lacks `gfx*`)
 // should treat an empty return as a hard failure rather than guessing.
-std::string detectIsaFromElf(const std::vector<uint8_t> &elfData);
+std::string detectIsaFromElf(llvm::ArrayRef<uint8_t> elfData);
 
 } // namespace transpiler
 

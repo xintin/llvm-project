@@ -159,7 +159,7 @@ std::vector<uint8_t> readFile(llvm::StringRef path) {
   return data;
 }
 
-TextSection extractTextSection(const std::vector<uint8_t> &elfData) {
+TextSection extractTextSection(llvm::ArrayRef<uint8_t> elfData) {
   TextSection result;
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
@@ -189,7 +189,7 @@ TextSection extractTextSection(const std::vector<uint8_t> &elfData) {
   return result;
 }
 
-std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
+std::vector<std::string> listKernelNames(llvm::ArrayRef<uint8_t> elfData) {
   std::vector<std::string> names;
 
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
@@ -272,7 +272,7 @@ std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
   return names;
 }
 
-KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
+KernelMeta extractKernelMeta(llvm::ArrayRef<uint8_t> elfData,
                              llvm::StringRef kernelName) {
   KernelMeta meta;
 
@@ -409,7 +409,7 @@ KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
   return meta;
 }
 
-uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
+uint64_t findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
                                 llvm::StringRef kernelName) {
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
@@ -456,7 +456,7 @@ uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
   return 0;
 }
 
-std::string detectIsaFromElf(const std::vector<uint8_t> &elfData) {
+std::string detectIsaFromElf(llvm::ArrayRef<uint8_t> elfData) {
   // Read the EI_CLASS / e_machine / e_flags fields straight off the
   // ELF64 header rather than building a full ObjectFile — this is
   // called from raise_cli BEFORE we have a CO opened, and we want

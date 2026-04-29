@@ -208,7 +208,7 @@ bool isStrictMode() {
 // Raise one kernel to IR, compile to a relocatable .o via llc + llvm-mc.
 // On success, writes the .o to objPath and returns true.
 static bool raiseAndCompileKernel(const TextSection &text,
-                                  const std::vector<uint8_t> &codeObjectData,
+                                  llvm::ArrayRef<uint8_t> codeObjectData,
                                   llvm::StringRef kernelName,
                                   llvm::StringRef sourceISA,
                                   llvm::StringRef targetISA,
@@ -347,7 +347,7 @@ void collectTargetPrivateSegmentMetadata(PipelineResult &result,
   }
 }
 
-PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
+PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
                            llvm::StringRef sourceISA,
                            llvm::StringRef targetISA,
                            llvm::StringRef kernelName,
@@ -396,7 +396,7 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
   return result;
 }
 
-PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
+PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      llvm::StringRef sourceISA,
                                      llvm::StringRef targetISA,
                                      bool enableWritelaneRewrite,
