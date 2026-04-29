@@ -824,6 +824,108 @@ Recipe makeCanaryReadlaneLastLaneRecipe() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Recipe: canary_issue20_wave_parity — issue #20 hard-coded wave-size guard
+//
+// Pins the exact Tensile/TDM warp-specialisation shape from
+// martin-luecke/rocm-systems#20:
+//   v_readfirstlane_b32 sTmp, vThreadId
+//   s_lshr_b32          sTmp, sTmp, 5
+//   s_bitcmp1_b32       sTmp, 0
+//   s_cbranch_scc1      oddPath
+//
+// Gold semantics = gfx1250 wave32 source behaviour.  For a 128-thread block,
+// source waves alternate parity by 32-lane groups:
+//   lanes  0..31  -> even path
+//   lanes 32..63  -> odd path
+//   lanes 64..95  -> even path
+//   lanes 96..127 -> odd path
+//
+// A native gfx942 compile is expected to be WRONG 64/128 per block: wave64
+// has one scalar `readfirstlane` value for lanes 0..63 and one for 64..127,
+// so both target waves compute an even `thread_id >> 5` parity.  Salmon must
+// preserve the original wave32 source-wave partition while running on wave64.
+// ─────────────────────────────────────────────────────────────────────────────
+
+Recipe makeCanaryIssue20WaveParityRecipe() {
+  Recipe r;
+  r.name = "canary_issue20_wave_parity";
+  r.defaultNs = {128, 256, 1024};
+  r.defaultBlocks = {128};
+  r.validate = [](int N, int blockSize) -> std::optional<std::string> {
+    if (blockSize != 128)
+      return std::string("blockSize must be 128: issue #20's parity split "
+                         "requires four packed source wave32s per workgroup");
+    if (N % blockSize != 0)
+      return std::string("N must be a multiple of blockSize so every "
+                         "workgroup has the full even/odd/even/odd pattern");
+    return std::nullopt;
+  };
+  r.outputElemBytes = sizeof(uint32_t);
+  r.outputElems = [](int N, int) { return N; };
+  r.makeInput = [](int) { return std::vector<uint8_t>{0}; };
+  r.cpuReference = [](const std::vector<uint8_t> &, int N, int blockSize) {
+    std::vector<uint8_t> out(N * sizeof(uint32_t));
+    auto *o = reinterpret_cast<uint32_t *>(out.data());
+    for (int tid = 0; tid < N; ++tid) {
+      int laneInBlock = tid % blockSize;
+      bool oddSourceWave = ((laneInBlock / 32) & 1) != 0;
+      uint32_t base = oddSourceWave ? 0xB0000000u : 0xA0000000u;
+      o[tid] = base | static_cast<uint32_t>(tid);
+    }
+    return out;
+  };
+  r.dispatch = [](hipModule_t mod, const std::vector<uint8_t> &, int N,
+                  int blockSize) {
+    hipFunction_t fn;
+    HIP_ASSERT(hipModuleGetFunction(&fn, mod, "canary_issue20_wave_parity"));
+
+    uint32_t *dOut = nullptr;
+    size_t bytes = static_cast<size_t>(N) * sizeof(uint32_t);
+    HIP_ASSERT(hipMalloc(&dOut, bytes));
+    HIP_ASSERT(hipMemset(dOut, 0xcd, bytes));
+
+    struct alignas(8) Args {
+      uint32_t *out;
+    } args = {dOut};
+    size_t argSize = sizeof(args);
+    void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+                      HIP_LAUNCH_PARAM_BUFFER_SIZE, &argSize,
+                      HIP_LAUNCH_PARAM_END};
+    int grd = (N + blockSize - 1) / blockSize;
+    HIP_ASSERT(hipModuleLaunchKernel(fn, grd, 1, 1, blockSize, 1, 1, 0,
+                                     nullptr, nullptr, config));
+    HIP_ASSERT(hipDeviceSynchronize());
+    std::vector<uint8_t> out(bytes);
+    HIP_ASSERT(hipMemcpy(out.data(), dOut, bytes, hipMemcpyDeviceToHost));
+    HIP_ASSERT(hipFree(dOut));
+    return out;
+  };
+  r.compare = [](const std::vector<uint8_t> &gold,
+                 const std::vector<uint8_t> &actual,
+                 int, int, int outElems) {
+    const auto *g = reinterpret_cast<const uint32_t *>(gold.data());
+    const auto *a = reinterpret_cast<const uint32_t *>(actual.data());
+    int mismatches = 0;
+    int firstIdx = -1;
+    double firstG = 0.0;
+    double firstA = 0.0;
+    for (int i = 0; i < outElems; ++i) {
+      if (g[i] == a[i])
+        continue;
+      if (firstIdx < 0) {
+        firstIdx = i;
+        firstG = static_cast<double>(g[i]);
+        firstA = static_cast<double>(a[i]);
+      }
+      ++mismatches;
+    }
+    return std::make_tuple(mismatches, mismatches == 0 ? 0.0 : 1.0,
+                           firstIdx, firstG, firstA);
+  };
+  return r;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Recipe: canary_ds_swizzle_swap1 — P6 ds_swizzle_b32 SWAP-1 regression guard
 //
 // Canary for the `ds_swizzle_b32 ... offset:swizzle(SWAP,1)` imm shape
@@ -5470,6 +5572,7 @@ const std::vector<Recipe> &allRecipes() {
         makeMubufStoreB32Recipe(),
         makeSSetVgprMsbRecipe(),
         makeCanaryReadlaneLastLaneRecipe(),
+        makeCanaryIssue20WaveParityRecipe(),
         makeCanaryDsSwizzleSwap1Recipe(),
         makeCanaryDsSwizzleQuadPermRecipe(),
         makeCanaryCvtScalePk8Bf16Fp4Recipe(),

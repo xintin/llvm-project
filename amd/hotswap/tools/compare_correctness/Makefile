@@ -50,6 +50,7 @@ KERNELS        := vecadd block_sum_shfl lane_swap \
                   wmma_f32_16x16x4_gemm \
                   mubuf_store_b32 s_set_vgpr_msb \
                   canary_readlane_last_lane \
+                  canary_issue20_wave_parity \
                   canary_ds_swizzle_swap1 \
                   canary_ds_swizzle_quad_perm \
                   canary_cvt_scale_pk8_bf16_fp4
