@@ -38,9 +38,9 @@ inline uint16_t readU16(const uint8_t *p) {
 // and that information is essential for modelling the gfx1250 user-SGPR
 // ABI in Phase 4 of the raiser.
 bool readKernelDescriptorBytes(llvm::object::ObjectFile &obj,
-                               const std::string &kernelName,
+                               llvm::StringRef kernelName,
                                std::array<uint8_t, 64> &out) {
-  std::string kdSymName = kernelName + ".kd";
+  std::string kdSymName = (kernelName + ".kd").str();
 
   std::optional<llvm::object::SectionRef> rodataSec;
   for (const auto &sec : obj.sections()) {
@@ -137,8 +137,8 @@ void populateKernelDescriptorFields(llvm::object::ObjectFile &obj,
 }
 } // namespace
 
-std::vector<uint8_t> readFile(const std::string &path) {
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
+std::vector<uint8_t> readFile(llvm::StringRef path) {
+  std::ifstream f(path.str(), std::ios::binary | std::ios::ate);
   if (!f.is_open()) {
     llvm::errs() << "transpiler: Cannot open file: " << path << "\n";
     return {};
@@ -273,7 +273,7 @@ std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData) {
 }
 
 KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
-                             const std::string &kernelName) {
+                             llvm::StringRef kernelName) {
   KernelMeta meta;
 
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
@@ -410,7 +410,7 @@ KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
 }
 
 uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
-                                const std::string &kernelName) {
+                                llvm::StringRef kernelName) {
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
                       elfData.size()),

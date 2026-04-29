@@ -121,7 +121,7 @@ struct KernelRaiseStats {
   char failFormat[64];
 };
 
-std::string autoDetectIsa(const std::string &path) {
+std::string autoDetectIsa(llvm::StringRef path) {
   // Look for ``gfx<digits>[a-z]?`` anywhere in the filename.
   for (size_t i = 0; i + 3 < path.size(); ++i) {
     if (path[i] == 'g' && path[i + 1] == 'f' && path[i + 2] == 'x') {
@@ -132,7 +132,7 @@ std::string autoDetectIsa(const std::string &path) {
       if (j > i + 3) {
         if (j < path.size() && path[j] >= 'a' && path[j] <= 'z')
           ++j;
-        return path.substr(i, j - i);
+        return path.substr(i, j - i).str();
       }
     }
   }

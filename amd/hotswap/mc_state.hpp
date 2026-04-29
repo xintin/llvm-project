@@ -30,7 +30,7 @@ struct MCState {
 // The AMDGPU triple shared by every MC object we construct here.
 extern const char kAMDGPUTriple[];
 
-bool initMCState(MCState &state, const std::string &targetISA);
+bool initMCState(MCState &state, llvm::StringRef targetISA);
 
 // Thin wrapper around Target::createMCSubtargetInfo for the AMDGPU triple.
 // Returns a fully populated MCSubtargetInfo (feature bits honour the CPU

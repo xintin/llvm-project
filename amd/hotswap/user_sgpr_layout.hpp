@@ -4,6 +4,8 @@
 #include "code_object_utils.hpp"
 #include "isa_profile.hpp"
 
+#include "llvm/ADT/StringRef.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -101,14 +103,14 @@ struct UserSgprLayout {
   // compute_pgm_rsrc2.USER_SGPR_COUNT. `sourceISA` is used only in diagnostics.
   static bool tryFromKernelMeta(const KernelMeta &meta,
                                 const ISAProfile &sourceProfile,
-                                const std::string &sourceISA,
+                                llvm::StringRef sourceISA,
                                 UserSgprLayout &layout,
                                 std::string &failureDetail);
 
   // Fatal wrapper for callers that cannot return a structured RaiseFailure.
   static UserSgprLayout fromKernelMeta(const KernelMeta &meta,
                                        const ISAProfile &sourceProfile,
-                                       const std::string &sourceISA);
+                                       llvm::StringRef sourceISA);
 
   // Render a one-line debug summary: useful for HSA_HOTSWAP_DEBUG output
   // and for failure diagnostics. Format:

@@ -1,5 +1,6 @@
 #include "mc_state.hpp"
 #include "decoded_inst.hpp"
+#include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCInstrDesc.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -23,7 +24,7 @@ buildSubtargetInfo(const Target &target, StringRef isa) {
   return sti;
 }
 
-bool initMCState(MCState &state, const std::string &targetISA) {
+bool initMCState(MCState &state, StringRef targetISA) {
   LLVMInitializeAMDGPUTargetInfo();
   LLVMInitializeAMDGPUTarget();
   LLVMInitializeAMDGPUTargetMC();

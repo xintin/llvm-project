@@ -28,13 +28,13 @@ namespace transpiler {
 
 namespace {
 
-bool writeFile(const std::string &path, const std::string &contents) {
-  std::ofstream f(path);
+bool writeFile(llvm::StringRef path, llvm::StringRef contents) {
+  std::ofstream f(path.str());
   if (!f.is_open()) {
     llvm::errs() << "transpiler: Cannot write file: " << path << "\n";
     return false;
   }
-  f << contents;
+  f.write(contents.data(), contents.size());
   f.flush();
   if (!f) {
     llvm::errs() << "transpiler: write failed for: " << path << "\n";
@@ -43,8 +43,8 @@ bool writeFile(const std::string &path, const std::string &contents) {
   return true;
 }
 
-bool writeFile(const std::string &path, const std::vector<uint8_t> &data) {
-  std::ofstream f(path, std::ios::binary);
+bool writeFile(llvm::StringRef path, llvm::ArrayRef<uint8_t> data) {
+  std::ofstream f(path.str(), std::ios::binary);
   if (!f.is_open()) {
     llvm::errs() << "transpiler: Cannot write file: " << path << "\n";
     return false;
@@ -68,11 +68,11 @@ bool writeFile(const std::string &path, const std::vector<uint8_t> &data) {
 // The returned basename preserves a readable prefix of the original name
 // for debuggability; it's only intended for temp-dir scratch files —
 // symbol names inside the IR itself are unaffected.
-std::string makeSafeBasename(const std::string &kernelName,
+std::string makeSafeBasename(llvm::StringRef kernelName,
                              size_t reservedSuffixBytes = 8) {
   constexpr size_t kMaxComponentBytes = 255;
   if (kernelName.size() + reservedSuffixBytes <= kMaxComponentBytes)
-    return kernelName;
+    return kernelName.str();
 
   // FNV-1a 64-bit hash — small, deterministic, no libstdc++ dep beyond cstdint.
   uint64_t h = 0xcbf29ce484222325ull;
@@ -85,7 +85,7 @@ std::string makeSafeBasename(const std::string &kernelName,
   constexpr size_t kSeparatorBytes = 1;  // '_'
   const size_t prefixBudget = kMaxComponentBytes - reservedSuffixBytes -
                               kHashHexBytes - kSeparatorBytes;
-  std::string prefix = kernelName.substr(0, prefixBudget);
+  std::string prefix = kernelName.substr(0, prefixBudget).str();
   char buf[32];
   std::snprintf(buf, sizeof(buf), "%016llx",
                 static_cast<unsigned long long>(h));
@@ -209,11 +209,11 @@ bool isStrictMode() {
 // On success, writes the .o to objPath and returns true.
 static bool raiseAndCompileKernel(const TextSection &text,
                                   const std::vector<uint8_t> &codeObjectData,
-                                  const std::string &kernelName,
-                                  const std::string &sourceISA,
-                                  const std::string &targetISA,
+                                  llvm::StringRef kernelName,
+                                  llvm::StringRef sourceISA,
+                                  llvm::StringRef targetISA,
                                   const DumpDir &tmpDir,
-                                  const std::string &objPath,
+                                  llvm::StringRef objPath,
                                   PipelineResult &result,
                                   bool enableWritelaneRewrite,
                                   bool enableWaveNative) {
@@ -285,9 +285,9 @@ static bool raiseAndCompileKernel(const TextSection &text,
     writeFile(tmpDir.filePath(fileStem + ".dis"), raised.disasmText);
 
   std::string llcBin = std::string(LLVM_TOOLS_DIR) + "/llc";
-  if (runTool(llcBin, {llcBin, "-march=amdgcn",
-                       "-mcpu=" + targetISA,
-                       "-filetype=asm", "-o", asmPath, irPath}) != 0) {
+  std::string mcpuLlc = ("-mcpu=" + targetISA).str();
+  if (runTool(llcBin, {llcBin, "-march=amdgcn", mcpuLlc, "-filetype=asm", "-o",
+                       asmPath, irPath}) != 0) {
     llvm::errs() << "transpiler: llc failed for '" << kernelName << "'\n";
     return false;
   }
@@ -300,8 +300,8 @@ static bool raiseAndCompileKernel(const TextSection &text,
   }
 
   std::string mcBin = std::string(LLVM_TOOLS_DIR) + "/llvm-mc";
-  if (runTool(mcBin, {mcBin, "-triple=amdgcn-amd-amdhsa",
-                      "-mcpu=" + targetISA,
+  std::string mcpuMc = ("-mcpu=" + targetISA).str();
+  if (runTool(mcBin, {mcBin, "-triple=amdgcn-amd-amdhsa", mcpuMc,
                       "-filetype=obj", "-o", objPath, asmPath}) != 0) {
     llvm::errs() << "transpiler: llvm-mc failed for '" << kernelName << "'\n";
     return false;
@@ -312,7 +312,7 @@ static bool raiseAndCompileKernel(const TextSection &text,
 
 // Link one or more relocatable .o files into a shared HSACO.
 static bool linkObjects(llvm::ArrayRef<std::string> objPaths,
-                        const std::string &hsacoPath) {
+                        llvm::StringRef hsacoPath) {
   std::string lldBin = std::string(LLVM_TOOLS_DIR) + "/ld.lld";
   llvm::SmallVector<llvm::StringRef, 16> args;
   args.push_back(lldBin);
@@ -333,7 +333,7 @@ void collectTargetPrivateSegmentMetadata(PipelineResult &result,
   using namespace llvm::amdhsa;
   if (result.hsaco.empty())
     return;
-  for (const std::string &kernelName : kernelNames) {
+  for (llvm::StringRef kernelName : kernelNames) {
     KernelMeta meta = extractKernelMeta(result.hsaco, kernelName);
     if (!meta.hasKernelDescriptor)
       continue;
@@ -348,9 +348,9 @@ void collectTargetPrivateSegmentMetadata(PipelineResult &result,
 }
 
 PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
-                           const std::string &sourceISA,
-                           const std::string &targetISA,
-                           const std::string &kernelName,
+                           llvm::StringRef sourceISA,
+                           llvm::StringRef targetISA,
+                           llvm::StringRef kernelName,
                            bool enableWritelaneRewrite,
                            bool enableWaveNative) {
   PipelineResult result;
@@ -387,7 +387,8 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
     llvm::errs() << "transpiler: Failed to read HSACO\n";
     return result;
   }
-  collectTargetPrivateSegmentMetadata(result, {kernelName});
+  std::string kernelNameStr = kernelName.str();
+  collectTargetPrivateSegmentMetadata(result, {kernelNameStr});
 
   LLVM_DEBUG(llvm::dbgs() << "transpiler: HSACO generated: " << result.hsaco.size()
                           << " bytes\n");
@@ -396,8 +397,8 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
 }
 
 PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
-                                     const std::string &sourceISA,
-                                     const std::string &targetISA,
+                                     llvm::StringRef sourceISA,
+                                     llvm::StringRef targetISA,
                                      bool enableWritelaneRewrite,
                                      bool enableWaveNative) {
   PipelineResult result;

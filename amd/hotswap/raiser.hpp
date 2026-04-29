@@ -4,6 +4,8 @@
 #include "code_object_utils.hpp"
 #include "raise_failure.hpp"
 
+#include "llvm/ADT/StringRef.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -97,11 +99,11 @@ struct RaiseResult {
 // future need for a global toggle arises, add a proper
 // `PipelineConfig` field.
 RaiseResult raiseToIR(const std::vector<uint8_t> &textBytes,
-                      const std::string &sourceISA,
-                      const std::string &kernelName,
+                      llvm::StringRef sourceISA,
+                      llvm::StringRef kernelName,
                       const KernelMeta &meta,
                       uint64_t kernelOffset = 0,
-                      const std::string &compilationTargetISA = "",
+                      llvm::StringRef compilationTargetISA = "",
                       bool enableWritelaneRewrite = true,
                       bool enableWaveNative = true);
 

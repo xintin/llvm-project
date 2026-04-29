@@ -6,6 +6,7 @@
 #include "SIDefines.h"                        // SISrcMods::OP_SEL_0
 #include "Utils/AMDGPUBaseInfo.h"
 
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"

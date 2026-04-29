@@ -2,6 +2,7 @@
 
 #include "code_object_utils.hpp"
 
+#include "llvm/ADT/Twine.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
@@ -93,7 +94,7 @@ bool readElfHeaderFields(llvm::ArrayRef<uint8_t> data, uint16_t &machine,
   return true;
 }
 
-std::string hashFile(const std::string &path, std::string &error) {
+std::string hashFile(llvm::StringRef path, std::string &error) {
   auto buffer = llvm::MemoryBuffer::getFile(path);
   if (!buffer) {
     error = buffer.getError().message();
@@ -104,11 +105,11 @@ std::string hashFile(const std::string &path, std::string &error) {
       reinterpret_cast<const uint8_t *>(contents.data()), contents.size()));
 }
 
-FileIdentity statIdentity(const std::string &path) {
+FileIdentity statIdentity(llvm::StringRef path) {
   FileIdentity id;
-  id.path = path;
+  id.path = path.str();
   struct stat st;
-  if (::stat(path.c_str(), &st) != 0)
+  if (::stat(id.path.c_str(), &st) != 0)
     return id;
   id.present = true;
   id.size = static_cast<uint64_t>(st.st_size);
@@ -119,7 +120,7 @@ FileIdentity statIdentity(const std::string &path) {
   id.mtimeSec = static_cast<int64_t>(st.st_mtime);
   id.mtimeNsec = 0;
 #endif
-  id.sha256 = hashFile(path, id.error);
+  id.sha256 = hashFile(id.path, id.error);
   return id;
 }
 
@@ -269,25 +270,25 @@ bool cacheDisabledByEnv() {
   return envEnabled("HSA_SALMON_CACHE_DISABLE") || cacheRoot().empty();
 }
 
-std::string cacheSubdir(const std::string &key) {
+std::string cacheSubdir(llvm::StringRef key) {
   llvm::SmallString<256> path(cacheRoot());
   llvm::sys::path::append(path, key.substr(0, 2));
   return std::string(path);
 }
 
-std::string cacheObjectPath(const std::string &key) {
+std::string cacheObjectPath(llvm::StringRef key) {
   llvm::SmallString<256> path(cacheSubdir(key));
-  llvm::sys::path::append(path, key + ".hsaco");
+  llvm::sys::path::append(path, llvm::Twine(key) + ".hsaco");
   return std::string(path);
 }
 
-std::string cacheMetadataPath(const std::string &key) {
+std::string cacheMetadataPath(llvm::StringRef key) {
   llvm::SmallString<256> path(cacheSubdir(key));
-  llvm::sys::path::append(path, key + ".json");
+  llvm::sys::path::append(path, llvm::Twine(key) + ".json");
   return std::string(path);
 }
 
-bool exists(const std::string &path) {
+bool exists(llvm::StringRef path) {
   return llvm::sys::fs::exists(path);
 }
 
@@ -299,7 +300,7 @@ std::string jsonToString(llvm::json::Value value) {
   return os.str();
 }
 
-bool writeFileAtomic(const std::string &path, llvm::StringRef contents,
+bool writeFileAtomic(llvm::StringRef path, llvm::StringRef contents,
                      std::string &error) {
   llvm::SmallString<256> model(path);
   model += ".tmp-%%%%%%";
@@ -327,7 +328,7 @@ bool writeFileAtomic(const std::string &path, llvm::StringRef contents,
   return true;
 }
 
-bool writeFileAtomic(const std::string &path, llvm::ArrayRef<uint8_t> data,
+bool writeFileAtomic(llvm::StringRef path, llvm::ArrayRef<uint8_t> data,
                      std::string &error) {
   return writeFileAtomic(
       path, llvm::StringRef(reinterpret_cast<const char *>(data.data()),
@@ -404,7 +405,7 @@ bool requireEqualBool(const llvm::json::Object &obj, llvm::StringRef field,
 
 llvm::json::Array kernelArray(const std::vector<std::string> &kernelNames) {
   llvm::json::Array arr;
-  for (const std::string &name : kernelNames)
+  for (llvm::StringRef name : kernelNames)
     arr.push_back(name);
   return arr;
 }
@@ -715,9 +716,9 @@ std::string skippedKernelForTranslationCache(
     remaining = split.second;
     if (requested.empty())
       continue;
-    for (const std::string &kernelName : kernelNames) {
+    for (llvm::StringRef kernelName : kernelNames) {
       if (requested == kernelName)
-        return kernelName;
+        return kernelName.str();
     }
   }
   return "";

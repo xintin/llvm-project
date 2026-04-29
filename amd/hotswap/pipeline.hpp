@@ -1,6 +1,8 @@
 #ifndef HOTSWAP_TRANSPILER_PIPELINE_HPP
 #define HOTSWAP_TRANSPILER_PIPELINE_HPP
 
+#include "llvm/ADT/StringRef.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -79,9 +81,9 @@ struct PipelineResult {
 /// instead; the ~5 single-ISA call sites that did this pre-fix are
 /// all updated to the two-string form.
 PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
-                           const std::string &sourceISA,
-                           const std::string &targetISA,
-                           const std::string &kernelName,
+                           llvm::StringRef sourceISA,
+                           llvm::StringRef targetISA,
+                           llvm::StringRef kernelName,
                            bool enableWritelaneRewrite = true,
                            bool enableWaveNative = true);
 
@@ -90,8 +92,8 @@ PipelineResult runPipeline(const std::vector<uint8_t> &codeObjectData,
 /// raised and compiled. On raise failure, the `fail*` fields carry the
 /// structured `RaiseFailure` details for proof logs and corpus summaries.
 PipelineResult runPipelineAllKernels(const std::vector<uint8_t> &codeObjectData,
-                                     const std::string &sourceISA,
-                                     const std::string &targetISA,
+                                     llvm::StringRef sourceISA,
+                                     llvm::StringRef targetISA,
                                      bool enableWritelaneRewrite = true,
                                      bool enableWaveNative = true);
 

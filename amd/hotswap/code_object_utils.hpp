@@ -1,6 +1,8 @@
 #ifndef HOTSWAP_TRANSPILER_CODE_OBJECT_UTILS_HPP
 #define HOTSWAP_TRANSPILER_CODE_OBJECT_UTILS_HPP
 
+#include "llvm/ADT/StringRef.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -87,13 +89,13 @@ struct KernelMeta {
   }
 };
 
-std::vector<uint8_t> readFile(const std::string &path);
+std::vector<uint8_t> readFile(llvm::StringRef path);
 TextSection extractTextSection(const std::vector<uint8_t> &elfData);
 std::vector<std::string> listKernelNames(const std::vector<uint8_t> &elfData);
 KernelMeta extractKernelMeta(const std::vector<uint8_t> &elfData,
-                             const std::string &kernelName);
+                             llvm::StringRef kernelName);
 uint64_t findKernelSymbolOffset(const std::vector<uint8_t> &elfData,
-                                const std::string &kernelName);
+                                llvm::StringRef kernelName);
 
 // Read the AMDGPU target ISA name (e.g. "gfx1250", "gfx942") encoded in
 // the ELF e_flags MACH field per

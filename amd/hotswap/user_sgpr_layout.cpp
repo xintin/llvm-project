@@ -63,7 +63,7 @@ unsigned decodeUserSgprCount(uint32_t computePgmRsrc2,
 }
 
 std::string formatMetadataMismatch(const KernelMeta &meta,
-                                   const std::string &sourceISA,
+                                   llvm::StringRef sourceISA,
                                    const UserSgprLayout &layout,
                                    unsigned decodedUserSgprCount,
                                    unsigned userSgprCountWidth,
@@ -142,7 +142,7 @@ std::string formatMetadataMismatch(const KernelMeta &meta,
 
 bool UserSgprLayout::tryFromKernelMeta(const KernelMeta &meta,
                                        const ISAProfile &sourceProfile,
-                                       const std::string &sourceISA,
+                                       llvm::StringRef sourceISA,
                                        UserSgprLayout &layout,
                                        std::string &failureDetail) {
   layout = UserSgprLayout();
@@ -250,7 +250,7 @@ bool UserSgprLayout::tryFromKernelMeta(const KernelMeta &meta,
 
 UserSgprLayout UserSgprLayout::fromKernelMeta(const KernelMeta &meta,
                                               const ISAProfile &sourceProfile,
-                                              const std::string &sourceISA) {
+                                              llvm::StringRef sourceISA) {
   UserSgprLayout layout;
   std::string failureDetail;
   if (!tryFromKernelMeta(meta, sourceProfile, sourceISA, layout, failureDetail))
