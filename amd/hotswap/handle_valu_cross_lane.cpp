@@ -712,16 +712,34 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
   }
 
   // ---- v_mbcnt_lo_u32_b32 / v_mbcnt_hi_u32_b32 ----
-  // Count set bits in src0 below the current lane. Wave-size-aware
-  // (mbcnt.hi only meaningful on wave64). These are the building
-  // blocks for lane-id derivation that `WaveProjection::emitLaneIdx`
-  // also uses; the raw intrinsics must be passed through exactly.
+  // Count set bits in src0 below the current lane.  For same-wave lifts the
+  // raw intrinsic is exact.  For wave32 source -> wave64 target, however,
+  // raw target `mbcnt.lo` would return popcount(src0[0:31]) for target lanes
+  // 32..63, while the source instruction's lane id restarts at 0 in the
+  // second modeled source wave.  Recompute the source-wave-local low-half
+  // count from `lane_id mod W_s` in that case.
   case SemOp::V_MBCNT_LO_U32_B32: {
-    Function *mbcnt = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::amdgcn_mbcnt_lo, {});
-    ctx.writeReg32(op.dst(),
-                   ctx.B.CreateCall(mbcnt, {op.src(0), op.src(1)},
-                                    "mbcnt_lo"));
+    Value *result = nullptr;
+    if (ctx.isa.isWave32() && ctx.targetIsa.waveSize > ctx.isa.waveSize) {
+      Value *laneId = ctx.emitLaneIdx();
+      Value *sourceLane = ctx.B.CreateAnd(
+          laneId, ctx.B.getInt32(ctx.isa.waveSize - 1), "mbcnt_source_lane");
+      Value *laneBit = ctx.B.CreateShl(ctx.B.getInt32(1), sourceLane,
+                                       "mbcnt_lane_bit");
+      Value *belowMask = ctx.B.CreateSub(laneBit, ctx.B.getInt32(1),
+                                         "mbcnt_below_mask");
+      Value *masked = ctx.B.CreateAnd(op.src(0), belowMask, "mbcnt_masked");
+      Function *ctpop = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::ctpop, {ctx.i32Ty});
+      result = ctx.B.CreateAdd(
+          ctx.B.CreateCall(ctpop, {masked}, "mbcnt_pop"), op.src(1),
+          "mbcnt_lo_srcwave");
+    } else {
+      Function *mbcnt = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_mbcnt_lo, {});
+      result = ctx.B.CreateCall(mbcnt, {op.src(0), op.src(1)}, "mbcnt_lo");
+    }
+    ctx.writeReg32(op.dst(), result);
     hr.handled = true;
     return hr;
   }

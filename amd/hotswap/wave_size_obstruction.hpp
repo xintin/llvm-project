@@ -37,13 +37,17 @@ struct MCState;
 // `ScalarizationProjection` as future rungs, but no corpus kernel
 // reaches them (see hotswap/docs/gpt-oss-derisking.md §9.1–9.3).
 //
-// Analysis strategy — syntactic for now, dataflow later.
+// Analysis strategy — mostly syntactic, with decoded-register provenance
+// where needed.
 // ============================================================================
 //
 // TODO(dataflow-upgrade): The current implementation is a syntactic
 // classifier: it walks the decoded instruction stream and flags
 // obstruction sites by matching on `SemOp` / `rawMnemonic` / operand
-// immediates. This is sound-not-complete for some kinds:
+// immediates. Class-4 EXEC writers additionally run a small decoded-
+// register provenance pass so unrelated lane-id probes no longer poison
+// ordinary bounds masks. The analysis remains sound-not-complete for
+// some kinds:
 //
 //   - MbcntHiLaneIdLeak: matched directly by SemOp
 //     (`V_MBCNT_HI_U32_B32`); exact.
@@ -62,14 +66,13 @@ struct MCState;
 //   - CmpxFromLaneId / SaveExecFromLaneId: the principled check
 //     asks "does this v_cmpx / s_*_saveexec's source-operand
 //     dataflow chain contain a value derived from
-//     `amdgcn.mbcnt.{lo,hi}`?". The syntactic approximation
-//     implemented here flags the EXEC writer whenever it co-occurs
-//     with any v_mbcnt_* in the same kernel, regardless of whether
-//     the mbcnt value actually flows into the EXEC-writer's
-//     operands. This over-approximates: kernels that use mbcnt for
-//     an unrelated purpose and also have a bounds-check v_cmpx
-//     would be flagged and refused, even though modulo-replication
-//     would emit correct code for them.
+//     `amdgcn.mbcnt.{lo,hi}`?". The implementation tracks decoded
+//     physical-register provenance across the MC stream and refuses
+//     only when the EXEC writer's predicate/mask is actually
+//     mbcnt-derived. This is still conservative across unmodelled
+//     memory/control-flow joins, but it avoids the old kernel-wide
+//     false positive where a shuffle selector used mbcnt and an
+//     unrelated bounds-check v_cmpx appeared in the same kernel.
 //
 // The sound direction of the imprecision is preserved: false
 // positives (refuse a safe kernel) are benign; false negatives
@@ -78,8 +81,8 @@ struct MCState;
 // plumb LLVM Uniformity Analysis (plus the operand-aware target hook
 // from llvm/llvm-project#137639 to mark `lane_id mod W_s` as
 // uniform-across-replicas) over the RAISED IR — i.e. after Phase 2,
-// not at the decoded-instruction level — and replace the syntactic
-// co-occurrence heuristic with a precise dataflow query.
+// not at the decoded-instruction level — and replace the decoded
+// provenance approximation with a full SSA dataflow query.
 //
 // The syntactic classifier is the minimum viable unit that catches
 // every obstruction kind on every kernel in the GPT-OSS /
@@ -183,8 +186,8 @@ enum class ObstructionKind : uint8_t {
   // The EXEC mask the kernel writes depends on the absolute lane
   // position; under modulo-replication the projection does not
   // reproduce the source's intent.
-  CmpxFromLaneId,           // v_cmpx co-located with v_mbcnt_* — syntactic approximation.
-  SaveExecFromLaneId,       // s_*_saveexec_b32 co-located with v_mbcnt_* — same shape.
+  CmpxFromLaneId,           // v_cmpx predicate is derived from v_mbcnt_*.
+  SaveExecFromLaneId,       // s_*_saveexec_b32 source mask is derived from v_mbcnt_*.
 };
 
 // Identifier for the rewrite rule that would discharge an obstruction

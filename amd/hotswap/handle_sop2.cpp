@@ -152,10 +152,14 @@ static llvm::Value *tryGetSrcWaveMaskI1(RaiseContext &ctx, OpResolver &op,
 //     so downstream V_CNDMASK consumers that read VCC directly
 //     (via the VCC alloca's load) get the right bit.
 //
-// Other destination kinds (VGPR, EXEC, M0, TTMP, immediate) are
-// no-ops — they either don't participate in the cross-widening
-// ballot truncation this propagation addresses, or the earlier
-// `writeReg32` already did the right thing.
+// EXEC destinations are the source-wave mask itself.  When both inputs
+// supplied a per-lane i1, commit that full-width mask directly so
+// wave-native cross-widening preserves independent masks for lanes 0..31
+// and 32..63 instead of keeping the earlier low32 broadcast fallback.
+// Other destination kinds (VGPR, M0, TTMP, immediate) are no-ops — they
+// either don't participate in the cross-widening ballot truncation this
+// propagation addresses, or the earlier `writeReg32` already did the right
+// thing.
 static void recordDerivedWaveMaskI1(RaiseContext &ctx, ParsedReg dstReg,
                                      llvm::Value *i1) {
   if (!i1)
@@ -171,6 +175,12 @@ static void recordDerivedWaveMaskI1(RaiseContext &ctx, ParsedReg dstReg,
     // within this BB (the next reader sees the new i1).
     ctx.regs.storeVCC(ctx.B, i1);
     return;
+  case ParsedReg::EXEC: {
+    llvm::Value *mask = ctx.projection.ballotI1ToWidth(
+        ctx.B, i1, ctx.regs.execTy, "wave_mask_exec");
+    ctx.storeExec(mask);
+    return;
+  }
   default:
     return;
   }

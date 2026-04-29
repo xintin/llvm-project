@@ -7,6 +7,7 @@
 
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h" // AMDGPU::OpName, AMDGPU::TTMP_32RegClassID, AMDGPU::mc2PseudoReg
 #include "Utils/AMDGPUBaseInfo.h"             // AMDGPU::getNamedOperandIdx
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/MC/MCInst.h"
@@ -254,6 +255,200 @@ bool dsSwizzleSafeForModRep(uint16_t imm) {
   return false;
 }
 
+struct LanePredicatedExecSite {
+  const DecodedInst *inst;
+  ObstructionKind kind; // CmpxFromLaneId or SaveExecFromLaneId.
+  std::string detail;
+};
+
+class LaneIdProvenanceTracker {
+public:
+  explicit LaneIdProvenanceTracker(const MCRegisterInfo &MRI) : MRI(MRI) {}
+
+  bool anySourceTainted(const DecodedInst &di) const {
+    for (unsigned i = 0; i < di.numSrcs; ++i) {
+      unsigned opIdx = di.srcMap[i];
+      if (opIdx >= di.inst.getNumOperands())
+        continue;
+      const MCOperand &op = di.inst.getOperand(opIdx);
+      if (op.isReg() && isRegTainted(op.getReg()))
+        return true;
+    }
+    return false;
+  }
+
+  bool execTainted() const {
+    return isRegTainted(AMDGPU::EXEC_LO) || isRegTainted(AMDGPU::EXEC_HI) ||
+           isRegTainted(AMDGPU::EXEC);
+  }
+
+  bool anyVopdHalfSourceTainted(const DecodedInst::VopdHalf &half) const {
+    for (unsigned i = 0; i < half.numSrcs; ++i)
+      if (vopdSourceTainted(half.src[i]))
+        return true;
+    return false;
+  }
+
+  void updateAfterVopd(const DecodedInst &di) {
+    for (const DecodedInst::VopdHalf &half : di.vopd) {
+      if (half.semOp == SemOp::Unknown || !half.dstReg)
+        continue;
+      setRegTaint(half.dstReg, anyVopdHalfSourceTainted(half));
+    }
+  }
+
+  void updateAfterInstruction(const DecodedInst &di, bool explicitDefsTainted,
+                              bool vccTainted, bool execTainted,
+                              bool sccTainted) {
+    for (unsigned i = 0; i < di.numDefs; ++i) {
+      if (i >= di.inst.getNumOperands())
+        continue;
+      const MCOperand &op = di.inst.getOperand(i);
+      if (op.isReg())
+        setRegTaint(op.getReg(), explicitDefsTainted);
+    }
+    if (di.defsVCC) {
+      setRegTaint(AMDGPU::VCC_LO, vccTainted);
+      setRegTaint(AMDGPU::VCC_HI, vccTainted);
+      setRegTaint(AMDGPU::VCC, vccTainted);
+    }
+    if (di.defsEXEC) {
+      setRegTaint(AMDGPU::EXEC_LO, execTainted);
+      setRegTaint(AMDGPU::EXEC_HI, execTainted);
+      setRegTaint(AMDGPU::EXEC, execTainted);
+    }
+    if (di.defsSCC)
+      setRegTaint(AMDGPU::SCC, sccTainted);
+  }
+
+private:
+  void appendCanonicalRegLanes(MCRegister reg,
+                               SmallVectorImpl<unsigned> &out) const {
+    if (!reg)
+      return;
+    MCRegister lane = MRI.getSubReg(reg, AMDGPU::sub0);
+    if (!lane)
+      lane = reg;
+    out.push_back(static_cast<unsigned>(AMDGPU::mc2PseudoReg(lane)));
+
+    const unsigned maxSubIdx = MRI.getNumSubRegIndices();
+    for (unsigned subIdx = AMDGPU::sub1; subIdx < maxSubIdx; ++subIdx) {
+      MCRegister sub = MRI.getSubReg(reg, subIdx);
+      if (!sub)
+        break;
+      out.push_back(static_cast<unsigned>(AMDGPU::mc2PseudoReg(sub)));
+    }
+  }
+
+  bool isRegTainted(MCRegister reg) const {
+    SmallVector<unsigned> lanes;
+    appendCanonicalRegLanes(reg, lanes);
+    for (unsigned lane : lanes)
+      if (taintedRegs.contains(lane))
+        return true;
+    return false;
+  }
+
+  bool vopdSourceTainted(const DecodedInst::VopdSource &src) const {
+    using Kind = DecodedInst::VopdSource::Kind;
+    switch (src.kind) {
+    case Kind::VGPR:
+    case Kind::AGPR:
+    case Kind::SGPR:
+    case Kind::TTMP:
+    case Kind::VCC:
+    case Kind::EXEC:
+    case Kind::SCC:
+    case Kind::M0:
+      return isRegTainted(src.reg);
+    case Kind::Imm:
+    case Kind::None:
+      return false;
+    }
+    return false;
+  }
+
+  void setRegTaint(MCRegister reg, bool tainted) {
+    SmallVector<unsigned> lanes;
+    appendCanonicalRegLanes(reg, lanes);
+    for (unsigned lane : lanes) {
+      if (tainted)
+        taintedRegs.insert(lane);
+      else
+        taintedRegs.erase(lane);
+    }
+  }
+
+  const MCRegisterInfo &MRI;
+  DenseSet<unsigned> taintedRegs;
+};
+
+bool isSaveExecB32(SemOp sop) {
+  return sop == SemOp::S_AND_SAVEEXEC_B32 ||
+         sop == SemOp::S_OR_SAVEEXEC_B32 ||
+         sop == SemOp::S_XOR_SAVEEXEC_B32 ||
+         sop == SemOp::S_ANDN2_SAVEEXEC_B32 ||
+         sop == SemOp::S_ORN2_SAVEEXEC_B32;
+}
+
+SmallVector<LanePredicatedExecSite>
+findLanePredicatedExecSites(ArrayRef<DecodedInst> insts,
+                            const MCRegisterInfo &MRI) {
+  LaneIdProvenanceTracker tracker(MRI);
+  SmallVector<LanePredicatedExecSite> sites;
+
+  for (const DecodedInst &di : insts) {
+    const SemOp sop = di.semOp;
+    if (di.hasVopd) {
+      tracker.updateAfterVopd(di);
+      continue;
+    }
+    const bool sourceTainted = tracker.anySourceTainted(di);
+    const bool oldExecTainted = tracker.execTainted();
+
+    bool explicitDefsTainted = sourceTainted;
+    bool vccTainted = sourceTainted;
+    bool execTainted = sourceTainted || oldExecTainted;
+    bool sccTainted = sourceTainted;
+
+    if (sop == SemOp::V_MBCNT_LO_U32_B32 ||
+        sop == SemOp::V_MBCNT_HI_U32_B32) {
+      explicitDefsTainted = true;
+      vccTainted = false;
+      execTainted = oldExecTainted;
+      sccTainted = false;
+    } else if (sop == SemOp::V_CMPX) {
+      if (sourceTainted) {
+        sites.push_back(
+            {&di, ObstructionKind::CmpxFromLaneId,
+             "v_cmpx operand dataflow is derived from v_mbcnt_*; EXEC would "
+             "be gated by absolute target lane position under cross-widening"});
+      }
+      explicitDefsTainted = false;
+      vccTainted = false;
+      execTainted = oldExecTainted || sourceTainted;
+      sccTainted = false;
+    } else if (isSaveExecB32(sop)) {
+      if (sourceTainted) {
+        sites.push_back(
+            {&di, ObstructionKind::SaveExecFromLaneId,
+             "s_*_saveexec_b32 source mask dataflow is derived from "
+             "v_mbcnt_*; EXEC would be gated by absolute target lane "
+             "position under cross-widening"});
+      }
+      explicitDefsTainted = oldExecTainted;
+      vccTainted = false;
+      execTainted = oldExecTainted || sourceTainted;
+      sccTainted = execTainted;
+    }
+
+    tracker.updateAfterInstruction(di, explicitDefsTainted, vccTainted,
+                                   execTainted, sccTainted);
+  }
+
+  return sites;
+}
+
 // Return true iff any source-operand register of `di` covers the 32-bit
 // TTMP8 lane — either as a bare `ttmp8` or as part of a larger tuple
 // (e.g. `ttmp[8:9]`). Defs are skipped: only reads of TTMP8 constitute a
@@ -363,21 +558,18 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
   const MCRegisterInfo &MRI = *mc.regInfo;
 
   // First pass: tag the self-contained obstruction kinds (lane-id
-  // leaks, cross-lane shuffles, replica races). Also collect
-  // co-occurrence state for the lane-predicated EXEC check below.
+  // leaks, cross-lane shuffles, replica races). Class-4
+  // lane-predicated EXEC sites are found by the decoded-register
+  // provenance pre-walk below and emitted after the main walk.
   //
   // The walk matches purely on `SemOp` and `MCInstrDesc` TSFlags
   // bits; there is no string matching on `rawMnemonic`. New
   // obstruction triggers should be added by extending semop.hpp +
   // opcode_map.cpp (so the lookup is a single enum compare here),
   // not by adding `raw.contains(...)` substring tests.
-  bool haveMbcnt = false;
   bool haveWMMA = false;
-  struct PendingExecSite {
-    const DecodedInst *inst;
-    ObstructionKind kind; // CmpxFromLaneId or SaveExecFromLaneId.
-  };
-  llvm::SmallVector<PendingExecSite> pendingExecWriters;
+  SmallVector<LanePredicatedExecSite> lanePredicatedExecSites =
+      findLanePredicatedExecSites(insts, MRI);
   // Deferred TtmpWaveIdLeak site emission. The canonical shape —
   // `s_bfe_u32 sDST, ttmp8, 0x50019` — has a principled rescue in
   // `handle_sop2.cpp`'s `S_BFE_U32` pattern-lift, which emits
@@ -506,15 +698,14 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
       site.detail = "v_mbcnt_hi reads target exec_hi — no wave32 semantics "
                     "to preserve under modulo-replication";
       report.sites.push_back(std::move(site));
-      haveMbcnt = true;
       continue;
     }
     if (sop == SemOp::V_MBCNT_LO_U32_B32) {
       // v_mbcnt_lo alone is not a leak by itself (wave32 sources use
       // it as the canonical lane-id probe and it's lane-position-
-      // independent inside its wave). We track its presence only
-      // for the lane-predicated-EXEC co-occurrence heuristic below.
-      haveMbcnt = true;
+      // independent inside its wave). The C4 provenance pre-walk above
+      // tracks whether its result actually reaches an EXEC writer; a
+      // standalone lane-index probe is not an obstruction.
       continue;
     }
     if (sop == SemOp::V_READLANE_B32 || sop == SemOp::V_WRITELANE_B32) {
@@ -783,22 +974,12 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
     }
 
     // --- §3 Class 4: lane-predicated EXEC writers -------------------
-    // The principled check is "does the EXEC-writer's source operand
-    // chain contain a value derived from mbcnt?". The syntactic
-    // approximation: collect EXEC writers now, decide after the walk
-    // based on kernel-level mbcnt presence.
-    if (sop == SemOp::V_CMPX) {
-      pendingExecWriters.push_back({&di, ObstructionKind::CmpxFromLaneId});
-      continue;
-    }
-    if (sop == SemOp::S_AND_SAVEEXEC_B32 ||
-        sop == SemOp::S_OR_SAVEEXEC_B32 ||
-        sop == SemOp::S_XOR_SAVEEXEC_B32 ||
-        sop == SemOp::S_ANDN2_SAVEEXEC_B32 ||
-        sop == SemOp::S_ORN2_SAVEEXEC_B32) {
-      pendingExecWriters.push_back({&di, ObstructionKind::SaveExecFromLaneId});
-      continue;
-    }
+    // Handled by `findLanePredicatedExecSites` above.  The main walk
+    // intentionally does not emit C4 sites from mere opcode presence:
+    // kernels often contain `v_mbcnt_*` for ds_bpermute selectors and
+    // unrelated bounds/saveexec masks in the same instruction stream.
+    // Only actual decoded-register dataflow from mbcnt into an EXEC
+    // writer is an obstruction.
   }
 
   // Deferred TtmpWaveIdLeak emission. See the pre-loop comment on
@@ -850,8 +1031,10 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
   //                                           ; writing the wrong tile.
   //
   // The refusal is syntactic (three-way co-occurrence over the kernel)
-  // and therefore a sound-not-complete over-approximation, same as the
-  // CmpxFromLaneId / SaveExecFromLaneId co-occurrence heuristic above.
+  // and therefore a sound-not-complete over-approximation.  Class-4
+  // CmpxFromLaneId / SaveExecFromLaneId uses the provenance pre-walk
+  // above; this separate WaveIdLiftScalarized shape remains intentionally
+  // co-occurrence-based until a post-raise SSA query owns that path too.
   // Kernels that happen to contain all three constructs but do NOT
   // route the wave_id value into the cross-lane scalar source would be
   // over-refused — benign (false positive). Kernels that are missing
@@ -907,31 +1090,19 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
     }
   }
 
-  // Second pass: for each pending EXEC writer, apply the syntactic
-  // co-occurrence heuristic. If the kernel contains ANY mbcnt (lo or
-  // hi), treat the writer as lane-predicated and unrewritable.
-  // Otherwise it is a lane-position-INDEPENDENT bounds-check style
-  // writer (the overwhelming common case per gpt-oss-derisking.md
-  // §7.6) and does NOT produce a site — the outer Phase 1.4 legacy
-  // diagnostic (now LLVM_DEBUG-only) still logs it for auditability.
-  //
-  // TODO(dataflow-upgrade): replace this co-occurrence heuristic with
-  // a precise dataflow check once the classifier runs post-raise on
-  // the LLVM IR. See wave_size_obstruction.hpp's TODO block.
-  if (haveMbcnt) {
-    for (const auto &pw : pendingExecWriters) {
-      ObstructionSite site;
-      site.inst = pw.inst;
-      site.kind = pw.kind;
-      site.rewrite = RewriteId::None;
-      site.rewriteImplemented = false;
-      site.detail =
-          "v_cmpx / saveexec co-occurs with v_mbcnt_* in the same kernel — "
-          "syntactic over-approximation of 'gating expression flows from an "
-          "absolute-lane-id value'. Dataflow upgrade may reclassify this as "
-          "wave-size-oblivious (see TODO(dataflow-upgrade)).";
-      report.sites.push_back(std::move(site));
-    }
+  // Second pass: emit Class-4 EXEC writers whose predicate/mask was
+  // actually proven to depend on a v_mbcnt_* result by the decoded-
+  // register provenance pre-walk. This replaces the old kernel-wide
+  // co-occurrence heuristic while preserving the same fail-loud
+  // outcome for true mbcnt-fed EXEC predicates.
+  for (const auto &pw : lanePredicatedExecSites) {
+    ObstructionSite site;
+    site.inst = pw.inst;
+    site.kind = pw.kind;
+    site.rewrite = RewriteId::None;
+    site.rewriteImplemented = false;
+    site.detail = pw.detail;
+    report.sites.push_back(std::move(site));
   }
 
   return report;

@@ -20,15 +20,12 @@
 ; only fixture remains valid under the new gate because its
 ; compare is provably lane-position-independent.
 ;
-; DATAFLOW FOLLOW-UP. The current syntactic classifier flags this
-; kernel by matching on v_cmpx co-occurring with v_mbcnt_lo /
-; v_mbcnt_hi in the same kernel. The principled check — proving
-; the v_cmpx's operand chain is rooted in an absolute-lane-id
-; expression — requires LLVM Uniformity Analysis on the raised IR
-; and is tracked as wave_size_obstruction.cpp's
-; TODO(dataflow-upgrade). Until then, false positives (syntactically
-; co-located v_cmpx and mbcnt that don't actually flow into each
-; other) fail closed, which is the correct direction.
+; CLASSIFIER CONTRACT. The decoded-provenance classifier flags this
+; kernel because the v_cmpx source register is defined by v_mbcnt_lo.
+; This is the unsafe path: an EXEC predicate rooted in absolute
+; lane-id arithmetic. Kernels that use v_mbcnt_* only for unrelated
+; ds_bpermute selectors and write EXEC from bounds masks should not
+; trip this fixture's refusal.
 
 ; STDERR: transpiler: pre-translation abort:
 ; STDERR-SAME: cross-wave-lane-predicated-exec

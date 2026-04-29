@@ -158,7 +158,15 @@ HandlerResult handleSOP1(RaiseContext &ctx, const DecodedInst &di,
   SemOp sop = di.semOp;
 
   if (sop == SemOp::S_MOV_B32) {
-    ctx.regs.writeReg32(ctx.B, op.dst(), op.src(0));
+    ParsedReg dst = op.dst();
+    ParsedReg srcReg = op.isSrcReg(0) ? op.srcReg(0) : ParsedReg{};
+    Value *src = op.src(0);
+    ctx.regs.writeReg32(ctx.B, dst, src);
+    if (dst.kind == ParsedReg::SGPR && srcReg.kind == ParsedReg::EXEC) {
+      Value *execI1 = ctx.projection.extractLaneBitFromWaveMask(
+          ctx.B, ctx.regs.loadExec(ctx.B));
+      ctx.recordSgprWaveMaskI1(dst.baseIdx, execI1, /*isPair=*/false);
+    }
     hr.handled = true;
     return hr;
   }
