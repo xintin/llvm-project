@@ -200,14 +200,22 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
       //      under -O1+ SIMT optimisations" — comment block above)
       //      doesn't apply when we use the buffer intrinsic itself.
       //
-      // EXEC gating: like the load, the call is emitted unconditionally;
-      // the hardware EXEC mask suppresses inactive-lane writes natively.
-      // We still wrap in `emitUnderExec` so that within an
-      // already-narrowed IR-level lane window (e.g. an inner if-then
-      // branch handled earlier in the kernel) the store body is
-      // dominated by the handler's lane-active diamond, keeping
-      // EXEC and IR-level dominance in sync — same pattern other
-      // store handlers (DS, scratch) use.
+      // EXEC gating:
+      //
+      // In the ordinary projection path we wrap the store in `emitUnderExec`,
+      // matching the rest of the side-effecting handlers: source-inactive
+      // lanes skip the intrinsic in IR.
+      //
+      // WaveNative cross-widening is different.  That projection deliberately
+      // holds hardware EXEC at the full target wave for the kernel body
+      // (`providesFullWaveExecInvariant`).  Triton masked MUBUF stores in this
+      // class already encode the per-lane predicate in the vector offset:
+      // inactive source lanes receive an OOB offset and the BUFFER unit drops
+      // those writes.  Adding a second IR-level `emitUnderExec` diamond can
+      // make the translated code stricter than the source packet and drop the
+      // valid lane as well; `get_num_kv_splits_triton` is the observed case.
+      // Emitting the raw buffer store directly preserves the source packet's
+      // hardware contract: full-wave issue plus per-lane OOB suppression.
       Type *storeTy;
       Value *val;
       if (isSubDword) {
@@ -223,9 +231,13 @@ HandlerResult handleMUBUF(RaiseContext &ctx, const DecodedInst &di,
       }
       Function *bufSt = Intrinsic::getOrInsertDeclaration(
           &ctx.M, Intrinsic::amdgcn_raw_buffer_store, {storeTy});
-      ctx.emitUnderExec([&] {
+      auto emitStore = [&] {
         ctx.B.CreateCall(bufSt, {val, srd, voffset, soffset, auxFlags});
-      });
+      };
+      if (ctx.projection.providesFullWaveExecInvariant())
+        emitStore();
+      else
+        ctx.emitUnderExec(emitStore);
       hr.handled = true;
     return hr;
     }
