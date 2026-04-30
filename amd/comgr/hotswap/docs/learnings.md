@@ -205,7 +205,7 @@ We don't have gfx1250 hardware to verify which of these is true
       Triton's gfx1250 codegen has a bug that produces
       algorithmically incorrect code on gfx1250 hardware itself.
 
-The `Gfx1250Gpu.Permlane16Swap` GTest validates the symmetric
+The `Gfx1250Gpu.Permlane16Swap` GPU regression coverage validates the symmetric
 cross-wire semantic by running a salmon-lifted gfx1250 kernel
 with DISTINCT `vdst_in[L] = L`, `src0_in[L] = 1000 + L` inputs
 on gfx942 hardware — it tests our EMULATION, not gfx1250 silicon.
@@ -236,7 +236,7 @@ outside the Triton idiom:
      phi walks to the same SSA root.
 
 Non-Triton kernels that use `v_permlane16_swap_b32` with distinct
-inputs per-operand (the `Permlane16Swap` GTest, the AITER
+inputs per-operand (the `Permlane16Swap` regression, the AITER
 kernels' `v_permlane32_swap_b32` siblings through a different
 opcode) don't match condition 3 — their data args trace to
 distinct SSA roots.  DPP cross-widening's `ds.bpermute` calls
@@ -363,10 +363,10 @@ already wired to narrow the bug class without re-deriving it.
     `Gfx1250Gpu.BitonicCross16Probe`,
     `Gfx1250Gpu.BitonicXor3TritonState`,
     `Gfx1250Gpu.RcpSqrt`, `Gfx1250Gpu.DppQuadPerm` — all pass.
-  * Full ctest: 95% (105/107 lit fixtures + 74 gtests) with
+  * Full ctest: 95% (105/107 lit fixtures plus the focused test suite) with
     the same pre-existing failures as before the fix (the
     `wmma_phantom_lane_*` lit fixtures that the matmul-WMMA
-    agent owns, and the `MfmaGpu.Gemm*` gtests blocked on a
+    agent owns, and the `MfmaGpu.Gemm*` tests blocked on a
     separate `s_load_dwordx4` kernarg-slot parsing bug).
 
 **Flag plumbing — same pattern as the xor3-partner flag.**
@@ -460,7 +460,7 @@ popcount sum.
 
 No regressions elsewhere — `canary_tl_sort_fp32_deterministic`
 (which exercises the permlane16-xor3-partner rewrite we just
-landed) still matches, all Gfx1250Gpu cross-lane + atomic GTests
+landed) still matches, all Gfx1250Gpu cross-lane + atomic regression tests
 pass, and the `c3_atomic_cas` lit fixture's CMPSWAP path goes
 through the same code path via `fa.stData + baseIdx+1` so the
 cmp/new pair contract is preserved.
@@ -471,7 +471,7 @@ cmp/new pair contract is preserved.
 recurring salmon bug class.  The same root cause (hard-coded
 plain-form shape, later patched up for gfx12+ SADDR) bit
 `rcp_sqrt_kernel` in `GLOBAL_LOAD` before this — see the
-`Gfx1250Gpu.RcpSqrt` GTest and handle_flat.cpp:653-665 comment.
+RcpSqrt regression coverage and handle_flat.cpp:653-665 comment.
 The prescribed pattern is: **when a gfx12+ form has SGPR-base +
 VGPR-offset addressing, EXTRACT the shape decode into a helper
 (`decodeGlobal{Load,Store}Addr`) and have every consumer — load,
@@ -502,9 +502,9 @@ prefetch) should follow the same pattern.
     env-gated debug print is faster than reading LLVM's encoding
     specs.
 
-The `sum_bitmatrix_rows_u32{,_nw4}` compare_correctness recipes
-are the regression pin — they're the only artefacts in-tree that
-exercise a Triton-emitted `global_atomic_*` SADDR + `scale_offset`
+The `sum_bitmatrix_rows_u32{,_nw4}` end-to-end recipes are the
+regression pin: they exercise a Triton-emitted `global_atomic_*` SADDR
++ `scale_offset`
 shape end-to-end on a real GPU, and both verdicts flip from
 `EXIT=2 (HIP 700)` to `match` under the fix.  A narrower gtest-
 scope regression (on the line of `Gfx1250Gpu.RcpSqrt` for the
@@ -579,7 +579,7 @@ transition period is zero-risk because:
     an outer xor with the shared seed.  No non-Triton salmon
     lift produces this shape.
   * `Gfx1250Gpu.BitonicXor3TritonState` probe verifies the
-    per-lane transformation.  `Permlane16Swap*` GTests pin the
+    per-lane transformation.  `Permlane16Swap*` regressions pin the
     standalone swap semantic.  `canary_dpp_reduce_fp32` +
     `canary_permlanex16_rowmax_fp32` pin other cross-lane
     primitives.  None regress.
@@ -812,7 +812,7 @@ they all graduate:
   the exact shuffle-network shape that broke
 
 **Progress update (same-day).**  Step 1 DONE — two wave32-source
-GTests now exist alongside the pre-existing wave64-source one:
+regressions now exist alongside the pre-existing wave64-source one:
 
 | test                                     | source    | projection      | verdict |
 |------------------------------------------|-----------|------------------|---------|
@@ -881,7 +881,7 @@ sequence and produces a CORRECT sort.  That means either:
     variant that has different semantics than the `NGT`
     mapping salmon applied.
 
-Committed the two wave32 GTests as regression guards
+Committed the two wave32 regression tests as regression guards
 regardless; the PASSING state of both pins the positive
 correctness invariant for `emitPermLaneSwapEmulation` under
 both ModRep and WaveNative.  Any future regression in the
@@ -890,7 +890,7 @@ emulation (e.g. forgetting to cross-wire the two
 user.
 
 **Hardware probe run (same-day):** the wave32 inline-asm canary
-(`test_data/gfx1250/bitonic_cross16_probe_kernel.hip`, GTest
+(`test_data/gfx1250/bitonic_cross16_probe_kernel.hip`, regression
 `Gfx1250Gpu.BitonicCross16Probe`) confirms the textbook model
 of the sequence `v_permlane16_swap_b32 v3, v4; v_xor3_b32 v3,
 v3, v4, v2`.  With distinct inputs `v2=L, v3=100+L, v4=200+L`,
@@ -947,7 +947,7 @@ sites verbatim (Opcode + OperandVec) so we can compare what
 salmon's LLVM decoder thinks versus what the upstream tables
 would infer.  Alternatively, test salmon with a newer LLVM
 (e.g. the `amd-llvm` source in
-`/data/llama3.1/anush/github/TheRock/compiler/amd-llvm/`) —
+`a newer LLVM AMDGPU source tree`) —
 if that newer tree has full gfx1250 decode tables, any
 discrepancy with salmon's current decode is the bug.
 
@@ -996,9 +996,9 @@ under cross-widening.
 `topk_forward_bisect.py::_recipe`.  See the comment block there for
 the per-mode derivation.  `topk_forward_bisect_m1_fp32` got its own
 `rel-rms tol=1e-5` entry (observed 8.7e-8 ≈ 1 fp32 ULP at magnitude
-7).  Harness change: `compare_correctness.cpp` now routes integer
-dtypes (`i16`/`u16`/`i32`/`u32`/`i64`) through `judge` when the
-comparator is `rel-rms`, matching the float paths; this is the
+7).  Harness change: the end-to-end comparator now routes integer dtypes
+(`i16`/`u16`/`i32`/`u32`/`i64`) through the same tolerance-aware judge
+when the comparator is `rel-rms`, matching the float paths; this is the
 clean extension for "tolerance-aware integer comparison" that
 keeps integer `abs` / `rel` on the fast bit-exact loop.
 
@@ -1265,9 +1265,8 @@ information:
     Could be a prior register state not cleared, or an init-bias
     (e.g. bf16 RNE `+0x7FFF`) surfacing into the output.
 
-**Mechanisation — tractable today.**  For every
-`compare_correctness` recipe with a deterministic reduction shape,
-auto-synthesise a `_const_in` sibling recipe:
+**Mechanisation — tractable today.** For every deterministic reduction
+recipe, auto-synthesise a `_const_in` sibling recipe:
 
 ```python
 # Sibling generator: given a base recipe, emit a _const_in variant
@@ -1295,8 +1294,7 @@ operand that equals a "silently-damaging" value (0.0 as a
 multiplier, 1.0 as an addend, NaN anywhere, etc.) and print the
 MCInst operand it came from.  This is what a human does during
 triage — the Cursor / grep workflow is already mechanical-adjacent.
-A proper lint pass would live under `tools/ir_audit/` or similar
-and run as part of `raise_cli --audit`.
+A proper lint pass would live under a future IR audit pass and run as part of `raise_cli --audit`.
 
 **What NOT to mechanise (yet).**  Static analysis of handler
 source for "this code applies MC-encoding-dependent logic without
@@ -1424,7 +1422,7 @@ a data-path bug.
 
 **Graduation.**
 - All six `Gfx1250Gpu.Matmul*` XFAIL entries removed from
-  `tests/xfail.cmake` (commit da404faf84 landed the fix;
+  `the regression test configuration` (commit da404faf84 landed the fix;
   this entry and the follow-up retire the `WILL_FAIL TRUE`
   annotations).
 - The four diagnostic probes remain as positive regression guards —
@@ -1531,9 +1529,8 @@ the A-fragment side of the WMMA chain, on the UPPER-VGPR-BANK path
    wave 3's LDS stride for the prologue's first load causes it to
    wrap around into wave 0's region.
 
-4. **The `compare_correctness` `makeSSetVgprMsbRecipe()` probe.**
-   It is already wired to exercise the upper-VGPR-bank path with a
-   non-WMMA kernel. Run it under the same
+4. **The `s_set_vgpr_msb` end-to-end probe.** It exercises the
+   upper-VGPR-bank path with a non-WMMA kernel. Run it under the same
    `--enable-writelane-rewrite + --enable-wave-native` config as
    the matmul and check whether warp-3-specific data substitution
    appears there too. Same result would confirm the bug is in
@@ -1541,8 +1538,8 @@ the A-fragment side of the WMMA chain, on the UPPER-VGPR-BANK path
    LDS-side-of-WMMA interaction.
 
 **Files touched:**
-`tests/gfx1250_gpu_test.cpp` (`EvenRows`, `KStripedRow124` patterns
-+ `TEST_F` registrations), `tests/xfail.cmake` (four `WILL_FAIL`
+`GPU regression tests` (`EvenRows`, `KStripedRow124` patterns
++ `TEST_F` registrations), `the regression test configuration` (four `WILL_FAIL`
 entries + commentary), this doc.
 
 ---
@@ -1557,7 +1554,7 @@ gather that maps a 4-VGPR MFMA output back into the 8-VGPR Wave32 C
 fragment.
 
 **What was done.** Added two diagnostic input patterns to `doTestMatmul`
-in `tests/gfx1250_gpu_test.cpp`:
+in `GPU regression tests`:
 
 - `MatmulDataPattern::RowIdA`: `A[i,k] = (i+1) * 0.001` for all k, `B = 1`.
   Reference `C[i,j] = 128 * (i+1) * 0.001`, constant across columns.
@@ -1656,9 +1653,8 @@ first principles a third time.
    non-uniform A/B data. If it reproduces, the bug is
    `s_set_vgpr_msb`-related; if it doesn't, suspect the Triton-
    kernel-specific LDS shuffle path.
-3. The `compare_correctness` tool (tools/compare_correctness/)
-   already has a `makeSSetVgprMsbRecipe()` probe. Run it end-to-end
-   under the same `--enable-writelane-rewrite` + `--enable-wave-native`
+3. The `s_set_vgpr_msb` end-to-end probe exercises the upper-VGPR-bank
+   path with a non-WMMA kernel. Run it under the same `--enable-writelane-rewrite` + `--enable-wave-native`
    configuration as the matmul gtest. A mismatch there isolates the
    MSB path; a match rules it out.
 
@@ -1670,14 +1666,14 @@ matmul tests, so CTest still validates that the defect is reproducible
 (a silent fix would flip them unexpected-pass and force a review).
 
 **Files touched:**
-`tests/gfx1250_gpu_test.cpp`, `tests/xfail.cmake`, this doc.
+`GPU regression tests`, `the regression test configuration`, this doc.
 
 ---
 
 ## 2026-04-21 — WaveNative projection alone does not fix the Matmul128x128 residual
 
 **Context.** After the writelane/readlane symmetry fix (same day, below),
-the Matmul128x128 random-input gtests still failed with ~3% numerical
+the Matmul128x128 random-input tests still failed with ~3% numerical
 errors localised to output rows 124–127 / 252–255. The
 `wmma_lowering.cpp` file header and the `WaveNativeProjection`
 docstrings both point at partial-EXEC during WMMA → MFMA as the
@@ -1710,7 +1706,7 @@ WMMA → MFMA redistribution math — most likely in the "collect" stage
 in `wmma_lowering.cpp` for the second half of source wave 3's
 sub-tile, or in some bookkeeping the matmul exercises that the
 smaller `wmma_*` lit fixtures don't. Investigation handed off via
-`tests/xfail.cmake`'s rewritten commentary and the list of MFMA
+`the regression test configuration`'s rewritten commentary and the list of MFMA
 lane-layout equations at the top of `wmma_lowering.cpp`.
 
 **Value landed anyway.** WaveNative is a principled piece of
@@ -1803,6 +1799,6 @@ Re-added to `xfail.cmake` with that precise reason.
 `rewrite_cross_lane_divergent.{hpp,cpp}`,
 `lit_tests/writelane_uniform_noop/*`,
 `wave-size-translation.md` §5.6.3,
-`tests/xfail.cmake`,
-`tests/gfx1250_gpu_test.cpp`,
+`the regression test configuration`,
+`GPU regression tests`,
 `raise_cli.cpp` (added `--write-hsaco` for disassembly triage).

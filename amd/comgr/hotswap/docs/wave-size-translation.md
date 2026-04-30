@@ -449,7 +449,7 @@ is the fallback selected by `--disable-wave-native` or
 default WaveNative evidence, including `canary_bpermute_scan_fp32`,
 `swiglu_fp32`, `rmsnorm_fp32`, and `corpus_layernorm_fp32`; no
 lit/ctest/BatchRaise regressions) and
-`transpiler/raiser.hpp`'s `enableWaveNative` parameter docstring for
+`raiser.hpp`'s `enableWaveNative` parameter docstring for
 the programmatic toggle.
 
 Hook: `WaveProjection::emitInitialExec` (`wave_projection.{hpp,cpp}`);
@@ -524,7 +524,7 @@ Hook: `handle_sop2.cpp::handleSOP2` under `SemOp::S_BFE_U32`;
 classifier out of the lifted shape. Regression fence:
 `lit_tests/c1_ttmp_wave_id_lift` asserts the three-instruction IR
 shape (`workitem.id.x` → `lshr 5` → `and 31`) survives the raise,
-and the matmul gpu-level suite (`tests/gfx1250_gpu_test.cpp`,
+and the matmul gpu-level suite (`GPU regression tests`,
 `Gfx1250Gpu.Matmul{64,128}x*`) asserts end-to-end numerical
 correctness across the cross-wave boundary.
 

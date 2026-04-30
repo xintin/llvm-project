@@ -109,7 +109,7 @@ gfx12 preloads user SGPRs starting at a different base than gfx9 and
 with a different enable-bit encoding. `raiser.cpp:279-292` already
 handles this:
 
-```263:292:projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/raiser.cpp
+```263:292:amd/comgr/hotswap/raiser.cpp
   regs.storeSGPR32(B, 2, B.CreateCall(fnWorkgroupIdX, {}, "wg_id_x"));
   // ...
   if (AMDGPU::isGFX12Plus(*mc.subtargetInfo)) {

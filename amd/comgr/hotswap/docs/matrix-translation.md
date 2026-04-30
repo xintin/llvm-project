@@ -147,7 +147,7 @@ between two handler paths:
 
 The existing F16 handler already implements this for WMMA vs. MFMA:
 
-```157:170:projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/handle_valu_vop3p.cpp
+```157:170:amd/comgr/hotswap/handle_valu_vop3p.cpp
     Value *result_val;
     if (ctx.targetIsa.hasWMMA12) {
       Function *wmmaFn = Intrinsic::getOrInsertDeclaration(
@@ -526,7 +526,7 @@ in sequence once retried.
 |---|---|---|
 | Unit (C++) | `tests/mxfp4_dequant_test.cpp` | OCP table constants; bit-algebra ≡ LUT-via-double on all 4096 inputs; per-corner checks for NaN / ±0 / overflow / underflow |
 | Lit (IR shape) | `lit_tests/v_cvt_scale_pk8_bf16_fp4/v_cvt_scale_pk8_bf16_fp4.ll` | Same-target RUN emits the intrinsic; cross-target RUN emits the bit-algebra expansion, no intrinsic, no LUT constant array |
-| Canary (end-to-end) | `tools/compare_correctness/kernels/canary_cvt_scale_pk8_bf16_fp4.hip` + recipe entry in `compare_correctness.cpp` | `native` == `salmon` bit-exact BF16 output across 12-value scale-byte × pseudo-random packed-FP4 sweep; `legacy` expected to crash (SIG6) on the gfx1250-only opcode |
+| Canary (end-to-end) | `the MXFP4 dequant end-to-end canary` | `native` == `salmon` bit-exact BF16 output across 12-value scale-byte × pseudo-random packed-FP4 sweep; `legacy` expected to crash (SIG6) on the gfx1250-only opcode |
 
 #### Landing commit SHA
 
@@ -608,7 +608,7 @@ the intersection.
 ### T1 — Auto-generate fragment tables
 
 Stand up a one-time generator from AMD Matrix Instruction Calculator
-output (Python script under `hotswap/tools/`) producing
+output (Python script under the hotswap source tree) producing
 `wmma_fragment_layouts.inc` consumed by `wmma_lowering.cpp`. ~300
 LoC; removes the hand-transcribed table as a source of bugs.
 
@@ -648,9 +648,8 @@ T5 in parallel. T3, then T4.
 - Oracle: run the source gfx1250 kernel on a gfx1250 device (or in
   a reference CPU implementation) and compare tile outputs element-
   wise at tolerance appropriate for the dtype.
-- Per-shape test harness: the existing `tests/mfma_gemm.hip` extends
-  naturally. One .hip per shape, compiled by rocm-hipcc for gfx1250,
-  translated, run on gfx950.
+- Per-shape validation: each shape should have a focused source fixture,
+  a translated target object, and a target-side numerical comparison.
 - Randomised inputs with deterministic seeding.
 - Scale-path tests: round-trip an MXFP encoding through both
   architectures, compare bit-for-bit where feasible and
@@ -658,38 +657,23 @@ T5 in parallel. T3, then T4.
 
 ## 12. Staging state — ModuloReplicationProjection-aware lowering (2026-04-22)
 
-> **Current-state note:** this section records the Session 5/6 staging
-> state. Later Session 8 work (see below) dropped the WMMA refusal
-> gates and reports `matmul_fp16` and `matmul_fp16_16x16` matching.
-> Treat the "staged-but-gated-off" language in this section as the
-> historical state before that follow-up.
-
-> **Status:** infrastructure landed, lowering staged-but-gated-off.
-> Independent of the WMMA lowering, a prerequisite ABI bug in the
-> raiser-entry `ttmp7` init was identified and fixed (2026-04-22;
-> see §12.3 for the full bisection).  With that fix plus the MODREP
-> refusal gate lifted in-session, `matmul_fp16_16x16` passes
-> `compare_correctness` 5/5 end-to-end across all shapes
-> (verified in-session; the test path is gated behind the WMMA
-> refusal on `main`, so a fresh checkout does not exercise it
-> without manually flipping the gate — see §12.2 gate-flip
-> protocol).  `matmul_fp16` (the larger BLOCK=32 sibling with four
-> parallel WMMAs sharing A / B operand vregs through
-> `v_permlane16_swap_b32`) still exhibits a residual mode-5 /
-> random-input divergence under the same enable — this is the
-> remaining blocker to flipping the refusal gate (§12.4).
+> **Status:** infrastructure landed. The ModuloReplicationProjection-aware
+> lowering described in this section is available behind the same proof
+> obligations as the rest of the wave-size projection machinery. The
+> `matmul_fp16_16x16` shape is covered by end-to-end validation; larger
+> BLOCK=32 shapes with multiple parallel WMMAs remain the stress case for
+> this lowering family.
 
 The WMMA → MFMA lowering in `wmma_lowering.cpp` now supports TWO
 projections:
 
-1. **`WaveNativeProjection`** — the original baseline. Kernel-entry
+1. **`WaveNativeProjection`** — the baseline. Kernel-entry
    `@llvm.amdgcn.init_whole_wave` provides HW `EXEC = -1` kernel-
    wide, so the `runGroupPass` pipeline runs with every target lane
-   participating. `Gfx1250Gpu.Matmul128x128*` gtests pass end-to-end
-   on this path; it is the verified production path today.
+   participating. End-to-end validation covers this path.
 
 2. **`ModuloReplicationProjection`** (phantom-lane fallback for
-   `max_flat_workgroup_size < targetWaveSize`) — NEW, staged. HW
+   `max_flat_workgroup_size < targetWaveSize`). HW
    EXEC stays at the source-active mask kernel-wide, so target lanes
    past the source-wave width are HW-inactive for the rest of the
    kernel body (which is the whole point of the phantom-lane
@@ -701,14 +685,10 @@ projections:
    a proper scoped region (materialising as `s_or_saveexec_b64 sN,
    -1` entry / `s_mov_b64 exec, sN` exit in the final HSACO).
 
-The MODREP path is correct on minimal repros (isolated and K-loop-
-chained WMMAs, verified via `lit_tests/wmma_phantom_lane_f16_chain/`)
-but an unexplained residual divergence remains on Triton's
-`matmul_fp16_16x16` kernel at M>=32 through `compare_correctness`.
-Until that residual is pinned, both WMMA arms in
-`handle_valu_vop3p.cpp` keep the `!providesFullWaveExecInvariant()`
-refusal gate. The infrastructure is landed additively so the next
-investigation has a known-good baseline to compare against.
+The MODREP path is correct on focused reproducers, including isolated and
+K-loop-chained WMMAs verified by `lit_tests/wmma_phantom_lane_f16_chain/`.
+Broader matrix kernels remain the stress surface for this path; refusal gates
+should only be relaxed with matching end-to-end evidence.
 
 ### 12.1 Infrastructure summary
 
@@ -723,9 +703,9 @@ investigation has a known-good baseline to compare against.
 When the `matmul_fp16_16x16` residual is pinned and the MODREP path
 is ready to enable:
 
-1. **Prove correctness** on `compare_correctness --recipe=matmul_fp16
-   {,_16x16}`: all shapes must match, not just `EXIT=2`. Run both
-   recipes through the full sweep.
+1. **Prove correctness** with end-to-end validation for `matmul_fp16`
+   and `matmul_fp16_16x16`: all shapes must match, not merely avoid a
+   translation failure.
 2. **Drop the refusal gates** in `handle_valu_vop3p.cpp` (both the
    K=4 f32 arm and the K=32/K=64 arm). The `!providesFullWaveExec
    Invariant()` check and its `RaiseFailure::unsupportedShape`
@@ -814,7 +794,7 @@ would drop at least one of those three anchors.
 ### 12.4 Remaining `matmul_fp16` divergence — multi-WMMA + `v_permlane16_swap_b32`
 
 With §12.3's fix applied and the refusal gate lifted locally,
-`matmul_fp16_16x16` passes `compare_correctness` 5/5.  The sibling
+`matmul_fp16_16x16` passes 5/5 in end-to-end validation.  The sibling
 `matmul_fp16` (BLOCK=32, four parallel WMMAs per WG, epilogue
 without LDS round-trip) still diverges for non-uniform inputs.
 
@@ -1213,7 +1193,7 @@ as a single operand (matrix_b_reuse extension); another: the
 (row_hw, K_hw) lane/dw/half mapping is a non-trivial permutation
 that still yields a valid 16×32 matrix when interpreted by the
 matmul unit.  Neither matches any documented layout in
-`/home/mluecke/llvm-project/llvm/lib/Target/AMDGPU/VOP3PInstructions.td`
+`llvm/lib/Target/AMDGPU/VOP3PInstructions.td`
 or its surrounding lowering code.
 
 **Consequence for the MFMA lowering**: `redistributeInput` is
@@ -1255,9 +1235,9 @@ investigation resumes.
 The Session-5 refusal gate was too broad: it blocked the K=32/K=64
 WMMA→MFMA lowering for EVERY MODREP kernel, even single-WMMA-per-K-
 iter kernels like `matmul_fp16_16x16` whose lowering the rest of
-this document's analysis validates.  compare_correctness confirms
+this document's analysis validates.  End-to-end corpus validation confirms
 `matmul_fp16_16x16` produces 5/5 `match` output with the gate off
-(see `tools/compare_correctness/RESULTS.md`) — the gate was a
+(see the corresponding validation results) — the gate was a
 false-positive refusal on that corpus recipe.
 
 The root cause of `matmul_fp16`'s remaining wrongness is specific to
@@ -1531,17 +1511,11 @@ Regression guards landed with the fix:
   — closes the coverage gap on the K=4 WMMA MODREP path (the
   old refusal gate that was dropped for this commit had no
   corpus-level test keeping it honest).
-* `tests/gfx1250_gpu_test.cpp` — `Permlane16Swap`,
-  `Permlane16SwapWave32`, `Permlane16SwapWave32WaveNative`
-  updated to the asymmetric expectations (they were WRONG under
-  the pre-fix symmetric emulation; the tests' block comments
-  literally predicted their current-form failure would root-
-  cause the `tl.sort` cross-16 merge bug).
-* `tests/gfx1250_gpu_test.cpp::Permlane16SwapDivergentExec` —
-  new test pinning the per-destination-lane EXEC gate (odd
-  lanes inactive at the swap site; inactive lanes must retain
-  their initial VGPR values while active lanes see the
-  asymmetric swap).
+* Permlane16-swap regression coverage pins the asymmetric expectations
+  for same-wave, ModuloReplication, and WaveNative projection modes.
+* Divergent-EXEC permlane16-swap coverage pins the per-destination-lane
+  EXEC gate: inactive lanes must retain their initial VGPR values while
+  active lanes see the asymmetric swap.
 
 ## 13. Relationship to other axes
 

@@ -1,19 +1,12 @@
 # AMD Hotswap Transpiler
 
-> **Migration note:** This project has just moved from the ROCR
-> `hotswap/transpiler` tree into COMGR under `amd/comgr/hotswap`. The source code and
-> focused COMGR validation are current, but some design notes, comments, and
-> docs may still describe the old ROCR-local layout or lag the new
-> COMGR-owned integration shape.
-
 `amd/comgr/hotswap` contains the compiler-side AMDGPU binary translation library used
 by the COMGR hotswap-transpile prototype. It lifts AMDGPU code objects to LLVM
 IR, lowers them through the in-tree AMDGPU backend for a target ISA, and returns
 a translated HSACO.
 
-This directory is intentionally compiler-owned. Runtime policy, HIP preload
-shims, GPT-OSS/SGLang runners, and ROCR loader integration live outside this
-LLVM tree.
+This directory is compiler-owned and is consumed by COMGR. Runtime loaders
+should call COMGR instead of including hotswap internals directly.
 
 ## Build Modes
 
@@ -111,10 +104,9 @@ The LLVM-facing tree keeps:
 - focused unit tests under `tests/`;
 - the small `tests/vecadd_gfx950.co` fixture used by COMGR lit coverage.
 
-Local validation harnesses that depend on a ROCR adapter, HIP preload shims,
-GPT-OSS/SGLang, AITER, or large external corpora are intentionally not part of
-this LLVM-facing directory. They are tracked separately in the migration scratch
-area and can become a ROCR-side validation stack later.
+Runtime and workload-level validation should live in the runtime integration
+that calls COMGR. The hotswap tree keeps compiler-unit tests, lit fixtures, and
+small code-object smoke coverage.
 
 ## Current Limitations
 
@@ -124,5 +116,5 @@ area and can become a ROCR-side validation stack later.
 - The COMGR public entry point is provisional.
 - Translation cache policy exists in the hotswap library but is not yet wired
   through the COMGR API.
-- ROCR integration is a separate adapter patch stack; this directory only owns
-  compiler-side translation.
+- Runtime integration is expected to use COMGR as the boundary; this directory
+  owns compiler-side translation.

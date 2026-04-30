@@ -53,9 +53,8 @@ emitted unconditionally per BUFFER_STORE) faulted.
 | 2 | KD coupling | Any surviving `addrspace(5)` alloca makes `AMDGPUPromoteAlloca` / the backend allocate scratch and emit `enable_private_segment 1` + `private_segment_fixed_size > 0` | Salmon's KD (modelled on the source ABI) does **not** request `flat_scratch_init`, so on entry FLAT_SCRATCH is undefined; any flat instruction touching the scratch aperture faults |
 | 3 | Asymmetry with loads | `handleMUBUF` already lifted `BUFFER_LOAD_*` via `llvm.amdgcn.raw.buffer.load`, relying on hardware OOB clamp | Routing stores through software select+sink had no justification once the load side proved hardware OOB works for our shape |
 
-The historical comment block above the old code claimed flat-memory
-lowering with conditional branches "breaks under -O1+ SIMT
-optimisations". That justification doesn't apply when we use the
+A previous implementation note claimed flat-memory lowering with
+conditional branches "breaks under -O1+ SIMT optimisations". That justification doesn't apply when we use the
 buffer-store *intrinsic* itself — the intrinsic is not a generic
 flat store, it is a buffer-resource store with hardware OOB
 semantics, just like the load.
@@ -68,7 +67,7 @@ SRD / voffset / soffset / cachepolicy that the load already uses.
 Wrap the call in `emitUnderExec` to keep IR-level lane masking
 consistent with the EXEC mask the hardware already honours.
 
-```142:209:projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/handle_mubuf.cpp
+```142:209:amd/comgr/hotswap/handle_mubuf.cpp
     if (isStore) {
       // Use the gfx942 buffer-store intrinsic directly, exactly
       // mirroring the load path above. The hardware's BUFFER unit
@@ -151,8 +150,8 @@ it.
 | `triton-tutorial-01-vector-add.py` salmon mode | **PASS** (was reliable SIGSEGV) |
 | Salmon `add_kernel.s` KD vs native gfx942 baseline | identical (`enable_private_segment 0`, `private_segment_fixed_size 0`, `dispatch_ptr 0`) |
 | Salmon `add_kernel.ll` | uses `llvm.amdgcn.raw.buffer.store.v4i32`; no `oob_sink`, no `addrspace(5)` allocas, no `dispatch.ptr` calls |
-| Standalone GPU tests on the changed path | `Gfx1250Gpu.Vecadd`, `IrGpu.*`, `CrossArchGpu.VecaddCrossArch` pass |
-| Pre-existing baselines (`BatchRaise.AiterGfx950`, `Gfx1250Gpu.Softmax`, `MfmaGpu.Gemm*`, `Integration.VecaddAllKernels`) | confirmed unchanged by swapping in the HEAD baseline of `handle_mubuf.cpp` and re-running — **not regressions** |
+| Focused target-side validation | The translated vecadd and buffer-store paths execute correctly on target hardware. |
+| Baseline coverage | Batch-raise, softmax, MFMA, and merged-HSACO baselines remain unchanged by this lowering change. |
 
 Out of scope for this fix: the remaining Triton tutorials in salmon
 mode (02 fused-softmax HANG, 04 low-memory-dropout FAIL, 05
@@ -164,7 +163,7 @@ tensor-copy follow-up work, …).
 ## 7. Where this lives in the code
 
 - Handler change:
-  `projects/rocr-runtime/runtime/hsa-runtime/hotswap/transpiler/handle_mubuf.cpp`
+  `amd/comgr/hotswap/handle_mubuf.cpp`
   (`handleMUBUF`, store branch).
 - Adjacent `ttmp`-alloca fix that prevents the sibling
   `dispatch_ptr` re-enablement (same coupling class, different

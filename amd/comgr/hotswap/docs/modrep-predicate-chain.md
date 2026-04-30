@@ -7,7 +7,7 @@ explicit-readfirstlane SGPR-forced class. Under `WaveNativeProjection` (the
 default for wave32 → wave64 cross-widening) the class is structurally
 suppressed except for the defensive phantom-lane sub-case. Under
 `ModuloReplicationProjection`, the narrow-O1 classifier in
-`transpiler/c5_predicate_chain_classifier.{hpp,cpp}` refuses only when an
+`c5_predicate_chain_classifier.{hpp,cpp}` refuses only when an
 active target replica lane can exist; statically single-source-wave launches
 (`0 < max_flat_workgroup_size ≤ W_s`) remain supported because upper target
 lanes are hardware-inactive for the entire kernel body.
@@ -377,8 +377,7 @@ that non-trigger writelane/readlane rewrite cases stay on their existing path.
 
 ### O4. Harness-side constraint on `num_warps`
 
-Add a check in `compare_correctness`'s AOT-compile flow
-(`aot_compile.py`) that refuses to compile a recipe for
+Add a check in the AOT compile flow that refuses to compile a recipe for
 gfx1250 unless `num_warps × W_s ≥ W_t`. Ensures the target WG
 is at least one full target wave and MODREP's replica factor
 is 1.
@@ -402,7 +401,7 @@ assertion today but break on a `num_warps` bump.
 ### 6.1 Narrow-O1 classifier
 
 Implementation:
-`transpiler/c5_predicate_chain_classifier.{hpp,cpp}`. Wired into
+`c5_predicate_chain_classifier.{hpp,cpp}`. Wired into
 `raiser.cpp` Phase 6.6 (post-mem2reg). Emits
 `RaiseFailure::crossWavePredicateChain` on refusal, with
 `ObstructionKind::WorkitemIdPredicateChain` +
@@ -544,9 +543,8 @@ routing pattern to the six `V_{ADD,SUB,SUBREV}_CO_(CI_)U32`
 carry-chain handlers in `handle_valu.cpp` closes the VOPD /
 VOP3B SGPR-operand class independently of the predicate-chain
 class this document scopes. See the lit fixtures in §7.2 for
-the IR-level regression fences and the
-`compare_correctness.cpp` Triton-corpus sweep for the
-end-to-end verdicts.
+the IR-level regression fences and the Triton-corpus end-to-end
+verdicts.
 
 The narrow-O1 classifier (§6.1) still serves as the MODREP-path
 regression guard for the predicate-chain class — on a future
@@ -650,7 +648,7 @@ here because they close `canary_bpermute_scan_fp32` /
 
 ### 7.3 End-to-end regression surface
 
-`compare_correctness`'s salmon path on the Triton corpus (run
+External end-to-end validation on the Triton corpus (run
 against `gfx1250 → gfx942` cross-widening, WaveNative default):
 
 - `canary_bpermute_scan_fp32` — MATCH 4/4 under WaveNative
@@ -666,35 +664,22 @@ against `gfx1250 → gfx942` cross-widening, WaveNative default):
   (`wave-size-translation.md §5.6.3`); orthogonal class.
 
 `ctest` + `llvm-lit`: no regressions introduced by the landed
-design. `BatchRaise.AiterGfx950`: raise rate unchanged.
-Historical note: this originally left
-`Gfx1250Gpu.Matmul128x128_1tile` unchanged under WaveNative. That is
-no longer the current result: the Matmul128 family graduated after the
-V_CMP → V_CNDMASK per-lane-i1 shadow fix documented in
-`learnings.md` (2026-04-21), and Matmul tests are no longer listed in
-`transpiler/tests/xfail.cmake`.
+design. Batch-raise corpus coverage is unchanged. The Matmul128 family
+remains covered by the V_CMP → V_CNDMASK per-lane-i1 shadow tests
+documented in `learnings.md` (2026-04-21).
 
 ### 7.4 Repro
-
-Single-recipe salmon verdict:
-
-```bash
-cd $TRANSPILER/tools/compare_correctness
-LD_PRELOAD=./libsalmon_intercept.so \
-LD_LIBRARY_PATH=$ROCR_BUILD/rocr/lib \
-  ./compare_correctness --recipe=canary_bpermute_scan_fp32
-```
 
 Raise a single kernel to IR under each projection:
 
 ```bash
 # WaveNative default
-$TRANSPILER/build/raise_cli <kernel>.gfx1250.co \
+<hotswap-build>/raise_cli <kernel>.gfx1250.co \
   --isa=gfx1250 --target-isa=gfx942 \
   --emit-ir=<kernel_name>
 
 # MODREP (loud-refuses predicate-chain shapes)
-$TRANSPILER/build/raise_cli <kernel>.gfx1250.co \
+<hotswap-build>/raise_cli <kernel>.gfx1250.co \
   --isa=gfx1250 --target-isa=gfx942 \
   --disable-wave-native \
   --emit-ir=<kernel_name>
@@ -715,17 +700,17 @@ $TRANSPILER/build/raise_cli <kernel>.gfx1250.co \
   §5 — `SemOpAttrs` extension pattern (relevant if a future
   revision hangs a `predicateChainLaneScoped` bit on tid-
   emitting SemOps).
-- `transpiler/c5_predicate_chain_classifier.{hpp,cpp}` — the
+- `c5_predicate_chain_classifier.{hpp,cpp}` — the
   narrow-O1 classifier. Header carries the full design contract
   and the `waveNative` parameter docstring.
-- `transpiler/handle_vopd.cpp` — the VOPD `v_cndmask_b32`
+- `handle_vopd.cpp` — the VOPD `v_cndmask_b32`
   SGPR-condition handler (§6.4).
-- `transpiler/handle_valu.cpp` — the six carry-chain handlers
+- `handle_valu.cpp` — the six carry-chain handlers
   with `readCarryInI1` / `writeCarryOutI1` helpers (§6.4).
-- `transpiler/handle_valu_vop3p.cpp` — the non-VOPD
+- `handle_valu_vop3p.cpp` — the non-VOPD
   `V_CNDMASK_B32` handler; the reference implementation whose
   SGPR-aware routing the VOPD + carry-chain fixes mirror.
-- `transpiler/rewrite_cross_lane_divergent.cpp` — the
+- `rewrite_cross_lane_divergent.cpp` — the
   writelane/readlane post-raise rewrite. Structural template
   for a future O2 landing.
 
@@ -734,7 +719,7 @@ $TRANSPILER/build/raise_cli <kernel>.gfx1250.co \
 ## 9. Open questions
 
 1. Is there evidence of a GPT-OSS / AITER kernel in the broader
-   corpus (beyond compare_correctness's Triton set) that
+   corpus (beyond the current Triton set) that
    genuinely hits the predicate-chain class — i.e., matches the
    §2 signature AND miscompiles in a way not explained by the
    VOPD-cndmask / carry-chain class (§6.4) or the

@@ -141,7 +141,7 @@ scalar role.
 - **I1 — Additive, not replacing.** Narrow store and extract reader
   are both preserved. Absence of the cache routes to the existing
   (known-semantics, lossy-under-cross-widening, correct-everywhere-else)
-  path. Nothing the old code did is regressed.
+  path. The pre-existing extract path remains available when the shadow is absent.
 - **I2 — Same-BB, SSA-monotonic.** Within a BB, the raiser processes
   instructions in program order. The SSA value in the cache *is* the
   last V_CMP's `i1` with no intervening write to the same SGPR.
@@ -279,11 +279,10 @@ Only when §3.1's limitations hurt a real corpus kernel. Specifically:
 - Cross-BB coverage becomes a hard requirement for a shipping kernel
   before a proper reaching-definitions pass on the raised IR is ready.
 
-The existing runtime probe `tools/compare_correctness/kernels/v_cmp_
-cndmask_sgpr.hip` naturally becomes the regression gate for whichever
-design lands — with §3.1 the gate expands from `defaultBlocks={16,32}`
-to the full sweep; with §4 it stays at the full sweep and additionally
-pins a cross-BB / scalar-interleaved variant.
+The V_CMP-to-V_CNDMASK end-to-end recipe is the regression gate for
+whichever design lands: with §3.1 it expands from the narrow block-size
+subset to the full sweep; with §4 it stays at the full sweep and
+additionally pins a cross-BB / scalar-interleaved variant.
 
 ## 5. Scope boundaries of the chosen design (§3.1)
 
@@ -333,18 +332,17 @@ pins a cross-BB / scalar-interleaved variant.
   1` / `icmp ne 0`), proving invalidation fired. Negative assertion
   that no direct `select i1 %vcmpf, …` appears between the compare
   and the cndmask.
-- **HIP recipe gate.** `tools/compare_correctness/kernels/v_cmp_
-  cndmask_sgpr.hip` already exists. Under §3.1, widen its
-  `defaultBlocks` from `{16, 32}` back to `{16, 32, 64, 128, 256}`:
-  the larger blocks now fall entirely into the cache path and must
-  match bit-exactly. The narrowed sweep becomes historical.
+- **End-to-end recipe gate.** The V_CMP-to-V_CNDMASK recipe should
+  cover the full block-size sweep (`{16, 32, 64, 128, 256}`): the
+  larger blocks now fall into the shadow path and must match
+  bit-exactly.
 - **Corpus asin.** `corpus_asin_fp32` moves from 44 % wrong rows to
   match (or WRONG with `max|err|` ≪ recipe tolerance, purely from
   polynomial rounding). `status.py --run` table flips asin from
   `MISMATCH` to `ALL_MATCH`.
-- **No regressions.** `batch_raise_test` raise rate is unchanged (the
-  shadow is an emit-time optimisation, not a lift-blocker).
-  `transpiler_tests` GPU tests pass as before.
+- **No regressions.** Batch-raise coverage is unchanged because the
+  shadow is an emit-time optimisation, not a lift blocker. The focused
+  unit and lit tests continue to pass.
 
 ## 7. Evolution path
 

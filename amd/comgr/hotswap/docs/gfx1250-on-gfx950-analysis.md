@@ -449,7 +449,7 @@ partially compensate via gfx950's higher memory bandwidth.
 | `hotswap/wmma_to_mfma.cpp` | WMMA→MFMA substitution + lane remap sequences |
 | `hotswap/waitcnt_merge.cpp` | s_wait_*cnt → s_waitcnt merging |
 | `hotswap/hotswap.cpp` | Extended with transpile path (vs existing retarget path) |
-| `tools/gen_opcode_tables.py` | Script to extract opcode mappings from LLVM TableGen |
+| TableGen extraction utility | Extract opcode mappings from LLVM TableGen |
 
 ## Alternatives Considered
 
