@@ -1,0 +1,159 @@
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=v_s_exp_f32_kernel 2>/dev/null | %FileCheck %s
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %not %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=v_s_exp_f32_clamp_kernel 2>&1 | %FileCheck %s --check-prefix=REFUSE-CLAMP
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %not %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=v_s_exp_f32_omod_kernel 2>&1 | %FileCheck %s --check-prefix=REFUSE-OMOD
+;
+; Lift test for gfx12 VOP3 pseudo-scalar exp2. The instruction manual defines
+; v_s_exp_f32 as an OPF_SCALAR_TRANS VALU op:
+;   D0.f32 = pow(2.0F, S0.f32)
+; with scalar source/destination registers, 1 ULP accuracy, and flushed
+; denormals. Preserve that special-function contract through the AMDGPU
+; intrinsic instead of generic llvm.exp2.
+
+; CHECK-LABEL: define amdgpu_kernel void @v_s_exp_f32_kernel(
+; CHECK: [[SRC:%[^ ]+]] = bitcast i32 %arg1 to float
+; CHECK: [[EXP:%[^ ]+]] = call float @llvm.amdgcn.exp2.f32(float [[SRC]])
+; CHECK: bitcast float [[EXP]] to i32
+; CHECK-NOT: call {{.*}}@llvm.exp2.f32
+; CHECK: declare {{.*}}float @llvm.amdgcn.exp2.f32(float)
+
+; Non-default output modifiers are deliberately outside the declared support
+; set until their exact clamp / omod semantics are modeled in the lifter.
+; REFUSE-CLAMP: with non-default clamp/omod is not yet lifted
+; REFUSE-OMOD: with non-default clamp/omod is not yet lifted
+
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+	.amdhsa_code_object_version 6
+	.text
+	.globl	v_s_exp_f32_kernel
+	.p2align	8
+	.type	v_s_exp_f32_kernel,@function
+v_s_exp_f32_kernel:
+	s_setreg_imm32_b32 hwreg(HW_REG_WAVE_MODE, 25, 1), 1
+	s_clause 0x1
+	s_load_b32 s2, s[0:1], 0x1c
+	s_load_b128 s[4:7], s[0:1], 0x0
+	s_wait_xcnt 0x0
+	s_bfe_u32 s0, ttmp6, 0x4000c
+	s_and_b32 s1, ttmp6, 15
+	s_add_co_i32 s0, s0, 1
+	s_getreg_b32 s3, hwreg(HW_REG_IB_STS2, 6, 4)
+	s_mul_i32 s0, ttmp9, s0
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_4) | instid1(SALU_CYCLE_1)
+	s_add_co_i32 s1, s1, s0
+	s_wait_kmcnt 0x0
+	s_and_b32 s2, s2, 0xffff
+	s_cmp_eq_u32 s3, 0
+	s_cselect_b32 s0, ttmp9, s1
+	v_mad_u32 v0, s0, s2, v0
+	;;#ASMSTART
+	v_s_exp_f32 s0, s6
+
+	;;#ASMEND
+	v_mov_b32_e32 v1, s0
+	global_store_b32 v0, v1, s[4:5] scale_offset
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel v_s_exp_f32_kernel
+		.amdhsa_kernarg_size 272
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_wavefront_size32 1
+		.amdhsa_next_free_vgpr 2
+		.amdhsa_next_free_sgpr 8
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 1
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+
+	.text
+	.globl	v_s_exp_f32_clamp_kernel
+	.p2align	8
+	.type	v_s_exp_f32_clamp_kernel,@function
+v_s_exp_f32_clamp_kernel:
+	v_s_exp_f32 s0, s6 clamp
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel v_s_exp_f32_clamp_kernel
+		.amdhsa_kernarg_size 0
+		.amdhsa_user_sgpr_count 0
+		.amdhsa_wavefront_size32 1
+		.amdhsa_next_free_vgpr 0
+		.amdhsa_next_free_sgpr 8
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 1
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+
+	.text
+	.globl	v_s_exp_f32_omod_kernel
+	.p2align	8
+	.type	v_s_exp_f32_omod_kernel,@function
+v_s_exp_f32_omod_kernel:
+	v_s_exp_f32 s0, s6 mul:2
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel v_s_exp_f32_omod_kernel
+		.amdhsa_kernarg_size 0
+		.amdhsa_user_sgpr_count 0
+		.amdhsa_wavefront_size32 1
+		.amdhsa_next_free_vgpr 0
+		.amdhsa_next_free_sgpr 8
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 1
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+	.text
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .args:
+      - { .address_space:  global, .offset:         0, .size:           8, .value_kind:     global_buffer }
+      - { .offset:         8, .size:           4, .value_kind:     by_value }
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 272
+    .max_flat_workgroup_size: 1024
+    .name:           v_s_exp_f32_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     8
+    .symbol:         v_s_exp_f32_kernel.kd
+    .vgpr_count:     2
+    .wavefront_size: 32
+  - .args: []
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 0
+    .max_flat_workgroup_size: 1024
+    .name:           v_s_exp_f32_clamp_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     8
+    .symbol:         v_s_exp_f32_clamp_kernel.kd
+    .vgpr_count:     0
+    .wavefront_size: 32
+  - .args: []
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 0
+    .max_flat_workgroup_size: 1024
+    .name:           v_s_exp_f32_omod_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     8
+    .symbol:         v_s_exp_f32_omod_kernel.kd
+    .vgpr_count:     0
+    .wavefront_size: 32
+amdhsa.version: [1, 2]
+...
+
+	.end_amdgpu_metadata
