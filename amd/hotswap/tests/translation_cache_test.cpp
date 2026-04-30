@@ -1,4 +1,4 @@
-#include "test_common.hpp"
+#include <gtest/gtest.h>
 
 #include "../translation_cache.hpp"
 

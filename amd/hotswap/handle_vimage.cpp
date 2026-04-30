@@ -67,7 +67,7 @@
 // When the transpiler was built without hipcc, `tdmRuntimeAvailable()`
 // is false and this handler keeps the pre-existing loud refusal path
 // — the bucket / format name / formatName(VIMAGE) summary stays
-// stable for `kerneldex` / `corpus_test`.
+// stable for diagnostics.
 
 #include "handlers.hpp"
 

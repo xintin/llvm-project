@@ -59,9 +59,11 @@
 ; 0xAA = 170, 0xCC = 204.
 ; CHECK:       {{%[^ ]+}} = phi i32 [ 170, %[[DO2]] ], [ 204, %[[SKIP]] ]
 
-; Third SPE diamond — keyed on %and64 (EXEC after s_and_b64).
+; Third SPE diamond — keyed on the per-lane shadow derived from %and64.
 ; CHECK:       %and64 = and i64 %{{[^ ]+}}, %{{[^ ]+}}
-; CHECK:       %[[AT_LANE3:[^ ]+]] = lshr i64 %and64, %{{[^ ]+}}
+; CHECK:       %[[WAVE_MASK_AND64:[^ ]+]] = and i1 %{{[^ ]+}}, %{{[^ ]+}}
+; CHECK-NEXT:  %[[WAVE_MASK_EXEC:[^ ]+]] = call i64 @llvm.amdgcn.ballot.i64(i1 %[[WAVE_MASK_AND64]])
+; CHECK:       %[[AT_LANE3:[^ ]+]] = lshr i64 %[[WAVE_MASK_EXEC]], %{{[^ ]+}}
 ; CHECK:       br i1 %{{[^ ]+}}, label %[[DO3:[^ ,]+]], label %[[SKIP3:[^ ,]+]]
 
 ; Phi joining the 0xBB active path with the previous phi's result.

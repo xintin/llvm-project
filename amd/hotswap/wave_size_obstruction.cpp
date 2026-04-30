@@ -747,11 +747,11 @@ ObstructionReport buildObstructionReport(ArrayRef<DecodedInst> insts,
       // - Static imm < W_s: provably in-bounds, safe by construction.
       // - Dynamic operand (SGPR): we cannot statically prove the
       //   runtime value is < W_s, BUT we also cannot prove it is out
-      //   of bounds. Triton's softmax / matmul patterns (see
-      //   gpt-oss-derisking.md §7.1) use `v_writelane_b32` with
+      //   of bounds. Triton softmax / matmul patterns use
+      //   `v_writelane_b32` with
       //   dynamic lane operands that are in-bounds at runtime but not
       //   statically provable. Flagging those as refusal would
-      //   collapse coverage on every Gfx1250Gpu.* test that uses
+      //   collapse coverage on every cross-target kernel that uses
       //   them.
       //
       // TODO(dataflow-upgrade): graduate dynamic operands from "not

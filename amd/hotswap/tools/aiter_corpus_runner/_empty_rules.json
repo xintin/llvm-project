@@ -1,5 +1,0 @@
-{
-  "version": 1,
-  "target": "amdgcn-amd-amdhsa--gfx942",
-  "rules": []
-}

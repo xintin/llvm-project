@@ -13,8 +13,7 @@
 ; only the trailing intrinsic name differs. This fixture covers the
 ; FP8_FP8 corner directly and the others transitively through that
 ; shape symmetry; the underlying lane redistribution is also covered
-; transitively by the BF16 fixture and the F16 GPU tests
-; (Gfx1250Gpu.Matmul128x128).
+; transitively by the BF16 and F16 fixtures.
 ;
 ; INVARIANTS PINNED:
 ;

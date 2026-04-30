@@ -158,8 +158,7 @@ llvm::Value *emitWMMAtoMFMA(RaiseContext &ctx,
 /// lane-half). The layout is validated out-of-band by the hipBLASLt
 /// Tensile `SS_SS_HA_Bias_SAV_UA` f32 GEMM kernels (macro-tile
 /// `MT32x32x16`, WMMA shape `MI16x16x1`, wave32) — see
-/// `tools/tensile_gold_verify/verify_transpile.py`, which compares
-/// the lifted gfx942 output against the gfx1250 reference. A layout
+/// a cross-target numerical comparison against the gfx1250 reference. A layout
 /// mismatch would surface as a numerical regression there, not a
 /// silent wrong answer.
 ///

@@ -40,10 +40,9 @@
 ;
 ; Validated against the hipBLASLt/Tensile `SS_SS_HA_Bias_SAV_UA`
 ; family of f32 GEMM kernels (macro-tile `MT32x32x16`, WMMA shape
-; `MI16x16x1`, wave32) — the 4 corpus kernels that surfaced this
-; gap in the cross-target kerneldex sweep. `tools/tensile_gold_verify/`
-; compares the lifted gfx942 output against a gfx1250 gold reference,
-; so a layout mismatch would show up as a numerical regression, not
+; `MI16x16x1`, wave32) — the corpus kernels that surfaced this
+; gap in cross-target validation. A lifted gfx942 output comparison
+; against a gfx1250 gold reference would catch layout regressions, not
 ; a silent wrong answer.
 ;
 ; INVARIANTS PINNED:

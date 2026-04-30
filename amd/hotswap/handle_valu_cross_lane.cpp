@@ -466,10 +466,7 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
   // the same exchange independently in each half, the textbook
   // modulo-replication match.
   //
-  // CI regression gate: the `Gfx1250Gpu.Permlane16Swap` GTest
-  // (tests/gfx1250_gpu_test.cpp) lifts the committed
-  // `test_data/gfx1250/permlane16_swap_gfx1250.hsaco` (built from
-  // `permlane16_swap_kernel.hip` — a wave32 source kernel using
+  // Historical regression gate: a wave32 source kernel using
   // `v_permlane16_swap_b32_e32` via inline asm) and runs it on
   // gfx942 wave64 hardware, verifying per-lane outputs match the
   // expected XOR-16 partner pattern across all 64 lanes:
@@ -520,19 +517,17 @@ HandlerResult handleVALU_CrossLane(RaiseContext &ctx, const DecodedInst &di,
   // in wave32 source bytes indicates either a corrupted disassembly
   // or a wave64 source mis-classified as wave32).
   //
-  // CI regression gates:
-  //   * `Gfx1250Gpu.Permlane16Swap` (tests/gfx1250_gpu_test.cpp)
-  //     runs the XOR-16 emulation on gfx942 hardware and verifies
-  //     per-lane outputs against the expected XOR-16 partner
+  // Historical regression gates included XOR-16 emulation on gfx942
+  // hardware with per-lane outputs checked against the expected
+  // XOR-16 partner
   //     pattern across all 64 lanes.  A regression in the helper
   //     (wrong XOR mask, missing byte-address shift, cross-wiring
   //     error) fails this test before reaching a user.
-  //   * `BatchRaise.AiterGfx950` (tests/batch_raise_test.cpp) lifts
-  //     3 AITER `fmha_v3_fwd/fwd_hd128_bf16*` kernels whose
-  //     reduction cores depend on `v_permlane32_swap_b32`; a
-  //     regression on the helper surfaces here as a lift failure.
-  //     IR-shape coverage lives in `lit_tests/c2_permlane_swap/`
-  //     (XOR-16) and `lit_tests/v_permlane32_swap_b32/` (XOR-32).
+  // Historical corpus coverage included AITER `fmha_v3_fwd/fwd_hd128_bf16*`
+  // kernels whose reduction cores depend on `v_permlane32_swap_b32`; a
+  // regression on the helper surfaces there as a lift failure. IR-shape
+  // coverage lives in `lit_tests/c2_permlane_swap.s` (XOR-16) and
+  // `lit_tests/v_permlane32_swap_b32.s` (XOR-32).
   case SemOp::V_PERMLANE16_SWAP_B32:
     return emitPermLaneSwapEmulation(ctx, di, op, /*partnerXorMask=*/16,
                                       /*ssaPrefix=*/"pls16");

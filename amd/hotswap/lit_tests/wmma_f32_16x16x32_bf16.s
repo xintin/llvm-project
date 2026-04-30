@@ -8,9 +8,8 @@
 ; `case SemOp::V_WMMA_F32_16x16x32_F16: case SemOp::V_WMMA_F32_16x16x32_BF16:`;
 ; the parameterised lowering body in transpiler/wmma_lowering.{hpp,cpp}.
 ;
-; Bidirectional handler ↔ test back-reference: the F16 sibling case
-; in the same dispatch block is covered transitively by the existing
-; Gfx1250Gpu.Matmul128x128 gtest; this fixture covers the BF16 fork.
+; Bidirectional handler/test back-reference: this fixture covers the
+; BF16 fork of the same dispatch block as the F16 case.
 ;
 ; INVARIANTS PINNED:
 ;

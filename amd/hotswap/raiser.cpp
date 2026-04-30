@@ -1055,10 +1055,9 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
     LLVM_DEBUG(dbgs() << trace);
     if (report.hasUnrewritable() || report.hasPendingRewrite()) {
       RaiseFailure f = selectFailureFromReport(report);
-      // The factory names the class in `format`; surface the full
-      // trace in `detail` so raise_cli / batch_raise_test can carry
-      // the per-site context forward without re-invoking the
-      // classifier.
+      // The factory names the class in `format`; surface the full trace in
+      // `detail` so diagnostics can carry the per-site context forward without
+      // re-invoking the classifier.
       if (!f.detail.empty())
         f.detail += "\n";
       f.detail += trace;

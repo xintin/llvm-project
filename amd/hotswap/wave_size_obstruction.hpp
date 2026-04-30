@@ -35,7 +35,7 @@ struct MCState;
 // always `ModuloReplicationProjection` — wave-size-translation.md
 // §2.2's coverage ladder envisions `ThreadLoopProjection` /
 // `ScalarizationProjection` as future rungs, but no corpus kernel
-// reaches them (see hotswap/docs/gpt-oss-derisking.md §9.1–9.3).
+// reaches them in the currently audited corpus.
 //
 // Analysis strategy — mostly syntactic, with decoded-register provenance
 // where needed.
@@ -55,8 +55,7 @@ struct MCState;
 //     the lane-operand MCOperand for a constant; static-constant
 //     operands are exact, dynamic operands are NOT flagged today
 //     (Triton's softmax / matmul use writelane with dynamic
-//     operands that happen to be in-bounds at runtime — see
-//     gpt-oss-derisking.md §7.1).
+//     operands that happen to be in-bounds at runtime).
 //   - Cross-lane shuffles (FullWaveRotate / LaneGroupShuffle /
 //     DsSwizzle / DppCrossLane / DsBpermuteGather): matched on
 //     SemOp / `rawMnemonic` — exact.
@@ -85,8 +84,8 @@ struct MCState;
 // provenance approximation with a full SSA dataflow query.
 //
 // The syntactic classifier is the minimum viable unit that catches
-// every obstruction kind on every kernel in the GPT-OSS /
-// hipBLASLt / Gluon corpora (gpt-oss-derisking.md §4); the dataflow
+// every obstruction kind seen in the audited GPT-OSS /
+// hipBLASLt / Gluon corpora; the dataflow
 // upgrade is a refinement to shrink the false-positive set, not a
 // correctness blocker.
 
@@ -247,8 +246,7 @@ struct ObstructionReport {
   // Per LLVM coding standards, omit the explicit inline-element
   // count — `SmallVector<T>` picks a default suited to `sizeof(T)`.
   // GPT-OSS / hipBLASLt / Gluon corpora typically produce a handful
-  // of sites per kernel (gpt-oss-derisking.md §5 worst case is ~13
-  // in `bitmatrix_metadata_compute_stage1`); the default inline
+  // of sites per kernel; the default inline
   // buffer covers that comfortably.
   llvm::SmallVector<ObstructionSite> sites;
 

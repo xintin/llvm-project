@@ -38,9 +38,9 @@ enum class RaiseFailureReason : uint16_t {
   IRVerificationFailed,
   // Phase 1.4.5 wave-size-obstruction classifier (hotswap/docs/
   // wave-size-translation.md §7's three-outcome decision procedure).
-  // One reason per refusal *decision* so `batch_raise_test` and
-  // `corpus_test` can bucket failures without parsing the failure
-  // text. See `wave_size_obstruction.hpp` for the classifier
+  // One reason per refusal *decision* so diagnostics can bucket
+  // failures without parsing the failure text. See
+  // `wave_size_obstruction.hpp` for the classifier
   // taxonomy and the mapping between these reasons and the more
   // specific `ObstructionKind` values.
   //
@@ -68,8 +68,7 @@ enum class RaiseFailureReason : uint16_t {
   // honest "unsupported, may silently miscompile" verdict instead.
   // Today this covers MODE-register writes (`handle_sopk.cpp`) and
   // `implicitarg.ptr` lifts (`handle_smem.cpp`); see
-  // `tools/triton_corpus_runner/INTEGRATION_GAP.md` for the
-  // diagnosis behind each site.
+  // the integration-gap investigation for the diagnosis behind each site.
   StrictUnsafeLowering,
   // Phase 4 init: extractKernelMeta failed to read the kernel descriptor
   // from .rodata via the `<name>.kd` symbol. Without the KD we cannot
@@ -84,7 +83,7 @@ enum class RaiseFailureReason : uint16_t {
 };
 
 // Human-readable name for a `RaiseFailureReason`. Stable enough for
-// test fixtures (`batch_raise_test`, `corpus_test`) to bucket on.
+// diagnostics and tests to bucket on.
 const char *reasonString(RaiseFailureReason r);
 
 struct RaiseFailure {
@@ -169,9 +168,8 @@ struct RaiseFailure {
   // predicate-chain refusal. No `DecodedInst` because
   // `workitem.id.x()` is an IR-level intrinsic call, not an MC
   // opcode. `kernelName` is captured for bucketing; `detail` names
-  // the first failing call's icmp + constant so
-  // `batch_raise_test` / `corpus_test` can surface attribution
-  // without parsing `detail`. See
+  // the first failing call's icmp + constant so callers can surface
+  // attribution without parsing `detail`. See
   // `c5_predicate_chain_classifier.{hpp,cpp}` and
   // hotswap/docs/modrep-predicate-chain.md §5 (narrow-O1).
   static RaiseFailure crossWavePredicateChain(llvm::StringRef kernelName,
@@ -197,9 +195,9 @@ struct RaiseFailure {
       llvm::StringRef kernelName, const llvm::Twine &detail);
 
   // `HSA_SALMON_STRICT=1` refusal. `site` is a short stable label
-  // (e.g. `"HWREG_MODE_write"`, `"implicitarg.ptr"`) that
-  // `batch_raise_test` / `corpus_test` can bucket on without parsing
-  // `detail`; `detail` carries the human-readable explanation of *why*
+  // (e.g. `"HWREG_MODE_write"`, `"implicitarg.ptr"`) that callers can
+  // bucket on without parsing `detail`; `detail` carries the human-readable
+  // explanation of *why*
   // the lowering would silently miscompile.
   static RaiseFailure strictUnsafeLowering(const DecodedInst &di,
                                             llvm::StringRef site,

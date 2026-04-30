@@ -1187,8 +1187,7 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     // DROPPED the per-lane VGPR offset, producing a kernel where every
     // lane addresses the same memory location (observable on the
     // `rcp_sqrt_kernel` gfx1250 fixture: 256 output lanes all reading
-    // `in[0x206/4] = in[518]` regardless of tid — see the
-    // `Gfx1250Gpu.RcpSqrt` regression gate in `tests/gfx1250_gpu_test.cpp`).
+    // `in[0x206/4] = in[518]` regardless of tid).
     // The shape discriminator below (`op.srcReg(0).kind == SGPR` AND
     // `op.srcReg(1).kind == VGPR`) matches `decodeGlobalLoadAddr`'s
     // inner predicate but keeps the plain-form AS choice local — the
@@ -1363,7 +1362,7 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     // knows the buffer lives in global) — but it's the identical
     // class that bit GLOBAL_ATOMIC (see that block's comment for the
     // `sum_bitmatrix_rows_u32` failure and the
-    // `Gfx1250Gpu.SumBitmatrixRowsU32` regression gate).  Fixed here
+    // sum-bitmatrix-rows regression gate).  Fixed here
     // for symmetry to close the "handler assumes operand shape that
     // varies by subtarget" bug class across FLAT_LOAD / FLAT_STORE /
     // FLAT_ATOMIC / GLOBAL_LOAD / GLOBAL_STORE / GLOBAL_ATOMIC — all
@@ -1496,8 +1495,7 @@ HandlerResult handleFLAT(RaiseContext &ctx, const DecodedInst &di,
     // of value) for the offset field, so CPol no longer leaks into
     // the offset lookup.  See `hotswap/docs/learnings.md` entry
     // "2026-04-23 — global_atomic SADDR form silently miscompiled"
-    // for the full investigation and the regression gate
-    // (`Gfx1250Gpu.SumBitmatrixRowsU32`).
+    // for the full investigation and the regression gate.
     //
     // Element size for `scale_offset`: every atomic in the SemOp range
     // [GLOBAL_ATOMIC_ADD, GLOBAL_ATOMIC_PK_ADD_F16] operates on a

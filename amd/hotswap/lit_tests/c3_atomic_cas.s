@@ -6,9 +6,8 @@
 ; rewrite that preserves the source semantics on a wider target
 ; wave. The classifier must refuse.
 ;
-; gpt-oss-derisking.md §4 reports 0/170 kernels use this pattern,
-; so this test exists as a guard / regression fence, not because
-; any corpus kernel trips it.
+; The audited corpus did not exercise this pattern, so this test exists
+; as a guard / regression fence, not because any corpus kernel trips it.
 
 ; STDERR: transpiler: pre-translation abort:
 ; STDERR-SAME: cross-wave-replica-race

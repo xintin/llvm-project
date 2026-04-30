@@ -166,7 +166,7 @@ bool constantI32(Value *v, uint32_t &out) {
 // fault, and no stderr output from the runtime.
 //
 // Bisected with kernels/build/mubuf_store_b32 + inline-asm V#
-// probes (see hotswap/docs/triage-2026-04-20-softmax-matmul128.md):
+// probes:
 //
 //   dw3=0x00020000  MATCH   DATA_FORMAT=32 alone (minimum working)
 //   dw3=0x00024000  MATCH   DATA_FORMAT=32 + NUM_FORMAT=UINT

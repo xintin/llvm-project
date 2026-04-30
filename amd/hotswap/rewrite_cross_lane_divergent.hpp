@@ -121,8 +121,8 @@ namespace transpiler {
 // readlane on the same VGPR reads BOTH `N` and `N + W_s`. The upper
 // replica returns undef, which flows into downstream address math and
 // faults the kernel with HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION
-// (observed on the Gfx1250Gpu.Matmul128x128* gtests after graduation;
-// see hotswap/docs/learnings.md).
+// (observed historically on matmul cross-widening kernels after
+// WaveNative graduation).
 //
 // USE-CHAIN CONSTRAINT. The rewrite is correct for any kernel whose
 // writelane / readlane results flow only into VGPR-safe consumers

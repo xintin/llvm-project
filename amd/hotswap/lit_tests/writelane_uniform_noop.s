@@ -20,8 +20,7 @@
 ; sibling readlane reads BOTH lane N and lane N + W_s, so the upper
 ; source-wave replica observes undef and downstream address math
 ; faults (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION; see the
-; Gfx1250Gpu.Matmul128x128* triage in tests/xfail.cmake and
-; hotswap/docs/wave-size-translation.md §5.6.3 "symmetry contract").
+; wave-size-translation.md §5.6.3 "symmetry contract").
 ;
 ; Under the symmetry fix, every writelane site is rewritten under
 ; cross-widening regardless of operand divergence. Uniform operands

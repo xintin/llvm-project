@@ -52,9 +52,12 @@
 
 ; s_and_b64 exec, exec, s[4:5] writes EXEC to %and64. This proves
 ; the S_AND_B{32,64} handler on an EXEC destination routes through
-; storeExec — same SSA-level contract as the V_CMPX path.
+; storeExec. The SPE predicate uses the derived per-lane shadow, not
+; the raw scalar %and64 value.
 ; CHECK:       %and64 = and i64 %{{[^ ]+}}, %{{[^ ]+}}
-; CHECK:       lshr i64 %and64, %{{[^ ]+}}
+; CHECK:       %[[WAVE_MASK_AND64:[^ ]+]] = and i1 %{{[^ ]+}}, %{{[^ ]+}}
+; CHECK-NEXT:  %[[WAVE_MASK_EXEC:[^ ]+]] = call i64 @llvm.amdgcn.ballot.i64(i1 %[[WAVE_MASK_AND64]])
+; CHECK:       lshr i64 %[[WAVE_MASK_EXEC]], %{{[^ ]+}}
 
 ; Final store under the %and64 mask (valB = 0xBB = 187).
 ; CHECK:       store i32 {{.*}}, ptr addrspace(1) %{{[^ ]+}}, align 4

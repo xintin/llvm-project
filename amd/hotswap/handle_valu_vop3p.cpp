@@ -495,9 +495,8 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     // the backend couldn't lower on gfx1250 (no MFMA hardware).
     // `BatchRaise.Gfx1250TestData` "succeeded" on that broken path
     // because the raise completed, even though any downstream
-    // codegen attempt would have failed.  See
-    // `hotswap/docs/gpt-oss-derisking.md` for the WMMA taxonomy
-    // and the K=4 f32 case above for the same structural fix
+    // codegen attempt would have failed.  The WMMA taxonomy
+    // and the K=4 f32 case above use the same structural fix
     // pattern (which got it right originally — this K=32/K=64
     // case was slower to catch up).
     if (ctx.targetIsa.hasTensorOps) {
