@@ -188,25 +188,22 @@ target_include_directories(amd_comgr
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# The hotswap CMakeLists exposes the hotswap-transpiler static library and
-# the HOTSWAP_TRANSPILER_* discovery variables (see amd/hotswap/CMakeLists.txt
-# for the contract); it does not build its own raise_cli / tests when
-# consumed via add_subdirectory.
+# The hotswap CMakeLists exposes the hotswap::transpiler target. CMake
+# targets are visible across sibling LLVM_EXTERNAL_PROJECTS directories, so
+# COMGR can consume the same target whether LLVM added hotswap first or COMGR
+# adds it here. The target's PUBLIC usage requirements carry the hotswap include
+# root needed for `#include "hotswap/pipeline.hpp"`.
 if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
-  if(NOT TARGET hotswap-transpiler)
+  if(NOT TARGET hotswap::transpiler)
     add_subdirectory("${COMGR_HOTSWAP_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/hotswap")
   endif()
-  if(NOT HOTSWAP_TRANSPILER_FOUND)
+  if(NOT TARGET hotswap::transpiler)
     message(FATAL_ERROR
       "COMGR_ENABLE_HOTSWAP_TRANSPILE=ON but the hotswap CMake subproject at "
-      "'${COMGR_HOTSWAP_DIR}' did not export HOTSWAP_TRANSPILER_FOUND. "
-      "Update hotswap to a revision that sets the HOTSWAP_TRANSPILER_* "
-      "variables.")
+      "'${COMGR_HOTSWAP_DIR}' did not define the hotswap::transpiler target.")
   endif()
-  target_include_directories(amd_comgr PRIVATE
-    ${HOTSWAP_TRANSPILER_INCLUDE_DIRS})
-  target_link_libraries(amd_comgr PRIVATE ${HOTSWAP_TRANSPILER_LIBRARIES})
+  target_link_libraries(amd_comgr PRIVATE hotswap::transpiler)
   target_compile_definitions(amd_comgr PRIVATE COMGR_ENABLE_HOTSWAP_TRANSPILE=1)
 endif()
 

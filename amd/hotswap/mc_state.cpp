@@ -44,7 +44,7 @@ bool initMCState(MCState &state, StringRef targetISA) {
   state.subtargetInfo = buildSubtargetInfo(*state.target, targetISA);
   state.asmInfo.reset(state.target->createMCAsmInfo(
       *state.regInfo, triple, MCTargetOptions()));
-  state.ctx = std::make_unique<MCContext>(triple, state.asmInfo.get(),
+  state.ctx = std::make_unique<MCContext>(triple, *state.asmInfo,
                                          state.regInfo.get(),
                                          state.subtargetInfo.get());
   // Defensive consistency with the legacy hotswap path

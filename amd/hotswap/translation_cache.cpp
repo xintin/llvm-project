@@ -139,8 +139,7 @@ std::string loadedImageIdentity() {
   static const std::string identity = [] {
     std::string out;
     llvm::raw_string_ostream os(out);
-    os << "compiled=" << __DATE__ << " " << __TIME__
-       << "|llvm=" << LLVM_VERSION_STRING;
+    os << "llvm=" << LLVM_VERSION_STRING;
     Dl_info info;
     if (::dladdr(reinterpret_cast<void *>(&loadedImageIdentity), &info) &&
         info.dli_fname) {

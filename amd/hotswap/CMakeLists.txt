@@ -195,6 +195,10 @@ add_library(hotswap-transpiler STATIC
   ${HOTSWAP_TDM_RUNTIME_GENERATED_CPP}
 )
 
+if(NOT TARGET hotswap::transpiler)
+  add_library(hotswap::transpiler ALIAS hotswap-transpiler)
+endif()
+
 target_compile_definitions(hotswap-transpiler PRIVATE
   HOTSWAP_HAVE_TDM_RUNTIME=${HOTSWAP_HAVE_TDM_RUNTIME}
 )
@@ -233,30 +237,6 @@ set_target_properties(hotswap-transpiler PROPERTIES POSITION_INDEPENDENT_CODE ON
 target_include_directories(hotswap-transpiler PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
 )
-
-# Export discovery variables for parent CMake projects that pull this in
-# via add_subdirectory. Linking against the `hotswap-transpiler` target
-# already propagates the public include directory above transitively, so
-# these variables are not required for compilation; they exist so callers
-# can spell hotswap paths without recomputing relative offsets and so the
-# target name has a single canonical alias.
-#
-# Available in a parent scope after add_subdirectory(<hotswap>):
-#   HOTSWAP_TRANSPILER_FOUND        -- always TRUE
-#   HOTSWAP_TRANSPILER_SOURCE_DIR   -- absolute path to amd/hotswap/
-#   HOTSWAP_TRANSPILER_INCLUDE_DIRS -- include root (parent of amd/hotswap/),
-#                                      so headers resolve as
-#                                      `#include "hotswap/pipeline.hpp"`
-#   HOTSWAP_TRANSPILER_LIBRARIES    -- the static library target name
-get_directory_property(_hotswap_transpiler_has_parent PARENT_DIRECTORY)
-if(_hotswap_transpiler_has_parent)
-  set(HOTSWAP_TRANSPILER_FOUND TRUE PARENT_SCOPE)
-  set(HOTSWAP_TRANSPILER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}" PARENT_SCOPE)
-  set(HOTSWAP_TRANSPILER_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/.."
-      PARENT_SCOPE)
-  set(HOTSWAP_TRANSPILER_LIBRARIES hotswap-transpiler PARENT_SCOPE)
-endif()
-unset(_hotswap_transpiler_has_parent)
 
 # `llc`, `llvm-mc`, `llvm-objdump` etc. live in the build tree's bin/.
 # ROCR's trap-handler subproject may require a ROCm Clang package even when
