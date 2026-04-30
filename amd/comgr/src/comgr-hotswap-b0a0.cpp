@@ -67,6 +67,7 @@ static RewriteConfig makeGfx1250B0A0Config() {
 uint32_t applyInPlacePatches(PatchContext &, size_t);
 uint32_t applyTrampolinePatches(PatchContext &, size_t);
 uint32_t applyWmmaHazardPatch(PatchContext &);
+uint32_t applyDS2WaitBump(PatchContext &);
 uint32_t applyWmmaSplitPatches(PatchContext &, size_t);
 uint32_t applyScratchPatches(PatchContext &, size_t);
 CFG buildCfg(ArrayRef<InternalDecodedInst> Decoded, const MCInstrInfo &);
@@ -100,6 +101,7 @@ LLVM_ATTRIBUTE_WEAK uint32_t applyTrampolinePatches(PatchContext &, size_t) {
   return 0;
 }
 LLVM_ATTRIBUTE_WEAK uint32_t applyWmmaHazardPatch(PatchContext &) { return 0; }
+LLVM_ATTRIBUTE_WEAK uint32_t applyDS2WaitBump(PatchContext &) { return 0; }
 LLVM_ATTRIBUTE_WEAK uint32_t applyWmmaSplitPatches(PatchContext &, size_t) {
   return 0;
 }
@@ -349,6 +351,15 @@ applyGfx1250B0toA0Rules(std::vector<InternalDecodedInst> &Decoded,
   }
 
   Patched += applyWmmaHazardPatch(Ctx);
+
+  // Whole-function post-pass: bump s_wait_dscnt immediates by the count
+  // of preceding DS2 sites in each basic block. Independent of every
+  // per-instruction patch and every other whole-function pass: it reads
+  // mnemonics from Ctx.Decoded (immutable since decode) and writes only
+  // at s_wait_dscnt slots in Ctx.Text, which no earlier pass modifies.
+  // If a future patch family rewrites s_wait_dscnt or rebuilds
+  // Ctx.Decoded, this pass must move ahead of it.
+  Patched += applyDS2WaitBump(Ctx);
 
   for (const llvm::StringMapEntry<KernelPatchStats> &KV : KernelStats) {
     StringRef KName = KV.first();

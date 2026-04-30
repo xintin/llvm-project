@@ -353,6 +353,23 @@ bool checkVgprOverlap(const llvm::MCInst &WmmaInst,
                       const llvm::MCInst &ValuInst,
                       const llvm::MCRegisterInfo &MRI);
 
+/// Predicate: returns true iff \p Mnemonic names a DS_READ2 / DS_WRITE2
+/// instruction (with or without the stride64 suffix). Drives the
+/// applyDS2WaitBump post-pass; exposed for unit testing of the
+/// classification table.
+bool isDS2Mnemonic(llvm::StringRef Mnemonic);
+
+/// Encode \p Wait with operand 0 (the dscnt immediate) replaced by
+/// \p NewImm, clamped at the architectural maximum (6-bit field).
+/// Returns the encoded bytes, empty on failure (no immediate operand,
+/// MCCodeEmitter error, or size mismatch with \p ExpectedSize). Pure
+/// function over \p LS; exposed for unit testing of the encode primitive
+/// without standing up a full PatchContext.
+llvm::SmallVector<uint8_t> encodeWaitWithImm(const llvm::MCInst &Wait,
+                                             unsigned NewImm,
+                                             const LLVMState &LS,
+                                             uint32_t ExpectedSize);
+
 // -- VGPR liveness types ------------------------------------------------------
 
 /// Per-instruction def/use bitvectors over the VGPR index space. Populated by

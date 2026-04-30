@@ -297,3 +297,160 @@ TEST(BuildTrampoline, EmptyOnBadAsm) {
                                  /*TrampolineTextOffset=*/0x1000, S);
   EXPECT_TRUE(T.Bytes.empty());
 }
+
+// -- isDS2Mnemonic ------------------------------------------------------------
+//
+// Predicate that classifies decoded mnemonics as DS2 instructions for the
+// applyDS2WaitBump post-pass. The tests pin the StringSwitch enumeration so
+// adding (or accidentally renaming) a variant trips a runtime check
+// immediately. Hostile-prefix near-misses guard against the
+// `starts_with`/`contains` regressions flagged in PR #2293 review.
+
+TEST(IsDS2Mnemonic, NonStride64VariantsMatch) {
+  EXPECT_TRUE(isDS2Mnemonic("ds_load_2addr_b32"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_load_2addr_b64"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_store_2addr_b32"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_store_2addr_b64"));
+}
+
+TEST(IsDS2Mnemonic, Stride64VariantsMatch) {
+  EXPECT_TRUE(isDS2Mnemonic("ds_load_2addr_stride64_b32"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_load_2addr_stride64_b64"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_store_2addr_stride64_b32"));
+  EXPECT_TRUE(isDS2Mnemonic("ds_store_2addr_stride64_b64"));
+}
+
+TEST(IsDS2Mnemonic, NearMissesDoNotMatch) {
+  EXPECT_FALSE(isDS2Mnemonic(""));
+  // Single-address DS variants share the prefix but are not split-targets.
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_b32"));
+  EXPECT_FALSE(isDS2Mnemonic("ds_store_b64"));
+  // Truncated mnemonic (no width suffix).
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr"));
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr_stride64"));
+  // Wrong width suffix not actually emitted.
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr_b16"));
+  // Suffix collision: catches a regression to `starts_with` matching.
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr_b32_extra"));
+  // Prefix collision: catches a regression to `contains` matching.
+  EXPECT_FALSE(isDS2Mnemonic("v_ds_load_2addr_b32"));
+  EXPECT_FALSE(isDS2Mnemonic("prefix_ds_load_2addr_b32"));
+  // Trailing whitespace: catches a regression where getMnemonic() stops
+  // calling rtrim() on the AsmStrs entry.
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr_b32 "));
+  // Case sensitivity (assembly mnemonics are lowercase).
+  EXPECT_FALSE(isDS2Mnemonic("DS_LOAD_2ADDR_B32"));
+  // Non-DS instructions.
+  EXPECT_FALSE(isDS2Mnemonic("s_wait_dscnt"));
+  EXPECT_FALSE(isDS2Mnemonic("v_nop"));
+  // Stride32 instead of stride64 (typo guard).
+  EXPECT_FALSE(isDS2Mnemonic("ds_load_2addr_stride32_b32"));
+}
+
+// -- encodeWaitWithImm --------------------------------------------------------
+//
+// Pure encode primitive. We feed it a real `s_wait_dscnt` MCInst built via
+// the asm parser, ask for a different immediate, and round-trip the bytes
+// back through the disassembler to verify the operand made it to the
+// encoded form. Avoids byte-exact checks (which would couple the test to
+// gfx1250-specific SOPP encoding) and mirrors the approach used by the
+// EncodeSBranch / AssembleDecode tests above.
+
+// Decode a single instruction from \p Bytes and return its decoded MCInst,
+// asserting size + mnemonic match the expectations. Returns a default
+// MCInst on any decode failure so callers can EXPECT_* on the return.
+static llvm::MCInst decodeOne(llvm::ArrayRef<uint8_t> Bytes,
+                              llvm::StringRef ExpectedMnemonic,
+                              const LLVMState &S) {
+  std::vector<InternalDecodedInst> Decoded;
+  EXPECT_TRUE(decodeTextSection(Bytes.data(), Bytes.size(), S, Decoded));
+  EXPECT_EQ(Decoded.size(), 1u);
+  if (Decoded.size() != 1)
+    return llvm::MCInst();
+  EXPECT_EQ(Decoded[0].Mnemonic, ExpectedMnemonic.str());
+  return Decoded[0].Inst;
+}
+
+TEST(EncodeWaitWithImm, RoundTripsBumpedImm) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Original = assembleSingleInst("s_wait_dscnt 5", S);
+  ASSERT_FALSE(Original.empty());
+  llvm::MCInst Wait = decodeOne(Original, "s_wait_dscnt", S);
+
+  llvm::SmallVector<uint8_t> Bumped = encodeWaitWithImm(
+      Wait, /*NewImm=*/7, S, /*ExpectedSize=*/Original.size());
+  ASSERT_EQ(Bumped.size(), Original.size());
+
+  llvm::MCInst Decoded = decodeOne(Bumped, "s_wait_dscnt", S);
+  ASSERT_GE(Decoded.getNumOperands(), 1u);
+  ASSERT_TRUE(Decoded.getOperand(0).isImm());
+  EXPECT_EQ(Decoded.getOperand(0).getImm(), 7);
+}
+
+TEST(EncodeWaitWithImm, ClampsAtMax) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Original = assembleSingleInst("s_wait_dscnt 0", S);
+  ASSERT_FALSE(Original.empty());
+  llvm::MCInst Wait = decodeOne(Original, "s_wait_dscnt", S);
+
+  // Ask for a value past the 6-bit field; encoder must clamp at 63.
+  llvm::SmallVector<uint8_t> Bumped =
+      encodeWaitWithImm(Wait, /*NewImm=*/100, S, Original.size());
+  ASSERT_EQ(Bumped.size(), Original.size());
+
+  llvm::MCInst Decoded = decodeOne(Bumped, "s_wait_dscnt", S);
+  ASSERT_TRUE(Decoded.getOperand(0).isImm());
+  EXPECT_EQ(Decoded.getOperand(0).getImm(), 63);
+}
+
+TEST(EncodeWaitWithImm, EncodesZeroImm) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Original = assembleSingleInst("s_wait_dscnt 5", S);
+  ASSERT_FALSE(Original.empty());
+  llvm::MCInst Wait = decodeOne(Original, "s_wait_dscnt", S);
+
+  llvm::SmallVector<uint8_t> Zero =
+      encodeWaitWithImm(Wait, /*NewImm=*/0, S, Original.size());
+  ASSERT_EQ(Zero.size(), Original.size());
+  llvm::MCInst Decoded = decodeOne(Zero, "s_wait_dscnt", S);
+  ASSERT_TRUE(Decoded.getOperand(0).isImm());
+  EXPECT_EQ(Decoded.getOperand(0).getImm(), 0);
+}
+
+TEST(EncodeWaitWithImm, RejectsNonImmOperand) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  // Construct an MCInst whose operand 0 is a register, not an immediate.
+  // encodeWaitWithImm must refuse rather than corrupting the encoding.
+  llvm::MCInst Bogus;
+  Bogus.setOpcode(0); // any opcode; we only inspect operand 0
+  Bogus.addOperand(llvm::MCOperand::createReg(1));
+  EXPECT_TRUE(
+      encodeWaitWithImm(Bogus, /*NewImm=*/3, S, /*ExpectedSize=*/4).empty());
+
+  llvm::MCInst Empty;
+  EXPECT_TRUE(
+      encodeWaitWithImm(Empty, /*NewImm=*/3, S, /*ExpectedSize=*/4).empty());
+}
+
+TEST(EncodeWaitWithImm, RejectsSizeMismatch) {
+  LLVMState S = initLLVM(makeGfx1250Ident());
+  ASSERT_TRUE(S.Valid);
+
+  llvm::SmallVector<uint8_t> Original = assembleSingleInst("s_wait_dscnt 0", S);
+  ASSERT_FALSE(Original.empty());
+  llvm::MCInst Wait = decodeOne(Original, "s_wait_dscnt", S);
+
+  // Lying about the expected size must produce empty (not a partial
+  // write). Pick a clearly-wrong size to make the intent obvious.
+  EXPECT_TRUE(encodeWaitWithImm(Wait, /*NewImm=*/3, S,
+                                /*ExpectedSize=*/Original.size() + 4)
+                  .empty());
+}
