@@ -91,23 +91,23 @@ set(SOURCES
   src/comgr-unbundle-command.cpp
   src/time-stat/time-stat.cpp)
 
-# Salmon binary transpiler, opt-in. The hotswap project lives at
+# Hotswap binary transpiler, opt-in. The hotswap project lives at
 # amd/hotswap/ as a sibling CMake subproject.
-# When enabled, we compile the comgr-hotswap-salmon.cpp entry point and link
-# the salmon static library into amd_comgr; when disabled, the
+# When enabled, we compile the comgr-hotswap-transpile.cpp entry point and link
+# the hotswap static library into amd_comgr; when disabled, the
 # amd_comgr_hotswap_transpile API is simply not provided.
-option(COMGR_ENABLE_SALMON
-  "Build the salmon-backed amd_comgr_hotswap_transpile entry point" OFF)
-set(COMGR_SALMON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hotswap"
+option(COMGR_ENABLE_HOTSWAP_TRANSPILE
+  "Build the hotswap-transpiler-backed amd_comgr_hotswap_transpile entry point" OFF)
+set(COMGR_HOTSWAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hotswap"
   CACHE PATH "Path to the hotswap-transpiler CMake subproject")
-if(COMGR_ENABLE_SALMON)
-  if(NOT EXISTS "${COMGR_SALMON_DIR}/CMakeLists.txt")
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  if(NOT EXISTS "${COMGR_HOTSWAP_DIR}/CMakeLists.txt")
     message(FATAL_ERROR
-      "COMGR_ENABLE_SALMON=ON but no CMakeLists.txt found at "
-      "COMGR_SALMON_DIR='${COMGR_SALMON_DIR}'. Point COMGR_SALMON_DIR at "
-      "the hotswap source tree or set COMGR_ENABLE_SALMON=OFF.")
+      "COMGR_ENABLE_HOTSWAP_TRANSPILE=ON but no CMakeLists.txt found at "
+      "COMGR_HOTSWAP_DIR='${COMGR_HOTSWAP_DIR}'. Point COMGR_HOTSWAP_DIR at "
+      "the hotswap source tree or set COMGR_ENABLE_HOTSWAP_TRANSPILE=OFF.")
   endif()
-  list(APPEND SOURCES src/comgr-hotswap-salmon.cpp)
+  list(APPEND SOURCES src/comgr-hotswap-transpile.cpp)
 endif()
 
 # Add Windows resource file for version info
@@ -192,22 +192,22 @@ target_include_directories(amd_comgr
 # the HOTSWAP_TRANSPILER_* discovery variables (see amd/hotswap/CMakeLists.txt
 # for the contract); it does not build its own raise_cli / tests when
 # consumed via add_subdirectory.
-if(COMGR_ENABLE_SALMON)
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
   if(NOT TARGET hotswap-transpiler)
-    add_subdirectory("${COMGR_SALMON_DIR}"
+    add_subdirectory("${COMGR_HOTSWAP_DIR}"
                      "${CMAKE_CURRENT_BINARY_DIR}/hotswap")
   endif()
   if(NOT HOTSWAP_TRANSPILER_FOUND)
     message(FATAL_ERROR
-      "COMGR_ENABLE_SALMON=ON but the hotswap CMake subproject at "
-      "'${COMGR_SALMON_DIR}' did not export HOTSWAP_TRANSPILER_FOUND. "
+      "COMGR_ENABLE_HOTSWAP_TRANSPILE=ON but the hotswap CMake subproject at "
+      "'${COMGR_HOTSWAP_DIR}' did not export HOTSWAP_TRANSPILER_FOUND. "
       "Update hotswap to a revision that sets the HOTSWAP_TRANSPILER_* "
       "variables.")
   endif()
   target_include_directories(amd_comgr PRIVATE
     ${HOTSWAP_TRANSPILER_INCLUDE_DIRS})
   target_link_libraries(amd_comgr PRIVATE ${HOTSWAP_TRANSPILER_LIBRARIES})
-  target_compile_definitions(amd_comgr PRIVATE COMGR_ENABLE_SALMON=1)
+  target_compile_definitions(amd_comgr PRIVATE COMGR_ENABLE_HOTSWAP_TRANSPILE=1)
 endif()
 
 message("")
@@ -218,8 +218,8 @@ message("-----------Clang_DIR: ${Clang_DIR}")
 message("--CLANG_INCLUDE_DIRS: ${CLANG_INCLUDE_DIRS}")
 message("----LLD_INCLUDE_DIRS: ${LLD_INCLUDE_DIRS}")
 message("---AMDDeviceLibs_DIR: ${AMDDeviceLibs_DIR}")
-if(COMGR_ENABLE_SALMON)
-  message("----COMGR_SALMON_DIR: ${COMGR_SALMON_DIR}")
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  message("----COMGR_HOTSWAP_DIR: ${COMGR_HOTSWAP_DIR}")
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

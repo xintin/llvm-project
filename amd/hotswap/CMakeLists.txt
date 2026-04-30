@@ -19,7 +19,7 @@ if(NOT DEFINED HOTSWAP_TRANSPILER_BUILD_TOOLS)
 endif()
 
 # --- Paths to LLVM ------------------------------------------------------------
-# Salmon needs an LLVM *build tree* (not an install tree) because the raiser
+# Hotswap needs an LLVM *build tree* (not an install tree) because the raiser
 # uses AMDGPU target-private headers (SIDefines.h, SIInstrInfo.h,
 # AMDGPUBaseInfo.h) which transitively #include TableGen-generated
 # AMDGPUGen*.inc files. Those .inc files are produced by llvm-tblgen during
@@ -27,8 +27,8 @@ endif()
 #
 # We support three configurations:
 #
-#   1. In-tree LLVM build. Salmon was added via add_subdirectory() from
-#      LLVM's own CMake (e.g. through LLVM_EXTERNAL_PROJECTS=salmon, or
+#   1. In-tree LLVM build. Hotswap was added via add_subdirectory() from
+#      LLVM's own CMake (e.g. through LLVM_EXTERNAL_PROJECTS=hotswap, or
 #      from a future amd/CMakeLists.txt wired into llvm/). LLVM has
 #      already populated LLVM_MAIN_SRC_DIR / LLVM_BINARY_DIR and the LLVM
 #      library targets; AddLLVM.cmake is loaded. No find_package needed.
@@ -37,10 +37,10 @@ endif()
 #      ...) that already called find_package(LLVM). Variables are
 #      populated; the find_package call below becomes a no-op.
 #
-#   3. Standalone (cmake -S amd/salmon -B build). We need find_package(LLVM)
-#      to resolve LLVM_DIR. Since salmon now lives at <llvm-project>/amd/
-#      salmon, default LLVM_DIR to the conventional <llvm-project>/build
-#      tree if the user did not pass one explicitly.
+#   3. Standalone (cmake -S amd/hotswap -B build). We need find_package(LLVM)
+#      to resolve LLVM_DIR. Since hotswap now lives at
+#      <llvm-project>/amd/hotswap, default LLVM_DIR to the conventional
+#      <llvm-project>/build tree if the user did not pass one explicitly.
 if(TARGET LLVMSupport AND DEFINED LLVM_MAIN_SRC_DIR)
   # Case 1. Mirror the variable name find_package(LLVM) would have set
   # against a build tree, so the rest of this file does not have to
@@ -49,18 +49,18 @@ if(TARGET LLVMSupport AND DEFINED LLVM_MAIN_SRC_DIR)
 else()
   # Cases 2 and 3.
   if(NOT DEFINED LLVM_DIR OR NOT LLVM_DIR)
-    # amd/salmon/ -> amd/ -> <llvm-project>/
-    set(_salmon_default_llvm_build
+    # amd/hotswap/ -> amd/ -> <llvm-project>/
+    set(_hotswap_default_llvm_build
         "${CMAKE_CURRENT_SOURCE_DIR}/../../build/lib/cmake/llvm")
-    if(EXISTS "${_salmon_default_llvm_build}/LLVMConfig.cmake")
-      get_filename_component(_salmon_default_llvm_build
-                             "${_salmon_default_llvm_build}" ABSOLUTE)
-      set(LLVM_DIR "${_salmon_default_llvm_build}" CACHE PATH
+    if(EXISTS "${_hotswap_default_llvm_build}/LLVMConfig.cmake")
+      get_filename_component(_hotswap_default_llvm_build
+                             "${_hotswap_default_llvm_build}" ABSOLUTE)
+      set(LLVM_DIR "${_hotswap_default_llvm_build}" CACHE PATH
           "Path to LLVMConfig.cmake (auto-detected from <llvm-project>/build)")
       message(STATUS
         "LLVM_DIR not set; defaulting to ${LLVM_DIR}")
     endif()
-    unset(_salmon_default_llvm_build)
+    unset(_hotswap_default_llvm_build)
   endif()
   find_package(LLVM REQUIRED CONFIG)
 endif()
@@ -111,7 +111,7 @@ add_definitions(${LLVM_DEFINITIONS})
 # returns false, and the cross-target VIMAGE handler keeps today's loud
 # refusal. This preserves the no-hipcc build behaviour exactly.
 find_program(HIPCC hipcc)
-set(SALMON_TDM_RUNTIME_GENERATED_CPP "")
+set(HOTSWAP_TDM_RUNTIME_GENERATED_CPP "")
 if(HIPCC)
   set(_tdm_src "${CMAKE_CURRENT_SOURCE_DIR}/runtime/tdm.hip")
   set(_tdm_bc  "${CMAKE_CURRENT_BINARY_DIR}/tdm_runtime.gfx942.bc")
@@ -140,11 +140,11 @@ if(HIPCC)
     COMMENT "Embedding TDM runtime bitcode into C++ blob"
     VERBATIM)
 
-  set(SALMON_TDM_RUNTIME_GENERATED_CPP ${_tdm_cpp})
-  set(SALMON_HAVE_TDM_RUNTIME 1)
+  set(HOTSWAP_TDM_RUNTIME_GENERATED_CPP ${_tdm_cpp})
+  set(HOTSWAP_HAVE_TDM_RUNTIME 1)
   message(STATUS "TDM runtime helper enabled (hipcc=${HIPCC})")
 else()
-  set(SALMON_HAVE_TDM_RUNTIME 0)
+  set(HOTSWAP_HAVE_TDM_RUNTIME 0)
   message(STATUS "TDM runtime helper DISABLED (hipcc not found); "
                  "cross-target gfx1250->gfx942 TENSOR ops will keep refusing")
 endif()
@@ -192,11 +192,11 @@ add_library(hotswap-transpiler STATIC
   kernarg_layout.cpp
   user_sgpr_layout.cpp
   tdm_runtime.cpp
-  ${SALMON_TDM_RUNTIME_GENERATED_CPP}
+  ${HOTSWAP_TDM_RUNTIME_GENERATED_CPP}
 )
 
 target_compile_definitions(hotswap-transpiler PRIVATE
-  SALMON_HAVE_TDM_RUNTIME=${SALMON_HAVE_TDM_RUNTIME}
+  HOTSWAP_HAVE_TDM_RUNTIME=${HOTSWAP_HAVE_TDM_RUNTIME}
 )
 
 # Match LLVM's compile flags (no-rtti, no-exceptions, etc.). LLVM is built
@@ -260,11 +260,11 @@ unset(_hotswap_transpiler_has_parent)
 
 # `llc`, `llvm-mc`, `llvm-objdump` etc. live in the build tree's bin/.
 # ROCR's trap-handler subproject may require a ROCm Clang package even when
-# Salmon itself is validated against a local LLVM build, so keep the tool path
+# Hotswap itself is validated against a local LLVM build, so keep the tool path
 # overrideable rather than deriving it unconditionally from the LLVM package
 # used for in-process linkage.
 set(HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR "${LLVM_TOOLS_BINARY_DIR}" CACHE PATH
-  "Directory containing llc, llvm-mc, llvm-objdump, and related LLVM tools used by Salmon")
+  "Directory containing llc, llvm-mc, llvm-objdump, and related LLVM tools used by Hotswap")
 target_compile_definitions(hotswap-transpiler PRIVATE
   LLVM_TOOLS_DIR="${HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR}"
 )

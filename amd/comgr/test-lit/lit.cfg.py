@@ -15,8 +15,8 @@ config.test_exec_root = config.my_obj_root
 if not config.comgr_disable_spirv:
     config.available_features.add("comgr-has-spirv")
 
-if config.comgr_enable_salmon:
-    config.available_features.add("comgr-salmon")
+if config.comgr_enable_hotswap_transpile:
+    config.available_features.add("comgr-hotswap-transpile")
 
 if platform.system() == "Windows":
     config.available_features.add("system-windows")

@@ -2733,12 +2733,12 @@ amd_comgr_hotswap_rewrite(
     amd_comgr_data_t *output) AMD_COMGR_VERSION_3_2;
 
 /**
- * @brief Transpile a code object from one ISA to another via the salmon
+ * @brief Transpile a code object from one ISA to another via the hotswap
  * binary transpiler.
  *
  * Where @c amd_comgr_hotswap_rewrite applies a small set of byte-level
  * stepping patches in place, this entry point hands the entire code object
- * to the salmon pipeline: every kernel is disassembled, raised to LLVM IR,
+ * to the hotswap pipeline: every kernel is disassembled, raised to LLVM IR,
  * re-lowered through the stock AMDGPU backend for @p target_isa_name, and
  * relinked into a single merged HSACO. Use this when the source and target
  * ISAs differ enough that no in-place patch sequence exists (cross-family
@@ -2762,7 +2762,7 @@ amd_comgr_hotswap_rewrite(
  *   done. @p output is not modified on failure.
  *
  * @retval ::AMD_COMGR_STATUS_SUCCESS Transpilation completed successfully.
- * @retval ::AMD_COMGR_STATUS_ERROR The salmon pipeline failed for at least
+ * @retval ::AMD_COMGR_STATUS_ERROR The hotswap pipeline failed for at least
  *   one kernel (unsupported instruction, raise failure, or backend
  *   compilation/link failure). Diagnostic detail is logged to stderr.
  * @retval ::AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT @p input is an invalid

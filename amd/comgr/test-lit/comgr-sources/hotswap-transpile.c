@@ -1,4 +1,4 @@
-//===- hotswap-transpile.c - Test salmon-backed transpile API ------------===//
+//===- hotswap-transpile.c - Hotswap transpile test driver ---------------===//
 //
 // Part of Comgr, under the Apache License v2.0 with LLVM Exceptions. See
 // amd/comgr/LICENSE.TXT in this repository for license information.
@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Driver for amd_comgr_hotswap_transpile (the salmon-backed entry point).
+// Driver for amd_comgr_hotswap_transpile, the hotswap-backed entry point.
 //
 // Mirrors the call/return shape of hotswap-rewrite.c for the validation
 // paths so the two entry points stay in lockstep at the comgr boundary.
@@ -14,7 +14,7 @@
 // gated on the caller supplying a known-good HSACO; in that case it just
 // asserts that the call returns SUCCESS and emits a non-empty output.
 //
-// The salmon pipeline shells out to llc and ld.lld at runtime, so end-to-end
+// The hotswap pipeline shells out to llc and ld.lld at runtime, so end-to-end
 // success on a real HSACO requires an LLVM build tree on PATH. The lit test
 // only exercises the validation paths by default for that reason.
 //
@@ -86,7 +86,7 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  // The salmon pipeline reports per-kernel failures as
+  // The hotswap pipeline reports per-kernel failures as
   // AMD_COMGR_STATUS_ERROR (e.g. unsupported instruction, missing kernels,
   // backend compile failure). Surface this as a distinct line so lit can
   // assert it independently from INVALID_ARGUMENT.

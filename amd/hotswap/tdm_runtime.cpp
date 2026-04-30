@@ -13,18 +13,18 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
-// SALMON_HAVE_TDM_RUNTIME is set to 1 by `CMakeLists.txt` when hipcc is
+// HOTSWAP_HAVE_TDM_RUNTIME is set to 1 by `CMakeLists.txt` when hipcc is
 // available at configure time and the embedded bitcode blob is generated
 // into `tdm_runtime_blob.cpp`. When unset (no hipcc), the linker would
 // otherwise fail to resolve `tdm_runtime_bc_data` / `tdm_runtime_bc_size`
 // — we provide a one-byte stub here so the build succeeds and
 // `tdmRuntimeAvailable()` reports false at runtime.
-#ifndef SALMON_HAVE_TDM_RUNTIME
-#define SALMON_HAVE_TDM_RUNTIME 0
+#ifndef HOTSWAP_HAVE_TDM_RUNTIME
+#define HOTSWAP_HAVE_TDM_RUNTIME 0
 #endif
 
 extern "C" {
-#if SALMON_HAVE_TDM_RUNTIME
+#if HOTSWAP_HAVE_TDM_RUNTIME
 extern const unsigned char tdm_runtime_bc_data[];
 extern const unsigned long tdm_runtime_bc_size;
 #else

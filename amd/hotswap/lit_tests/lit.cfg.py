@@ -1,11 +1,11 @@
 # -*- Python -*-
-"""Lit configuration for Salmon transpiler FileCheck tests (loaded by lit.site.cfg.py)."""
+"""Lit configuration for hotswap transpiler FileCheck tests."""
 
 import os
 
 import lit.formats
 
-config.name = "Salmon Transpiler"
+config.name = "Hotswap Transpiler"
 config.test_format = lit.formats.ShTest(execute_external=True)
 # Each AMDGPU assembly fixture is self-testing: the top of every `.s`
 # carries the lit RUN / CHECK directives, followed by the actual kernel
@@ -27,12 +27,12 @@ if not getattr(config, "test_source_root", None):
 if not getattr(config, "test_exec_root", None):
     import tempfile
     config.test_exec_root = os.path.join(
-        tempfile.gettempdir(), "salmon-transpiler-lit"
+        tempfile.gettempdir(), "hotswap-transpiler-lit"
     )
 
 if not hasattr(config, "available_features") or config.available_features is None:
     config.available_features = set()
-if getattr(config, "salmon_have_tdm_runtime", False):
+if getattr(config, "hotswap_have_tdm_runtime", False):
     config.available_features.add("tdm-runtime")
 
 config.substitutions.append(("%raise_cli", config.raise_cli))

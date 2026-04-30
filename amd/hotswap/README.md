@@ -65,8 +65,8 @@ Point `LLVM_DIR` at `<llvm-build>/lib/cmake/llvm` (the same convention every
 other LLVM out-of-tree project uses).
 
 ```bash
-cmake -B amd/salmon/build \
-  -S amd/salmon \
+cmake -B amd/hotswap/build \
+  -S amd/hotswap \
   -G Ninja \
   -DLLVM_DIR=$HOME/llvm-project/build/lib/cmake/llvm \
   -DCMAKE_CXX_COMPILER=clang++
@@ -79,7 +79,7 @@ needed — GPU tests auto-skip at runtime when HIP is unavailable.
 
 ## Building the transpiler as LLVM external project
 
-Note that you'll have to explicitly provide the source directory path for salmon
+Note that you'll have to explicitly provide the source directory path for hotswap
 as is customary for LLVM external projects.
 
 ```bash
@@ -87,8 +87,8 @@ cmake -B build \
   -S llvm \
   -G Ninja \
   -DLLVM_TARGETS_TO_BUILD="X86;AMDGPU" \
-  -DLLVM_EXTERNAL_PROJECTS=salmon \
-  -DLLVM_EXTERNAL_SALMON_SOURCE_DIR=$HOME/llvm-project/amd/salmon \
+  -DLLVM_EXTERNAL_PROJECTS=hotswap \
+  -DLLVM_EXTERNAL_HOTSWAP_SOURCE_DIR=$HOME/llvm-project/amd/hotswap \
   -DLLVM_ENABLE_PROJECTS="llvm;clang;lld" \
   -DLLVM_USE_LINKER=lld \
 ```
