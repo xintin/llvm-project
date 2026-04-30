@@ -31,8 +31,7 @@
 ;      pair-of-i32 lift would surface as `lshr i32`.
 
 ; CHECK-LABEL: define amdgpu_kernel void @s_lshr_b64_imm_kernel(
-; CHECK-SAME: ptr addrspace(1) %arg0
-; CHECK-SAME: i64 %arg1
+; CHECK-SAME: ptr addrspace(4) byref([272 x i8]) align 16 %kargs
 
 ; The s_lshr_b64 lift. The `lshr64` value-name is the canonical
 ; breadcrumb the handler emits (mirrors `shl64` for S_LSHL_B64 and

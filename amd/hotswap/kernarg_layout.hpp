@@ -3,113 +3,33 @@
 
 #include "code_object_utils.hpp"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Function.h"
-#include <string>
-#include <utility>
-#include <vector>
 
 namespace transpiler {
 
-struct KernargParam {
-  // Byte offset within the kernarg segment.
-  int byteOffset;
-  // Width of the slot in bytes. Pointers / i64 slots are 8 bytes, narrow
-  // scalar `by_value` slots may be 1 or 2 bytes, and every other slot
-  // (including the per-dword decomposition of `by_value` aggregates with
-  // size > 8) is 4 bytes. The
-  // raiser is responsible for splitting any larger `by_value` aggregate
-  // into 4-byte i32 slots so the IR-level kernarg buffer layout matches
-  // the source binary's byte layout. See raiser.cpp for the splitter.
-  int byteSize;
-  // Index into the IR-level kernel function's argument list.
-  int paramIdx;
-  // True iff the source metadata declared this slot as `global_buffer`
-  // (so the IR arg type is `ptr addrspace(1)`); false for i32 / i64 /
-  // dword-of-aggregate slots.
-  bool isPointer;
-};
-
+// Source-kernel kernarg-segment metadata shared by the raiser and any
+// helper that needs to reason about the segment without dereferencing
+// it (e.g. the kernel-entry preloaded-SGPR seeding loop).
+//
+// The raiser itself no longer indexes the segment slot-by-slot:
+// kernarg loads lift to GEP+load against `amdgcn_kernarg_segment_ptr`
+// and the AMDGPU backend handles the ABI lowering. This struct keeps
+// only the two pieces of metadata that survive that move.
 struct KernargLayout {
-  std::vector<KernargParam> params;
+  // Byte offset (within the source ABI's flat kernarg-segment view)
+  // where the implicit-arg block begins. `handle_smem.cpp` consults
+  // this to reroute SMEM loads at offsets >= implicitArgsBase through
+  // `amdgcn_implicitarg_ptr` instead of the kernarg-segment pointer:
+  // the source kernel's flat view is layout-correct for the source
+  // ABI, but the lifted target kernel reaches implicit args via a
+  // separate runtime pointer, so the offset must be rebased to
+  // `byteOffset - implicitArgsBase`.
   int implicitArgsBase = 0;
   // Total kernarg segment size in bytes, copied from the kernel
-  // descriptor's `.kernarg_segment_size`. Used by `extractKernargDword`
-  // to distinguish a load that lands in trailing alignment padding
-  // *within* the segment (HSA spec leaves those bytes uninitialised, so
-  // an `undef i32` is the spec-correct LLVM representation) from a load
-  // that overruns the segment entirely (a hard error). Tensile-style
-  // GEMM kernels routinely emit `s_load_b128` over the last named arg
-  // when `last_arg_end < segment_end` because the aligned 16-byte load
-  // is cheaper than a split 12+4 sequence; the trailing dword is loaded
-  // into an SGPR that the kernel never reads.
+  // descriptor's `.kernarg_segment_size`. Informational; the lifted
+  // kernel's `Function` parameter list drives the backend's
+  // `kernarg_segment_size` calculation in the output KD.
   int kernargSegmentSize = 0;
-
-  // Legacy "fully-contained slot list" resolver; kept around for any
-  // future caller that wants the slot-coarse-grained view, but
-  // `handle_smem.cpp` no longer relies on it (it uses the per-dword
-  // `extractKernargDword` helper below for an exact byte-by-byte tile).
-  void resolveLoad(
-      int byteOffset, int loadBytes,
-      std::vector<std::pair<int, int>> &out) const {
-    int loadEnd = byteOffset + loadBytes;
-    for (auto &p : params) {
-      int pEnd = p.byteOffset + p.byteSize;
-      if (p.byteOffset >= byteOffset && pEnd <= loadEnd)
-        out.push_back({p.byteSize / 4, p.paramIdx});
-    }
-  }
 };
-
-// Materialise the i32 dword that lives at `byteOffset` in the kernarg
-// segment, by extracting it from the matching IR-level Function arg.
-//
-// Handles the slot shapes that `KernargLayout::params` records:
-//   * i32 slot at the requested offset -> return the arg directly.
-//   * i8 / i16 slots inside the requested dword -> insert the known low
-//     bytes and leave padding/uncovered bytes undefined.
-//   * i64 / pointer slot covering [p.byteOffset, p.byteOffset+8) ->
-//     return either the low or high dword via lshr+trunc.
-//
-// Returns the materialised i32 Value on success.  On failure returns
-// `nullptr` and (if `whyNot != nullptr`) writes a precise diagnostic
-// describing why the load could not be served — the caller turns that
-// into a `RaiseFailure::smemKernargMiss` (handle_smem.cpp) or a
-// `report_fatal_error` (raiser.cpp Phase-4 SGPR preload).  Diagnostics
-// always name the byte offset, the conflicting param's offset/size, and
-// the sub-offset that defeated the lift, so the message is actionable
-// without re-running with a debugger attached.
-//
-// Does not emit any IR for the failure path; the caller decides.
-//
-// Test back-reference: lit_tests/s_load_b96_kernarg/ exercises this
-// helper end-to-end via an `s_load_b96` over a 16-byte `by_value`
-// aggregate.  Any change to the slot-walk logic above (i32 vs.
-// i64-or-ptr branch, sub-offset handling, error paths) must keep the
-// IR-arg signature shape that fixture pins; conversely, that fixture
-// is the only regression gate for the per-dword resolution contract
-// across raiser / handler boundaries.
-llvm::Value *extractKernargDword(const KernargLayout &layout,
-                                 llvm::IRBuilder<> &B,
-                                 llvm::Function *F,
-                                 int byteOffset,
-                                 std::string *whyNot = nullptr);
-
-// Materialise an integer load of `byteWidth` bytes from the kernarg segment at
-// an arbitrary byte offset. This is stricter generalisation of
-// `extractKernargDword`: it assembles the low-order bytes from one or more
-// dword extractions and therefore supports unaligned GLOBAL_LOAD SADDR forms
-// that read descriptor fields directly from the kernarg buffer.
-//
-// `byteWidth` must be 1, 2, or 4. The returned value is always i32 with the
-// loaded bytes in little-endian low-bit order; callers perform sign/zero
-// extension interpretation as needed.
-llvm::Value *extractKernargBytesAsI32(const KernargLayout &layout,
-                                      llvm::IRBuilder<> &B,
-                                      llvm::Function *F,
-                                      int byteOffset,
-                                      unsigned byteWidth,
-                                      std::string *whyNot = nullptr);
 
 enum class PreloadedHiddenKernargDword {
   NotHidden,

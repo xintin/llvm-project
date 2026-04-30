@@ -7,12 +7,15 @@
 ; The old destination value is therefore the accumulator operand, and the lift
 ; must use llvm.fma rather than an explicit fmul/fadd pair or llvm.fmuladd.
 
+; s_fmac_f32 must lift to a single @llvm.fma.f32, never to
+; @llvm.fmuladd or a separate fmul/fadd pair.  The accumulator and
+; both multiplicands all come from kernarg loads via
+; `llvm.amdgcn.kernarg.segment.ptr`.
 ; CHECK-LABEL: define amdgpu_kernel void @s_fmac_f32_kernel(
-; CHECK: [[KA_P2I:%[^ ]+]] = ptrtoint ptr addrspace(1) %arg0 to i64
-; CHECK: [[KA_LO:%[^ ]+]] = trunc i64 [[KA_P2I]] to i32
-; CHECK: [[SRC0:%[^ ]+]] = bitcast i32 %arg1 to float
-; CHECK: [[SRC1:%[^ ]+]] = bitcast i32 %arg2 to float
-; CHECK: [[ACC:%[^ ]+]] = bitcast i32 [[KA_LO]] to float
+; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+; CHECK: [[SRC0:%[^ ]+]] = bitcast i32 %{{[^ ]+}} to float
+; CHECK: [[SRC1:%[^ ]+]] = bitcast i32 %{{[^ ]+}} to float
+; CHECK: [[ACC:%[^ ]+]] = bitcast i32 %{{[^ ]+}} to float
 ; CHECK-NOT: call {{.*}}@llvm.fmuladd
 ; CHECK-NOT: fmul {{.*}}float
 ; CHECK-NOT: fadd {{.*}}float

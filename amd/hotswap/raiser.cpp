@@ -197,591 +197,6 @@ static bool threadLoopUnsupportedWorkgroupMemoryOrBarrier(
   return false;
 }
 
-bool provenanceSemOpHasLogicalDst(SemOp Sop) {
-  switch (Sop) {
-  case SemOp::S_GETREG_B32:
-  case SemOp::S_MOV_B32:
-  case SemOp::S_MOV_B64:
-  case SemOp::S_AND_B32:
-  case SemOp::S_OR_B32:
-  case SemOp::S_XOR_B32:
-  case SemOp::S_ANDN2_B32:
-  case SemOp::S_ORN2_B32:
-  case SemOp::S_NAND_B32:
-  case SemOp::S_NOR_B32:
-  case SemOp::S_XNOR_B32:
-  case SemOp::S_ADD_U32:
-  case SemOp::S_ADDC_U32:
-  case SemOp::S_SUB_U32:
-  case SemOp::S_SUBB_U32:
-  case SemOp::S_MUL_I32:
-  case SemOp::S_MUL_HI_U32:
-  case SemOp::S_MUL_HI_I32:
-  case SemOp::S_LSHL_B32:
-  case SemOp::S_LSHR_B32:
-  case SemOp::S_ASHR_I32:
-  case SemOp::S_BFE_U32:
-  case SemOp::S_BFE_I32:
-  case SemOp::S_BFM_B32:
-  case SemOp::S_CSELECT_B32:
-  case SemOp::S_NOT_B64:
-  case SemOp::S_CMOV_B64:
-  case SemOp::S_AND_B64:
-  case SemOp::S_OR_B64:
-  case SemOp::S_XOR_B64:
-  case SemOp::S_ANDN2_B64:
-  case SemOp::S_ORN2_B64:
-  case SemOp::S_NAND_B64:
-  case SemOp::S_NOR_B64:
-  case SemOp::S_XNOR_B64:
-  case SemOp::S_LSHL_B64:
-  case SemOp::S_LSHR_B64:
-  case SemOp::S_ASHR_I64:
-  case SemOp::S_BFM_B64:
-  case SemOp::S_CSELECT_B64:
-  case SemOp::S_BITSET0_B64:
-  case SemOp::S_BITSET1_B64:
-  case SemOp::S_ADD_NC_U64:
-  case SemOp::S_SUB_NC_U64:
-  case SemOp::S_MUL_U64:
-  case SemOp::S_LOAD_B32:
-  case SemOp::S_LOAD_B64:
-  case SemOp::S_LOAD_B96:
-  case SemOp::S_LOAD_B128:
-  case SemOp::S_LOAD_B256:
-  case SemOp::S_LOAD_B512:
-  case SemOp::S_LOAD_U8:
-  case SemOp::S_LOAD_I8:
-  case SemOp::S_LOAD_U16:
-  case SemOp::S_LOAD_I16:
-    return true;
-  default:
-    return false;
-  }
-}
-
-bool provenanceSemOpWritesScalarPair(SemOp Sop) {
-  switch (Sop) {
-  case SemOp::S_MOV_B64:
-  case SemOp::S_NOT_B64:
-  case SemOp::S_CMOV_B64:
-  case SemOp::S_AND_B64:
-  case SemOp::S_OR_B64:
-  case SemOp::S_XOR_B64:
-  case SemOp::S_ANDN2_B64:
-  case SemOp::S_ORN2_B64:
-  case SemOp::S_NAND_B64:
-  case SemOp::S_NOR_B64:
-  case SemOp::S_XNOR_B64:
-  case SemOp::S_LSHL_B64:
-  case SemOp::S_LSHR_B64:
-  case SemOp::S_ASHR_I64:
-  case SemOp::S_BFM_B64:
-  case SemOp::S_CSELECT_B64:
-  case SemOp::S_BITSET0_B64:
-  case SemOp::S_BITSET1_B64:
-  case SemOp::S_ADD_NC_U64:
-  case SemOp::S_SUB_NC_U64:
-  case SemOp::S_MUL_U64:
-    return true;
-  default:
-    return false;
-  }
-}
-
-bool provenanceIsSmemLoadResult(SemOp Sop) {
-  switch (Sop) {
-  case SemOp::S_LOAD_B32:
-  case SemOp::S_LOAD_B64:
-  case SemOp::S_LOAD_B96:
-  case SemOp::S_LOAD_B128:
-  case SemOp::S_LOAD_B256:
-  case SemOp::S_LOAD_B512:
-  case SemOp::S_LOAD_U8:
-  case SemOp::S_LOAD_I8:
-  case SemOp::S_LOAD_U16:
-  case SemOp::S_LOAD_I16:
-    return true;
-  default:
-    return false;
-  }
-}
-
-int provenanceSmemLoadDwords(SemOp Sop) {
-  switch (Sop) {
-  case SemOp::S_LOAD_B64:
-    return 2;
-  case SemOp::S_LOAD_B96:
-    return 3;
-  case SemOp::S_LOAD_B128:
-    return 4;
-  case SemOp::S_LOAD_B256:
-    return 8;
-  case SemOp::S_LOAD_B512:
-    return 16;
-  default:
-    return 1;
-  }
-}
-
-int provenanceSemanticDefDwords(SemOp Sop, ParsedReg PR) {
-  if (PR.kind != ParsedReg::SGPR)
-    return 0;
-  if (provenanceIsSmemLoadResult(Sop))
-    return provenanceSmemLoadDwords(Sop);
-  if (PR.width >= 2)
-    return PR.width;
-  if (provenanceSemOpWritesScalarPair(Sop) || Sop == SemOp::S_LOAD_B64)
-    return 2;
-  return 1;
-}
-
-// Tracks one narrow question while raising a single instruction:
-//
-//   "Did this instruction prove that the source-ABI kernarg SGPR pair no
-//    longer denotes the sentinel-modeled entry kernarg pointer?"
-//
-// This is intentionally not a general dataflow engine. It is a local
-// provenance update over the SGPR dword table stored in RaiseContext, paired
-// with the older constant-delta tracker for the original kernarg pair. Unknown
-// provenance remains loud: handle_smem.cpp refuses loads through s[ka:ka+1]
-// unless this updater proves either `Kernarg + const delta` or `NonKernarg`.
-class KernargSgprProvenanceUpdater {
-  using PairKind = RaiseContext::KernargPtrDelta::BaseKind;
-  using DwordProv = RaiseContext::SgprKernargProvenance;
-  using DwordKind = RaiseContext::SgprKernargProvenance::Kind;
-
-public:
-  KernargSgprProvenanceUpdater(RaiseContext &Ctx, const DecodedInst &DI,
-                               OpResolver &Op, int KaLo)
-      : Ctx(Ctx), DI(DI), Op(Op), KaLo(KaLo), KaHi(KaLo + 1) {
-    HasLogicalDst = computeLogicalDst(LogicalDst);
-  }
-
-  void update() {
-    const bool writesLo = writesKernargDword(KaLo);
-    const bool writesHi = writesKernargDword(KaHi) || hasWideDefAtKernargLo();
-
-    updateOriginalKernargPair(writesLo, writesHi);
-    updateGenericSgprProvenance();
-  }
-
-private:
-  RaiseContext &Ctx;
-  const DecodedInst &DI;
-  OpResolver &Op;
-  int KaLo = -1;
-  int KaHi = -1;
-  ParsedReg LogicalDst;
-  bool HasLogicalDst = false;
-
-  static bool semOpHasLogicalDst(SemOp Sop) {
-    return provenanceSemOpHasLogicalDst(Sop);
-  }
-
-  static bool semOpWritesScalarPair(SemOp Sop) {
-    return provenanceSemOpWritesScalarPair(Sop);
-  }
-
-  static bool isSmemLoadResult(SemOp Sop) {
-    return provenanceIsSmemLoadResult(Sop);
-  }
-
-  static int smemLoadDwords(SemOp Sop) {
-    return provenanceSmemLoadDwords(Sop);
-  }
-
-  bool computeLogicalDst(ParsedReg &Out) {
-    if (!semOpHasLogicalDst(DI.semOp))
-      return false;
-    Out = Op.dst();
-    return true;
-  }
-
-  int semanticDefDwords(ParsedReg PR) const {
-    if (PR.kind != ParsedReg::SGPR)
-      return 0;
-    if (isSmemLoadResult(DI.semOp))
-      return smemLoadDwords(DI.semOp);
-    if (PR.width >= 2)
-      return PR.width;
-    if (semOpWritesScalarPair(DI.semOp) || DI.semOp == SemOp::S_LOAD_B64)
-      return 2;
-    return 1;
-  }
-
-  bool writesKernargDword(int BaseIdx) {
-    if (HasLogicalDst && LogicalDst.kind == ParsedReg::SGPR) {
-      int Lo = LogicalDst.baseIdx;
-      int Hi = LogicalDst.baseIdx + LogicalDst.width - 1;
-      if (Lo <= BaseIdx && BaseIdx <= Hi)
-        return true;
-    }
-    for (unsigned D = 0; D < DI.numDefs; ++D) {
-      if (!DI.isReg(D))
-        continue;
-      ParsedReg PR = Ctx.parseReg(DI.getReg(D), D);
-      if (PR.kind != ParsedReg::SGPR)
-        continue;
-      int Lo = PR.baseIdx;
-      int Hi = PR.baseIdx + PR.width - 1;
-      if (Lo <= BaseIdx && BaseIdx <= Hi)
-        return true;
-    }
-    return false;
-  }
-
-  bool hasWideDefAtKernargLo() {
-    bool DefStartsAtLo = false;
-    if (HasLogicalDst && LogicalDst.kind == ParsedReg::SGPR &&
-        LogicalDst.baseIdx == KaLo) {
-      if (LogicalDst.width >= 2)
-        return true;
-      DefStartsAtLo = true;
-    }
-    for (unsigned D = 0; D < DI.numDefs; ++D) {
-      if (!DI.isReg(D))
-        continue;
-      ParsedReg PR = Ctx.parseReg(DI.getReg(D), D);
-      if (PR.kind == ParsedReg::SGPR && PR.baseIdx == KaLo) {
-        if (PR.width >= 2)
-          return true;
-        DefStartsAtLo = true;
-      }
-    }
-    if (!DefStartsAtLo)
-      return false;
-    return semOpWritesScalarPair(DI.semOp) ||
-           DI.semOp == SemOp::S_LOAD_B64 || DI.semOp == SemOp::S_LOAD_B96 ||
-           DI.semOp == SemOp::S_LOAD_B128 ||
-           DI.semOp == SemOp::S_LOAD_B256 ||
-           DI.semOp == SemOp::S_LOAD_B512;
-  }
-
-  bool isKernargHighCanonicalMask() {
-    if (DI.semOp != SemOp::S_AND_B32 || DI.numSrcs < 2 ||
-        DI.numDefs < 1 || !DI.isReg(0))
-      return false;
-    ParsedReg Dst = Ctx.parseReg(DI.getReg(0), 0);
-    if (Dst.kind != ParsedReg::SGPR || Dst.baseIdx != KaHi)
-      return false;
-
-    unsigned S0Idx = DI.srcMap[0];
-    unsigned S1Idx = DI.srcMap[1];
-    auto SrcIsKernargHi = [&](unsigned Idx) {
-      if (!DI.isReg(Idx))
-        return false;
-      ParsedReg Src = Ctx.parseReg(DI.getReg(Idx), Idx);
-      return Src.kind == ParsedReg::SGPR && Src.baseIdx == KaHi;
-    };
-    auto SrcIsLow16Mask = [&](unsigned Idx) {
-      return DI.isImm(Idx) &&
-             static_cast<uint64_t>(DI.getImm(Idx)) == 0xffffu;
-    };
-    return (SrcIsKernargHi(S0Idx) && SrcIsLow16Mask(S1Idx)) ||
-           (SrcIsKernargHi(S1Idx) && SrcIsLow16Mask(S0Idx));
-  }
-
-  void markKernargUnknown() {
-    Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
-    Ctx.kernargPtrDelta.delta = 0;
-    Ctx.kernargPtrDelta.valid = false;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::Unknown);
-  }
-
-  void markNonKernarg() {
-    Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
-    Ctx.kernargPtrDelta.delta = 0;
-    Ctx.kernargPtrDelta.valid = false;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::NonKernarg);
-  }
-
-  void markTrackedKernarg(int64_t Delta) {
-    Ctx.kernargPtrDelta.baseKind = PairKind::Kernarg;
-    Ctx.kernargPtrDelta.delta = Delta;
-    Ctx.kernargPtrDelta.valid = true;
-    Ctx.kernargPtrDelta.pendingLow = false;
-    Ctx.kernargPtrDelta.pendingLowDelta = 0;
-    Ctx.setKernargPairProvenance(PairKind::Kernarg, Delta);
-  }
-
-  bool sgprOverlapsKernargPair(ParsedReg PR) const {
-    if (PR.kind != ParsedReg::SGPR)
-      return false;
-    int Lo = PR.baseIdx;
-    int Hi = PR.baseIdx + PR.width - 1;
-    return Lo <= KaHi && Hi >= KaLo;
-  }
-
-  DwordProv dwordProvenance(int Idx) const {
-    if (Idx < 0 ||
-        static_cast<size_t>(Idx) >= Ctx.sgprKernargProvenance.size())
-      return {};
-    return Ctx.sgprKernargProvenance[Idx];
-  }
-
-  bool regIsDefinitelyNonKernarg(ParsedReg PR) const {
-    if (PR.kind != ParsedReg::SGPR)
-      return true;
-    int Width = PR.width;
-    if (Width < 2 && semOpWritesScalarPair(DI.semOp))
-      Width = 2;
-    for (int I = 0; I < Width; ++I) {
-      if (dwordProvenance(PR.baseIdx + I).kind != DwordKind::NonKernarg)
-        return false;
-    }
-    return true;
-  }
-
-  bool allSourcesDefinitelyNonKernarg() {
-    for (unsigned S = 0; S < DI.numSrcs; ++S) {
-      unsigned Idx = DI.srcMap[S];
-      if (!DI.isReg(Idx))
-        continue;
-      if (!regIsDefinitelyNonKernarg(Ctx.parseReg(DI.getReg(Idx), Idx)))
-        return false;
-    }
-    return true;
-  }
-
-  void setDwordProv(int Idx, DwordProv P) {
-    if (Idx < 0 ||
-        static_cast<size_t>(Idx) >= Ctx.sgprKernargProvenance.size())
-      return;
-    Ctx.sgprKernargProvenance[Idx] = P;
-  }
-
-  void setDwordKind(int Idx, DwordKind Kind) {
-    DwordProv P;
-    P.kind = Kind;
-    setDwordProv(Idx, P);
-  }
-
-  void setOriginalPairDwordKind(int Idx, DwordKind Kind) {
-    setDwordKind(Idx, Kind);
-  }
-
-  void refreshOriginalPairFromDwords() {
-    auto Lo = dwordProvenance(KaLo);
-    auto Hi = dwordProvenance(KaHi);
-    if (Lo.kind == DwordKind::NonKernarg &&
-        Hi.kind == DwordKind::NonKernarg) {
-      Ctx.kernargPtrDelta.baseKind = PairKind::NonKernarg;
-      Ctx.kernargPtrDelta.valid = false;
-      Ctx.kernargPtrDelta.pendingLow = false;
-      Ctx.kernargPtrDelta.pendingLowDelta = 0;
-      Ctx.kernargPtrDelta.delta = 0;
-    }
-  }
-
-  bool smemLoadMaterializesFullPair(bool WritesLo, bool WritesHi) const {
-    if (!(WritesLo && WritesHi))
-      return false;
-    switch (DI.semOp) {
-    case SemOp::S_LOAD_B64:
-    case SemOp::S_LOAD_B96:
-    case SemOp::S_LOAD_B128:
-    case SemOp::S_LOAD_B256:
-    case SemOp::S_LOAD_B512:
-      return true;
-    default:
-      return false;
-    }
-  }
-
-  std::pair<bool, int64_t> classifyConstInPlaceAdd(int DstBase) {
-    if (DI.numSrcs < 2)
-      return {false, 0};
-    unsigned S0Idx = DI.srcMap[0];
-    unsigned S1Idx = DI.srcMap[1];
-    const bool S0Reg = DI.isReg(S0Idx);
-    const bool S1Reg = DI.isReg(S1Idx);
-    const bool S0Imm = DI.isImm(S0Idx);
-    const bool S1Imm = DI.isImm(S1Idx);
-
-    auto RegMatchesDst = [&](unsigned Idx) {
-      ParsedReg PR = Ctx.parseReg(DI.getReg(Idx), Idx);
-      return PR.kind == ParsedReg::SGPR && PR.baseIdx == DstBase;
-    };
-
-    if (S0Reg && S1Imm && RegMatchesDst(S0Idx))
-      return {true, DI.getImm(S1Idx)};
-    if (S1Reg && S0Imm && RegMatchesDst(S1Idx))
-      return {true, DI.getImm(S0Idx)};
-    return {false, 0};
-  }
-
-  void updateOriginalKernargPair(bool WritesLo, bool WritesHi) {
-    if (!(WritesLo || WritesHi)) {
-      if (Ctx.kernargPtrDelta.valid && Ctx.kernargPtrDelta.pendingLow &&
-          DI.defsSCC)
-        markKernargUnknown();
-      return;
-    }
-
-    const bool WritesFullPair = WritesLo && WritesHi;
-    const bool FullIndependentOverwrite =
-        WritesFullPair && allSourcesDefinitelyNonKernarg();
-    if (FullIndependentOverwrite ||
-        smemLoadMaterializesFullPair(WritesLo, WritesHi)) {
-      markNonKernarg();
-      return;
-    }
-    if (!WritesFullPair && allSourcesDefinitelyNonKernarg()) {
-      Ctx.kernargPtrDelta.baseKind = PairKind::Unknown;
-      Ctx.kernargPtrDelta.delta = 0;
-      Ctx.kernargPtrDelta.valid = false;
-      Ctx.kernargPtrDelta.pendingLow = false;
-      Ctx.kernargPtrDelta.pendingLowDelta = 0;
-      if (WritesLo)
-        setOriginalPairDwordKind(KaLo, DwordKind::NonKernarg);
-      if (WritesHi)
-        setOriginalPairDwordKind(KaHi, DwordKind::NonKernarg);
-      refreshOriginalPairFromDwords();
-      return;
-    }
-    if (!Ctx.kernargPtrDelta.valid) {
-      markKernargUnknown();
-      return;
-    }
-    if (WritesHi && !WritesLo && isKernargHighCanonicalMask() &&
-        !Ctx.kernargPtrDelta.pendingLow)
-      return;
-    if (WritesLo && !WritesHi && DI.semOp == SemOp::S_ADD_U32) {
-      auto [Ok, Imm] = classifyConstInPlaceAdd(KaLo);
-      if (!Ok) {
-        markKernargUnknown();
-        return;
-      }
-      if (Ctx.kernargPtrDelta.pendingLow) {
-        markKernargUnknown();
-        return;
-      }
-      Ctx.kernargPtrDelta.pendingLow = true;
-      Ctx.kernargPtrDelta.pendingLowDelta = Imm;
-      Ctx.setKernargPairProvenance(PairKind::Unknown);
-      return;
-    }
-    if (WritesHi && !WritesLo && DI.semOp == SemOp::S_ADDC_U32 &&
-        Ctx.kernargPtrDelta.pendingLow) {
-      auto [Ok, Imm] = classifyConstInPlaceAdd(KaHi);
-      if (Ok && Imm == 0) {
-        markTrackedKernarg(Ctx.kernargPtrDelta.delta +
-                           Ctx.kernargPtrDelta.pendingLowDelta);
-      } else {
-        markKernargUnknown();
-      }
-      return;
-    }
-    markKernargUnknown();
-  }
-
-  void setPairFromBaseKind(int Dst, PairKind Kind, int64_t Delta = 0) {
-    switch (Kind) {
-    case PairKind::Kernarg: {
-      DwordProv Lo, Hi;
-      Lo.kind = DwordKind::Kernarg;
-      Lo.delta = Delta;
-      Lo.subDword = 0;
-      Hi.kind = DwordKind::Kernarg;
-      Hi.delta = Delta;
-      Hi.subDword = 1;
-      setDwordProv(Dst, Lo);
-      setDwordProv(Dst + 1, Hi);
-      break;
-    }
-    case PairKind::NonKernarg:
-      setDwordKind(Dst, DwordKind::NonKernarg);
-      setDwordKind(Dst + 1, DwordKind::NonKernarg);
-      break;
-    case PairKind::Unknown:
-      setDwordKind(Dst, DwordKind::Unknown);
-      setDwordKind(Dst + 1, DwordKind::Unknown);
-      break;
-    }
-  }
-
-  std::pair<PairKind, int64_t> pairProvenanceFromReg(ParsedReg PR) const {
-    if (PR.kind != ParsedReg::SGPR)
-      return {PairKind::Unknown, 0};
-    auto Lo = dwordProvenance(PR.baseIdx);
-    auto Hi = dwordProvenance(PR.baseIdx + 1);
-    if (Lo.kind == DwordKind::NonKernarg &&
-        Hi.kind == DwordKind::NonKernarg)
-      return {PairKind::NonKernarg, 0};
-    if (Lo.kind == DwordKind::Kernarg && Hi.kind == DwordKind::Kernarg &&
-        Lo.subDword == 0 && Hi.subDword == 1 && Lo.delta == Hi.delta)
-      return {PairKind::Kernarg, Lo.delta};
-    return {PairKind::Unknown, 0};
-  }
-
-  std::pair<PairKind, int64_t> pairProvenanceFromSrc0() {
-    if (DI.numSrcs < 1)
-      return {PairKind::Unknown, 0};
-    unsigned Idx = DI.srcMap[0];
-    if (!DI.isReg(Idx))
-      return {PairKind::NonKernarg, 0};
-    return pairProvenanceFromReg(Ctx.parseReg(DI.getReg(Idx), Idx));
-  }
-
-  DwordProv dwordProvenanceFromSrc0() {
-    DwordProv P;
-    if (DI.numSrcs < 1)
-      return P;
-    unsigned Idx = DI.srcMap[0];
-    if (!DI.isReg(Idx)) {
-      P.kind = DwordKind::NonKernarg;
-      return P;
-    }
-    ParsedReg Src = Ctx.parseReg(DI.getReg(Idx), Idx);
-    if (Src.kind != ParsedReg::SGPR) {
-      P.kind = DwordKind::NonKernarg;
-      return P;
-    }
-    return dwordProvenance(Src.baseIdx);
-  }
-
-  void updateGenericDefProvenance(ParsedReg Def) {
-    int DefDwords = semanticDefDwords(Def);
-    if (DefDwords == 0 || sgprOverlapsKernargPair(Def))
-      return;
-
-    if (isSmemLoadResult(DI.semOp)) {
-      for (int I = 0; I < DefDwords; ++I)
-        setDwordKind(Def.baseIdx + I, DwordKind::NonKernarg);
-      return;
-    }
-    if (DI.semOp == SemOp::S_MOV_B64 && DefDwords >= 2) {
-      auto [Kind, Delta] = pairProvenanceFromSrc0();
-      setPairFromBaseKind(Def.baseIdx, Kind, Delta);
-      return;
-    }
-    if (DI.semOp == SemOp::S_MOV_B32 && DefDwords == 1) {
-      setDwordProv(Def.baseIdx, dwordProvenanceFromSrc0());
-      return;
-    }
-
-    DwordKind Kind =
-        allSourcesDefinitelyNonKernarg() ? DwordKind::NonKernarg
-                                         : DwordKind::Unknown;
-    for (int I = 0; I < DefDwords; ++I)
-      setDwordKind(Def.baseIdx + I, Kind);
-  }
-
-  void updateGenericSgprProvenance() {
-    for (unsigned D = 0; D < DI.numDefs; ++D) {
-      if (DI.isReg(D))
-        updateGenericDefProvenance(Ctx.parseReg(DI.getReg(D), D));
-    }
-    if (HasLogicalDst)
-      updateGenericDefProvenance(LogicalDst);
-  }
-};
-
 } // namespace
 
 // parseReg, readOp32/64/ExecWidth, and OpResolver are in raise_context.hpp/cpp
@@ -1137,101 +552,53 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   auto *f32Ty = Type::getFloatTy(C);
   auto *ptrGlobalTy = PointerType::get(C, 1);
 
-  // Build function signature dynamically from kernel metadata.
+  // Build function signature: a single opaque
+  // `ptr byref([N x i8]) align 16` placeholder whose only job is to
+  // make the AMDGPU backend emit `kernarg_segment_size = N` and
+  // `kernarg_segment_align = 16` in the lifted kernel's KD/metadata,
+  // so the runtime's kernarg buffer reaches the kernel intact and
+  // the metadata reports the AMDGPU ABI's 16-byte minimum.
   //
-  // The IR-level argument list must reproduce the source binary's
-  // kernarg byte layout exactly: every byte the source reads from the
-  // kernarg buffer at offset O must be reachable through some IR
-  // argument anchored at that offset. The AMDGPU backend places kernel
-  // arguments in the kernarg buffer by their natural alignment + size,
-  // so as long as we emit the right type at the right cumulative
-  // offset, the buffer layout matches the runtime's packing.
+  // The handlers do NOT read this argument — kernarg loads lift to
+  // GEP+load against `amdgcn_kernarg_segment_ptr` and let the AMDGPU
+  // backend re-select `s_load_*` against the kernarg segment. The
+  // typed source-ABI signature (ptr addrspace(1) / i32 / i64 / per-
+  // dword aggregate split) is therefore unnecessary on the lifted
+  // side.
   //
-  // Slot shapes emitted:
-  //   * `global_buffer` (size==8) → ptr addrspace(1).
-  //   * non-pointer `by_value` size==1/2 → i8/i16.
-  //   * non-pointer `by_value` size==4 → i32.
-  //   * non-pointer `by_value` size==8 → i64.
-  //   * non-pointer `by_value` size > 8 (and divisible by 4, i.e. an
-  //     aggregate kernarg like Triton's tensor-descriptor struct) is
-  //     DECOMPOSED into one i32 slot per dword. Without this split the
-  //     IR would carry a single i32 placeholder for the whole struct
-  //     and codegen would only allocate 4 bytes for it — silently
-  //     shifting every downstream arg's runtime byte offset and turning
-  //     all kernarg loads past the struct into reads of garbage. The
-  //     per-dword split also makes SMEM kernarg loads against the
-  //     interior of the struct addressable through `extractKernargDword`
-  //     in handle_smem.cpp without needing any aggregate-aware extract
-  //     logic. Other odd sizes are refused loudly: they would require
-  //     aggregate extraction with a non-dword tail that no current
-  //     handler supports, and the no-fallback rule applies.
+  // Why `byref` + `align`: AMDGPULowerKernelArguments consults the
+  // `align` parameter attribute only for byref kernel args (see
+  // `MaybeAlign ParamAlign = IsByRef ? Arg.getParamAlign() :
+  // std::nullopt;` in LLVM's `AMDGPULowerKernelArguments.cpp`). For
+  // a non-byref `[N x i8]` arg, the IR-level alignment is the
+  // type's natural alignment (1 byte), and the YAML metadata's
+  // `.kernarg_segment_align` field reports a smaller value than the
+  // ABI's 16-byte minimum. Using `byref` with an explicit
+  // `align(16)` lets the backend honour the alignment without
+  // forcing a vector or padding type, and the byref semantics —
+  // "pointer to an aggregate that's actually placed in the kernarg
+  // segment" — match the placeholder's intent: a stable region of
+  // `kernarg_segment_size` bytes that handlers don't need a typed
+  // view of.
   //
-  // Test back-reference: lit_tests/s_load_b96_kernarg/ pins the i32
-  // slot signature this branch produces for a 16-byte by_value
-  // aggregate; any change to the dword-decomposition logic must keep
-  // that fixture's `(i32 %arg0, i32 %arg1, i32 %arg2, i32 %arg3, ptr
-  // addrspace(1) %arg4)` signature green.
-  SmallVector<Type *, 8> paramTypes;
+  // AMDGPULowerKernelArguments skips load emission for arguments
+  // that are `use_empty()` but still bumps the cumulative arg
+  // offset, so the unused placeholder still contributes to
+  // `kernarg_segment_size`.
+  //
+  // Test back-reference: every lit fixture under `lit_tests/` pins
+  // either a `ptr addrspace(4)` GEP shape or an addrspace(1) global
+  // GEP shape against the segment_ptr intrinsic — none of them rely
+  // on the kernarg buffer being a typed Function argument list.
+  SmallVector<Type *, 1> paramTypes;
   KernargLayout kernargs;
   int paramIdx = 0;
-  for (auto &arg : meta.args) {
-    if (arg.valueKind == "hidden_global_offset_x" ||
-        arg.valueKind == "hidden_global_offset_y" ||
-        arg.valueKind == "hidden_global_offset_z" ||
-        arg.valueKind.rfind("hidden_", 0) == 0)
-      continue;
-    bool isPtr = (arg.valueKind == "global_buffer");
-    if (isPtr) {
-      if (arg.size != 8)
-        report_fatal_error(
-            Twine("transpiler: kernel '") + kernelName + "' arg '" +
-            arg.name + "' is global_buffer but size=" +
-            Twine(arg.size) + " (expected 8)");
-      paramTypes.push_back(ptrGlobalTy);
-      kernargs.params.push_back({arg.offset, 8, paramIdx, true});
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 1) {
-      paramTypes.push_back(Type::getInt8Ty(C));
-      kernargs.params.push_back({arg.offset, 1, paramIdx, false});
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 2) {
-      paramTypes.push_back(Type::getInt16Ty(C));
-      kernargs.params.push_back({arg.offset, 2, paramIdx, false});
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 4) {
-      paramTypes.push_back(i32Ty);
-      kernargs.params.push_back({arg.offset, 4, paramIdx, false});
-      paramIdx++;
-      continue;
-    }
-    if (arg.size == 8) {
-      paramTypes.push_back(i64Ty);
-      kernargs.params.push_back({arg.offset, 8, paramIdx, false});
-      paramIdx++;
-      continue;
-    }
-    if (arg.size > 0 && arg.size % 4 == 0) {
-      int nDwords = arg.size / 4;
-      for (int d = 0; d < nDwords; ++d) {
-        paramTypes.push_back(i32Ty);
-        kernargs.params.push_back(
-            {arg.offset + d * 4, 4, paramIdx, false});
-        paramIdx++;
-      }
-      continue;
-    }
-    report_fatal_error(
-        Twine("transpiler: kernel '") + kernelName + "' arg '" +
-        arg.name + "' has unsupported by_value size=" + Twine(arg.size) +
-        " (expected 1, 2, 4, 8, or a positive multiple of 4); non-dword-tail "
-        "aggregate kernarg extraction is not modelled and silent rounding is "
-        "rejected by the no-fallback rule.");
+  Type *kernargByrefTy = nullptr;
+  if (meta.kernargSegmentSize > 0) {
+    kernargByrefTy =
+        ArrayType::get(i8Ty, static_cast<uint64_t>(meta.kernargSegmentSize));
+    paramTypes.push_back(PointerType::get(C, /*addrspace=*/4));
+    paramIdx = 1;
   }
   kernargs.implicitArgsBase = meta.implicitArgsBase();
   kernargs.kernargSegmentSize = meta.kernargSegmentSize;
@@ -1240,6 +607,16 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   Function *F =
       Function::Create(funcTy, GlobalValue::ExternalLinkage, kernelName, &M);
   F->setCallingConv(CallingConv::AMDGPU_KERNEL);
+
+  // Attach `byref([N x i8])` + `align(16)` to the placeholder kernarg
+  // pointer. AMDGPULowerKernelArguments only honours param-align on
+  // byref kernel args, so this combo is what gets the lifted KD's
+  // kernarg-segment alignment to the AMDGPU ABI's 16-byte minimum
+  // without forcing an aggregate / vector type for the parameter.
+  if (kernargByrefTy != nullptr) {
+    F->addParamAttr(0, Attribute::getWithByRefType(C, kernargByrefTy));
+    F->addParamAttr(0, Attribute::getWithAlignment(C, Align(16)));
+  }
   {
     // Pin the workgroup size to exactly what the source kernel declared, so
     // the backend lays out LDS / workitem IDs the same way the original
@@ -1311,16 +688,18 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
     F->addFnAttr("amdgpu-lds-size", sizeStr + "," + sizeStr);
   }
 
-  for (int i = 0; i < paramIdx; i++)
-    F->getArg(i)->setName("arg" + std::to_string(i));
+  if (paramIdx > 0)
+    F->getArg(0)->setName("kargs");
 
-  errs() << "transpiler: Kernel '" << kernelName << "' has " << paramIdx
-         << " args (kernarg_segment_size=" << meta.kernargSegmentSize << ")\n";
+  errs() << "transpiler: Kernel '" << kernelName
+         << "' kernarg_segment_size=" << meta.kernargSegmentSize << "\n";
 
   Function *fnWorkgroupIdX =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_x);
   Function *fnWorkgroupIdY =
       Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_workgroup_id_y);
+  Function *fnKargPtr =
+      Intrinsic::getOrInsertDeclaration(&M, Intrinsic::amdgcn_kernarg_segment_ptr);
   // Build the source-ISA user-SGPR ABI from the kernel descriptor.
   // Phase 4 seeding and handler-side ABI-sensitive decoding (e.g.
   // handle_smem's kernarg-pointer detection) both key off this layout.
@@ -1368,10 +747,16 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   // enable_sgpr_* toggles legally move the kernarg pointer and workgroup-id
   // SGPRs away from s[0:1]/s2/s3. Hardcoding those indices mis-seeds entry
   // state and turns real source values into undef reads on the JIT path.
+  //
+  // Seed the kernarg pair with ptrtoint(amdgcn_kernarg_segment_ptr) so the
+  // generic GEP+load path in handle_smem.cpp materialises kernarg SMEM
+  // loads as real scalar loads (the backend selects s_load_* off the
+  // addrspace(4) cast). storeSGPR64 ptrtoint-splits the pointer into two
+  // i32 halves; loadSGPR64 reconstructs and the SMEM handler casts back
+  // to ptr addrspace(4).
   if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
-    regs.storeSGPR64(
-        B, userSgprLayout.kernargSegmentPtrSgpr,
-        Constant::getNullValue(PointerType::get(C, 4)));
+    regs.storeSGPR64(B, userSgprLayout.kernargSegmentPtrSgpr,
+                     B.CreateCall(fnKargPtr, {}, "kernarg_ptr"));
   }
   if (userSgprLayout.workgroupIdXSgpr >= 0) {
     regs.storeSGPR32(B, userSgprLayout.workgroupIdXSgpr,
@@ -1429,21 +814,26 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
     return nullptr;
   };
   // Kernarg preload SGPRs carry dwords copied by hardware from the kernarg
-  // segment before kernel entry. Materialize the same dwords from the IR
-  // function args so early source-SGPR reads observe the descriptor-declared
-  // preload image.
+  // segment before kernel entry. Materialize the same dwords by loading
+  // through `amdgcn_kernarg_segment_ptr` so the AMDGPU backend handles the
+  // ABI lowering uniformly: the GEP+load lowers back to `s_load_b32` (or a
+  // hardware-preload SGPR read on gfx12+) against the kernarg segment, with
+  // identical bytes to what the source kernel saw at entry.
+  //
+  // Hidden block counts (Triton's hidden_block_count_* ABI) still need
+  // dispatch-packet synthesis since their values aren't stored in the
+  // kernarg segment at all — only `emitPreloadedHiddenKernargDword` can
+  // materialize them from `amdgcn_dispatch_ptr`.
   for (size_t sgprIdx = 0; sgprIdx < userSgprLayout.entries.size(); ++sgprIdx) {
     const auto &entry = userSgprLayout.entries[sgprIdx];
     if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
       continue;
-    std::string why;
     Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
-    if (!dw)
-      dw = extractKernargDword(kernargs, B, F, entry.kernargByteOffset, &why);
     if (!dw) {
-      report_fatal_error(Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
-                         Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
-                         Twine(entry.kernargByteOffset) + ": " + why);
+      Value *segPtr = B.CreateCall(fnKargPtr, {}, "preload_kernarg_ptr");
+      Value *gep = B.CreateInBoundsGEP(
+          i8Ty, segPtr, B.getInt64(entry.kernargByteOffset), "preload_gep");
+      dw = B.CreateAlignedLoad(i32Ty, gep, Align(4), "preload_dw");
     }
     regs.storeSGPR32(B, static_cast<int>(sgprIdx), dw);
   }
@@ -1530,10 +920,16 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
     SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[0]);
     SeedB.CreateStore(ConstantInt::get(i32Ty, 0), regs.flatScr[1]);
 
+    // Mirror the entry-BB user-SGPR seeding above: the kernarg pair is
+    // re-seeded with `amdgcn_kernarg_segment_ptr` so kernarg SMEM loads
+    // inside the thread-loop iteration body lift through the same
+    // GEP+load shape, and preloaded-kernarg SGPRs materialise their
+    // dwords via the same intrinsic + GEP + i32 load. Hidden block
+    // counts continue to flow through `emitPreloadedHiddenKernargDword`
+    // (dispatch-packet synthesis, not in kernarg memory).
     if (userSgprLayout.kernargSegmentPtrSgpr >= 0) {
-      regs.storeSGPR64(
-          SeedB, userSgprLayout.kernargSegmentPtrSgpr,
-          Constant::getNullValue(PointerType::get(C, 4)));
+      regs.storeSGPR64(SeedB, userSgprLayout.kernargSegmentPtrSgpr,
+                       SeedB.CreateCall(fnKargPtr, {}, "kernarg_ptr"));
     }
     if (userSgprLayout.workgroupIdXSgpr >= 0) {
       regs.storeSGPR32(SeedB, userSgprLayout.workgroupIdXSgpr,
@@ -1548,16 +944,14 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
       const auto &entry = userSgprLayout.entries[sgprIdx];
       if (entry.source != UserSgprLayout::Source::PreloadedKernarg)
         continue;
-      std::string why;
       Value *dw = emitPreloadedHiddenKernargDword(entry.kernargByteOffset);
-      if (!dw)
-        dw = extractKernargDword(kernargs, SeedB, F,
-                                 entry.kernargByteOffset, &why);
       if (!dw) {
-        report_fatal_error(
-            Twine("transpiler: failed to seed preloaded kernarg SGPR s") +
-            Twine(static_cast<int>(sgprIdx)) + " at byte offset " +
-            Twine(entry.kernargByteOffset) + ": " + why);
+        Value *segPtr =
+            SeedB.CreateCall(fnKargPtr, {}, "preload_kernarg_ptr");
+        Value *gep = SeedB.CreateInBoundsGEP(
+            i8Ty, segPtr, SeedB.getInt64(entry.kernargByteOffset),
+            "preload_gep");
+        dw = SeedB.CreateAlignedLoad(i32Ty, gep, Align(4), "preload_dw");
       }
       regs.storeSGPR32(SeedB, static_cast<int>(sgprIdx), dw);
     }
@@ -1599,578 +993,6 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
       static_cast<uint32_t>(std::max(meta.privateSegmentFixedSize, 0));
   ctx.sourceComputePgmRsrc2 = meta.computePgmRsrc2;
   ctx.sourceKernelCodeProperties = meta.kernelCodeProperties;
-  ctx.initializeSgprKernargProvenance();
-
-  // ==== Phase 4.5: Kernarg-pair pristine-at-BB-entry dataflow ====
-  //
-  // Populates `ctx.kernargPristineBBs` with the set of BB-start
-  // offsets where the kernarg-pointer SGPR pair is guaranteed to still
-  // hold its kernel-entry value along EVERY CFG path that reaches
-  // the BB. `handle_smem.cpp` consults this (via the tracker
-  // `RaiseContext::KernargPtrDelta`) to decide whether to take the
-  // kernarg-slot fast path or refuse loudly.
-  //
-  // This closes issue #21's silent miscompile in the Tensile
-  // UniversalArgs shape (`s_add_u32 ka, ka, 0x10 ; s_addc_u32 ka+1,
-  // ka+1, 0 ; s_load_b* s[sDST:…], s[ka:ka+1], imm`): the NORMAL-path
-  // BB that contains the shift still enters pristine (its sole
-  // predecessor is the entry BB, which never writes the pair), so
-  // the post-handler hook below can stage the delta and the shifted
-  // downstream loads correctly extract via `extractKernargDword(delta
-  // + imm)` instead of `extractKernargDword(imm)`.
-  //
-  // The analysis is a forward dataflow to fixed point:
-  //
-  //   pristine[entryBB]       = true
-  //   pristine[bb] (bb != e)  = AND over all preds p of bb:
-  //                                 pristine[p] AND !writesPairInBB[p]
-  //
-  // Converges monotonically (a BB can only transition pristine ->
-  // dirty, never back) in at most `#BBs` iterations. The CFG edges
-  // are read straight from the decoded instruction stream:
-  // unconditional / conditional branches add one or two target edges;
-  // fall-through adds an edge to the next BB in address order when
-  // the terminator is not an unconditional jump or `s_endpgm`.
-  //
-  // Skipped entirely when `kernargSegmentPtrSgpr < 0` (the kernel
-  // descriptor disables the kernarg pointer — no pair to track); in
-  // that case every BB is trivially "pristine" because the tracker
-  // never fires in handle_smem.cpp. We still populate the set to
-  // keep the resetKernargPtrDeltaAtBBBoundary code path uniform.
-  {
-    const int kaLo = userSgprLayout.kernargSegmentPtrSgpr;
-    const int kaHi = (kaLo >= 0) ? (kaLo + 1) : -1;
-
-    // Step 1: group instructions by their owning BB (largest
-    // blockStart <= di.offset) and record whether any instruction in
-    // each BB writes either kernarg-pair dword.
-    //
-    // `blockStarts` is an ascending std::set<uint64_t>, so
-    // lower_bound / --upper_bound gives the BB a given instruction
-    // belongs to in O(log N) per step.
-    llvm::DenseMap<uint64_t, bool> writesPairInBB;
-    llvm::DenseMap<uint64_t, uint64_t> bbOfInst; // inst offset -> BB start
-    llvm::DenseMap<uint64_t, const DecodedInst *> lastInstInBB;
-    auto isKernargHighCanonicalMask = [&](const DecodedInst &di) -> bool {
-      if (di.semOp != SemOp::S_AND_B32 || di.numSrcs < 2 || di.numDefs < 1)
-        return false;
-      if (!di.isReg(0))
-        return false;
-      ParsedReg dst = ctx.parseReg(di.getReg(0), 0);
-      if (dst.kind != ParsedReg::SGPR || dst.baseIdx != kaHi)
-        return false;
-
-      unsigned s0Idx = di.srcMap[0];
-      unsigned s1Idx = di.srcMap[1];
-      auto srcIsKernargHi = [&](unsigned idx) {
-        if (!di.isReg(idx))
-          return false;
-        ParsedReg src = ctx.parseReg(di.getReg(idx), idx);
-        return src.kind == ParsedReg::SGPR && src.baseIdx == kaHi;
-      };
-      auto srcIsLow16Mask = [&](unsigned idx) {
-        return di.isImm(idx) &&
-               static_cast<uint64_t>(di.getImm(idx)) == 0xffffu;
-      };
-      return (srcIsKernargHi(s0Idx) && srcIsLow16Mask(s1Idx)) ||
-             (srcIsKernargHi(s1Idx) && srcIsLow16Mask(s0Idx));
-    };
-    for (uint64_t bs : blockStarts) {
-      writesPairInBB.try_emplace(bs, false);
-      lastInstInBB.try_emplace(bs, nullptr);
-    }
-    for (const DecodedInst &di : insts) {
-      // Find the BB that owns this instruction: the largest entry in
-      // blockStarts <= di.offset.
-      auto it = blockStarts.upper_bound(di.offset);
-      if (it == blockStarts.begin())
-        continue; // before first BB — defensive, shouldn't happen.
-      --it;
-      uint64_t bb = *it;
-      bbOfInst[di.offset] = bb;
-      lastInstInBB[bb] = &di;
-      if (kaLo < 0)
-        continue;
-      // Detect writes to either dword of the pair via the MCInst's
-      // def operands (first `numDefs` operand slots). We only check
-      // register operands; parseReg may give a non-SGPR kind for
-      // TTMP-class defs etc., but the match condition below rejects
-      // those.
-      for (unsigned d = 0; d < di.numDefs; ++d) {
-        if (!di.isReg(d))
-          continue;
-        ParsedReg pr = ctx.parseReg(di.getReg(d), d);
-        if (pr.kind == ParsedReg::SGPR &&
-            (pr.baseIdx == kaLo || pr.baseIdx == kaHi)) {
-          if (pr.baseIdx == kaHi && isKernargHighCanonicalMask(di))
-            continue;
-          writesPairInBB[bb] = true;
-          break;
-        }
-      }
-    }
-
-    // Step 2: build CFG edges. For each BB, determine its successors
-    // (list of BB offsets) based on the last instruction:
-    //   * unconditional branch: single target from immediate.
-    //   * conditional branch: target from immediate + fall-through.
-    //   * s_endpgm / unconditional terminator without a target: no
-    //     successors.
-    //   * anything else (including the trivial "reached fall-through
-    //     without a branch"): fall-through to the next BB in address
-    //     order.
-    //
-    // We conservatively add s_set_pc_i64 targets too, via the
-    // setpcAnalysis machinery: `setpcAnalysis.chainTerminators` and
-    // the extra block starts merged into `blockStarts` above already
-    // capture those, but we must still add the *edges* here. For
-    // this bug's scope, s_set_pc_i64 targets only matter if they
-    // reach a BB that consumes the kernarg pair — none of the
-    // observed Tensile / AITER shapes do — so we model s_set_pc_i64
-    // conservatively as "target is reachable if ANY reachable
-    // BB's terminator is an s_set_pc_i64 whose resolved return
-    // address equals the target". Simpler: treat an unresolved
-    // s_set_pc_i64 as a successor edge to every extraBlockStart
-    // (over-approximation: marks potentially-pristine BBs as
-    // dirty only when they legitimately are). For the Tensile
-    // shape the s_set_pc_i64 machinery is not in play.
-    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t>> successors;
-    for (uint64_t bs : blockStarts)
-      successors.try_emplace(bs, llvm::SmallVector<uint64_t>{});
-
-    auto nextBBStart = [&](uint64_t bs) -> uint64_t {
-      auto it = blockStarts.upper_bound(bs);
-      return (it == blockStarts.end()) ? 0 : *it;
-    };
-    auto branchTargetOf = [](const DecodedInst &di) -> llvm::SmallVector<uint64_t> {
-      // Mirror `decode.cpp::collectBranchTargets`: a branch instruction's
-      // immediate operands each encode a signed 16-bit PC-relative
-      // offset (scaled by 4) from the instruction's successor address
-      // (off + 4, per the AMDGPU encoding definition). Collect every
-      // such target.
-      llvm::SmallVector<uint64_t> out;
-      const llvm::MCInst &inst = di.inst;
-      for (unsigned i = 0; i < inst.getNumOperands(); ++i) {
-        if (!inst.getOperand(i).isImm())
-          continue;
-        int64_t raw = inst.getOperand(i).getImm();
-        int64_t brOff = static_cast<int64_t>(
-            static_cast<int16_t>(static_cast<uint16_t>(raw & 0xFFFF)));
-        out.push_back(di.offset + 4 + brOff * 4);
-      }
-      return out;
-    };
-
-    for (uint64_t bs : blockStarts) {
-      const DecodedInst *last = lastInstInBB[bs];
-      if (!last) {
-        // BB has no instructions (shouldn't happen but be defensive).
-        uint64_t nxt = nextBBStart(bs);
-        if (nxt != 0)
-          successors[bs].push_back(nxt);
-        continue;
-      }
-      // S_ENDPGM / unconditional terminator with no target: no
-      // successors. `desc.isBarrier()` would be more precise, but
-      // we approximate via the SemOp set that matches the observed
-      // AMDGPU terminators. S_ENDPGM is always a barrier; unmatched
-      // cases fall through below.
-      if (last->semOp == SemOp::S_ENDPGM)
-        continue;
-      if (last->isBranch) {
-        auto targets = branchTargetOf(*last);
-        for (uint64_t t : targets)
-          successors[bs].push_back(t);
-        // Conditional branches also fall through to the next BB.
-        if (last->isConditionalBranch) {
-          uint64_t nxt = nextBBStart(bs);
-          if (nxt != 0)
-            successors[bs].push_back(nxt);
-        }
-        continue;
-      }
-      // Non-branch terminator (or no terminator at all in this BB
-      // because the BB split landed mid-stream): fall through to the
-      // next BB in address order.
-      uint64_t nxt = nextBBStart(bs);
-      if (nxt != 0)
-        successors[bs].push_back(nxt);
-    }
-
-    // Invert to predecessors for the fixed-point pass.
-    llvm::DenseMap<uint64_t, llvm::SmallVector<uint64_t>> predecessors;
-    for (uint64_t bs : blockStarts)
-      predecessors.try_emplace(bs, llvm::SmallVector<uint64_t>{});
-    for (auto &[bb, succs] : successors) {
-      for (uint64_t s : succs) {
-        auto it = predecessors.find(s);
-        if (it != predecessors.end())
-          it->second.push_back(bb);
-      }
-    }
-
-    // Provenance carry is safe only for the lexical fallthrough block whose
-    // sole predecessor is the block we just finished emitting. Any branch
-    // target that is not the immediate next block would require saving and
-    // restoring predecessor-exit state; any merge would require phi-style
-    // joins. Both remain loud/conservative via the normal BB-boundary reset.
-    uint64_t prevBB = 0;
-    bool havePrevBB = false;
-    for (uint64_t bs : blockStarts) {
-      if (havePrevBB) {
-        const auto &preds = predecessors[bs];
-        if (preds.size() == 1 && preds[0] == prevBB)
-          ctx.sgprProvenanceFallthroughBBs.insert(bs);
-      }
-      prevBB = bs;
-      havePrevBB = true;
-    }
-
-    // Step 3: iterative forward dataflow.
-    //   pristine[entryBB]  = true
-    //   pristine[bb]       = AND over preds p: pristine[p] AND
-    //                         !writesPairInBB[p]
-    //
-    // This is a greatest-fixed-point problem: a write-free loop header with
-    // a pristine preheader and a self-edge is pristine, because every trip
-    // around the loop preserves the pair. Initialising non-entry blocks to
-    // false permanently poisons such loops. Start optimistic, then
-    // monotonically remove blocks when any predecessor is dirty or writes the
-    // pair. Unreachable non-entry blocks (no preds) are removed.
-    //
-    // Skipped when `kaLo < 0` (no kernarg pointer enabled): mark
-    // every BB pristine unconditionally to keep the call sites
-    // uniform.
-    llvm::DenseSet<uint64_t> &pristine = ctx.kernargPristineBBs;
-    if (kaLo < 0) {
-      for (uint64_t bs : blockStarts)
-        pristine.insert(bs);
-    } else {
-      for (uint64_t bs : blockStarts)
-        pristine.insert(bs);
-      bool changed = true;
-      unsigned iters = 0;
-      const unsigned maxIters = static_cast<unsigned>(blockStarts.size()) + 2;
-      while (changed && iters < maxIters) {
-        changed = false;
-        ++iters;
-        for (uint64_t bs : blockStarts) {
-          if (bs == kernelOffset)
-            continue;
-          const auto &preds = predecessors[bs];
-          bool keepPristine = !preds.empty();
-          if (keepPristine) {
-            for (uint64_t p : preds) {
-              if (!pristine.contains(p) || writesPairInBB.lookup(p)) {
-                keepPristine = false;
-                break;
-              }
-            }
-          }
-          if (!keepPristine && pristine.erase(bs))
-            changed = true;
-        }
-      }
-      if (iters >= maxIters && changed) {
-        // Did not converge within the expected bound — fail loudly
-        // per the project's no-silent-fallback rule. Practically
-        // unreachable (forward-dataflow over a monotone lattice
-        // converges in at most `#BBs` iters), but surface a
-        // diagnostic rather than silently accept a possibly-wrong
-        // pristine set.
-        report_fatal_error(
-            "transpiler: kernarg-pristine dataflow failed to converge "
-            "within #BBs + 2 iterations; the CFG edge construction in "
-            "raiser.cpp Phase 4.5 is out of sync with the decoder's "
-            "branch-target collection.");
-      }
-    }
-
-    // Step 4: per-BB SGPR provenance for values that are definitely not the
-    // sentinel-modeled entry kernarg pointer on every incoming edge.
-    //
-    // `kernargPristineBBs` answers only "is the original kernarg pair still
-    // pristine at this BB?".  RoPE-style Triton kernels also keep ordinary
-    // pointer/scalar args in SGPRs loaded from the kernarg prologue, carry them
-    // across a control-flow merge, and later overwrite s[ka:ka+1] from those
-    // ordinary SGPRs before a `global_load ... s[ka:ka+1]`.  A local BB reset
-    // loses those non-kernarg facts and turns the overwrite into Unknown.
-    //
-    // This is a conservative forward must-analysis over dword provenance:
-    // a fact survives a BB entry only when all predecessors agree on the same
-    // provenance.  Unknown is the default and remains loud at consumers.
-    using DwordProv = RaiseContext::SgprKernargProvenance;
-    using DwordKind = RaiseContext::SgprKernargProvenance::Kind;
-
-    auto unknownProvenanceVector = [&]() {
-      llvm::SmallVector<DwordProv> vec;
-      vec.resize(regs.sgpr.size());
-      return vec;
-    };
-
-    auto sameProvenance = [](const DwordProv &a, const DwordProv &b) {
-      if (a.kind == DwordKind::NonKernarg && b.kind == DwordKind::NonKernarg)
-        return true;
-      if (a.kind == DwordKind::Unknown && b.kind == DwordKind::Unknown)
-        return true;
-      return a.kind == b.kind && a.delta == b.delta &&
-             a.subDword == b.subDword;
-    };
-
-    auto sameVector = [&](ArrayRef<DwordProv> a, ArrayRef<DwordProv> b) {
-      if (a.size() != b.size())
-        return false;
-      for (size_t i = 0; i < a.size(); ++i) {
-        if (!sameProvenance(a[i], b[i]))
-          return false;
-      }
-      return true;
-    };
-
-    auto joinProvenance = [&](const DwordProv &a, const DwordProv &b) {
-      if (sameProvenance(a, b))
-        return a;
-      return DwordProv{};
-    };
-
-    auto joinVectors = [&](ArrayRef<DwordProv> a, ArrayRef<DwordProv> b) {
-      llvm::SmallVector<DwordProv> out;
-      out.resize(regs.sgpr.size());
-      for (size_t i = 0; i < out.size(); ++i)
-        out[i] = joinProvenance(a[i], b[i]);
-      return out;
-    };
-
-    llvm::DenseMap<uint64_t, llvm::SmallVector<const DecodedInst *>>
-        instsByBB;
-    for (uint64_t bs : blockStarts)
-      instsByBB.try_emplace(bs, llvm::SmallVector<const DecodedInst *>{});
-    for (const DecodedInst &di : insts) {
-      auto it = bbOfInst.find(di.offset);
-      if (it != bbOfInst.end())
-        instsByBB[it->second].push_back(&di);
-    }
-
-    auto entryVec = unknownProvenanceVector();
-    for (size_t i = 0; i < userSgprLayout.entries.size() &&
-                       i < entryVec.size();
-         ++i) {
-      const auto &entry = userSgprLayout.entries[i];
-      if (entry.source == UserSgprLayout::Source::KernargSegmentPtr) {
-        entryVec[i].kind = DwordKind::Kernarg;
-        entryVec[i].delta = 0;
-        entryVec[i].subDword = entry.subDword;
-      } else if (entry.source != UserSgprLayout::Source::Unset) {
-        entryVec[i].kind = DwordKind::NonKernarg;
-      }
-    }
-
-    auto dwordAt = [](ArrayRef<DwordProv> state, int idx) {
-      if (idx < 0 || static_cast<size_t>(idx) >= state.size())
-        return DwordProv{};
-      return state[idx];
-    };
-
-    auto setDword = [](llvm::SmallVectorImpl<DwordProv> &state, int idx,
-                       DwordProv p) {
-      if (idx < 0 || static_cast<size_t>(idx) >= state.size())
-        return;
-      state[idx] = p;
-    };
-
-    auto setDwordKind = [&](llvm::SmallVectorImpl<DwordProv> &state, int idx,
-                            DwordKind kind) {
-      DwordProv p;
-      p.kind = kind;
-      setDword(state, idx, p);
-    };
-
-    auto regDefinitelyNonKernarg = [&](ArrayRef<DwordProv> state,
-                                       ParsedReg pr, int width) {
-      if (pr.kind != ParsedReg::SGPR)
-        return true;
-      for (int i = 0; i < width; ++i) {
-        if (dwordAt(state, pr.baseIdx + i).kind != DwordKind::NonKernarg)
-          return false;
-      }
-      return true;
-    };
-
-    auto allSourcesDefinitelyNonKernarg =
-        [&](ArrayRef<DwordProv> state, const DecodedInst &di) {
-          for (unsigned s = 0; s < di.numSrcs; ++s) {
-            unsigned idx = di.srcMap[s];
-            if (!di.isReg(idx))
-              continue;
-            ParsedReg pr = ctx.parseReg(di.getReg(idx), idx);
-            int width = std::max(pr.width, 1);
-            if (pr.kind == ParsedReg::SGPR &&
-                provenanceSemOpWritesScalarPair(di.semOp))
-              width = std::max(width, 2);
-            if (pr.kind == ParsedReg::SGPR &&
-                !regDefinitelyNonKernarg(state, pr, width))
-              return false;
-          }
-          return true;
-        };
-
-    auto pairProvenanceFromReg = [&](ArrayRef<DwordProv> state, ParsedReg pr) {
-      DwordProv lo = dwordAt(state, pr.baseIdx);
-      DwordProv hi = dwordAt(state, pr.baseIdx + 1);
-      std::pair<RaiseContext::KernargPtrDelta::BaseKind, int64_t> out = {
-          RaiseContext::KernargPtrDelta::BaseKind::Unknown, 0};
-      if (lo.kind == DwordKind::NonKernarg &&
-          hi.kind == DwordKind::NonKernarg) {
-        out.first = RaiseContext::KernargPtrDelta::BaseKind::NonKernarg;
-      } else if (lo.kind == DwordKind::Kernarg &&
-                 hi.kind == DwordKind::Kernarg && lo.subDword == 0 &&
-                 hi.subDword == 1 && lo.delta == hi.delta) {
-        out.first = RaiseContext::KernargPtrDelta::BaseKind::Kernarg;
-        out.second = lo.delta;
-      }
-      return out;
-    };
-
-    auto setPairFromBaseKind =
-        [&](llvm::SmallVectorImpl<DwordProv> &state, int dst,
-            RaiseContext::KernargPtrDelta::BaseKind kind, int64_t delta = 0) {
-          switch (kind) {
-          case RaiseContext::KernargPtrDelta::BaseKind::Kernarg: {
-            DwordProv lo, hi;
-            lo.kind = DwordKind::Kernarg;
-            lo.delta = delta;
-            lo.subDword = 0;
-            hi.kind = DwordKind::Kernarg;
-            hi.delta = delta;
-            hi.subDword = 1;
-            setDword(state, dst, lo);
-            setDword(state, dst + 1, hi);
-            break;
-          }
-          case RaiseContext::KernargPtrDelta::BaseKind::NonKernarg:
-            setDwordKind(state, dst, DwordKind::NonKernarg);
-            setDwordKind(state, dst + 1, DwordKind::NonKernarg);
-            break;
-          case RaiseContext::KernargPtrDelta::BaseKind::Unknown:
-            setDwordKind(state, dst, DwordKind::Unknown);
-            setDwordKind(state, dst + 1, DwordKind::Unknown);
-            break;
-          }
-        };
-
-    auto updateDef = [&](llvm::SmallVectorImpl<DwordProv> &state,
-                         const DecodedInst &di, ParsedReg def) {
-      const int defDwords = provenanceSemanticDefDwords(di.semOp, def);
-      if (defDwords == 0)
-        return;
-
-      if (provenanceIsSmemLoadResult(di.semOp)) {
-        for (int i = 0; i < defDwords; ++i)
-          setDwordKind(state, def.baseIdx + i, DwordKind::NonKernarg);
-        return;
-      }
-
-      if (di.semOp == SemOp::S_MOV_B64 && defDwords >= 2 &&
-          di.numSrcs >= 1) {
-        unsigned src0 = di.srcMap[0];
-        if (di.isReg(src0)) {
-          ParsedReg src = ctx.parseReg(di.getReg(src0), src0);
-          auto [kind, delta] = pairProvenanceFromReg(state, src);
-          setPairFromBaseKind(state, def.baseIdx, kind, delta);
-          return;
-        }
-      }
-
-      if (di.semOp == SemOp::S_MOV_B32 && defDwords == 1 &&
-          di.numSrcs >= 1) {
-        unsigned src0 = di.srcMap[0];
-        if (di.isReg(src0)) {
-          ParsedReg src = ctx.parseReg(di.getReg(src0), src0);
-          if (src.kind == ParsedReg::SGPR) {
-            setDword(state, def.baseIdx, dwordAt(state, src.baseIdx));
-            return;
-          }
-        } else {
-          setDwordKind(state, def.baseIdx, DwordKind::NonKernarg);
-          return;
-        }
-      }
-
-      DwordKind kind = allSourcesDefinitelyNonKernarg(state, di)
-                           ? DwordKind::NonKernarg
-                           : DwordKind::Unknown;
-      for (int i = 0; i < defDwords; ++i)
-        setDwordKind(state, def.baseIdx + i, kind);
-    };
-
-    auto transferBB = [&](ArrayRef<DwordProv> in,
-                          ArrayRef<const DecodedInst *> bbInsts) {
-      llvm::SmallVector<DwordProv> state(in.begin(), in.end());
-      for (const DecodedInst *di : bbInsts) {
-        for (unsigned d = 0; d < di->numDefs; ++d) {
-          if (di->isReg(d))
-            updateDef(state, *di, ctx.parseReg(di->getReg(d), d));
-        }
-        if (provenanceSemOpHasLogicalDst(di->semOp) && di->numDefs > 0 &&
-            di->isReg(0))
-          updateDef(state, *di, ctx.parseReg(di->getReg(0), 0));
-      }
-      return state;
-    };
-
-    llvm::DenseMap<uint64_t, llvm::SmallVector<DwordProv>> provIn;
-    llvm::DenseMap<uint64_t, llvm::SmallVector<DwordProv>> provOut;
-    for (uint64_t bs : blockStarts) {
-      provIn[bs] = unknownProvenanceVector();
-      provOut[bs] = unknownProvenanceVector();
-    }
-    provIn[kernelOffset] = entryVec;
-
-    bool provChanged = true;
-    unsigned provIters = 0;
-    const unsigned provMaxIters =
-        static_cast<unsigned>(blockStarts.size()) + 2;
-    while (provChanged && provIters < provMaxIters) {
-      provChanged = false;
-      ++provIters;
-      for (uint64_t bs : blockStarts) {
-        llvm::SmallVector<DwordProv> newIn;
-        if (bs == kernelOffset) {
-          newIn = entryVec;
-        } else {
-          const auto &preds = predecessors[bs];
-          if (preds.empty()) {
-            newIn = unknownProvenanceVector();
-          } else {
-            newIn = provOut[preds.front()];
-            for (uint64_t pred : ArrayRef<uint64_t>(preds).drop_front())
-              newIn = joinVectors(newIn, provOut[pred]);
-          }
-        }
-
-        if (!sameVector(provIn[bs], newIn)) {
-          provIn[bs] = newIn;
-          provChanged = true;
-        }
-
-        auto newOut = transferBB(provIn[bs], instsByBB[bs]);
-        if (!sameVector(provOut[bs], newOut)) {
-          provOut[bs] = newOut;
-          provChanged = true;
-        }
-      }
-    }
-    if (provIters >= provMaxIters && provChanged) {
-      report_fatal_error(
-          "transpiler: SGPR kernarg provenance dataflow failed to converge "
-          "within #BBs + 2 iterations; the CFG edge construction in "
-          "raiser.cpp Phase 4.5 is out of sync with the decoder's "
-          "branch-target collection.");
-    }
-
-    for (uint64_t bs : blockStarts)
-      ctx.sgprProvenanceAtBBEntry[bs] = provIn[bs];
-  }
 
   // Dominance-safe SGPR wave-mask shadow storage.
   // One EXEC-width mask + one scalar-valid bit per SGPR base index.
@@ -2283,20 +1105,6 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
       // to a proper per-BB merge (see sgpr-wave-mask-translation.md
       // section 7 evolution path).
       ctx.clearSgprWaveMaskShadow();
-      // Reset the kernarg-pair const-delta tracker for the new BB,
-      // consulting the precomputed `kernargPristineBBs` dataflow
-      // result (Phase 4.5 below) to decide whether the pair is
-      // guaranteed-pristine on every incoming CFG edge. When it is,
-      // the tracker enters `valid = true, delta = 0`; otherwise
-      // `valid = false` and handle_smem.cpp refuses the kernarg-slot
-      // fast path loudly for any kernarg-pair SMEM load in this BB.
-      // See `RaiseContext::KernargPtrDelta` and
-      // `resetKernargPtrDeltaAtBBBoundary` for the full contract.
-      ctx.resetKernargPtrDeltaAtBBBoundary(di.offset);
-      // VGPR zero facts are source-BB local. They intentionally do not merge
-      // across control-flow joins; consumers that need a zero VGPR offset must
-      // see the defining zero write in the same source basic block.
-      ctx.clearVgprZeroProvenance();
     }
 
     ctx.computeVGPRAdjust(di);
@@ -2436,42 +1244,6 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
         }
       }
 
-      // Kernarg-pointer const-delta tracker update. Single-BB, fires
-      // only for the canonical `s_add_u32 ; s_addc_u32 (hi, hi, #0)`
-      // 64-bit const-add pattern against the source-ABI kernarg-pair
-      // SGPRs (Tensile UniversalArgs: shift kernarg ptr past a 16-byte
-      // preamble before issuing the downstream static kernarg loads).
-      // Everything else that touches either dword invalidates the
-      // tracker; handle_smem.cpp then refuses the kernarg-slot fast
-      // path loudly. See `RaiseContext::KernargPtrDelta` for the full
-      // state machine and invariants, and issue #21 for the canonical
-      // miscompile this fix surfaces.
-      //
-      // Placed here (in the generic post-handler hook rather than in
-      // handle_sop2.cpp) so the update point is a single location
-      // independent of which SemOp fires: adding a new kernarg-pair
-      // mutator opcode (e.g. S_SUB_U32, S_MOV_B32) means updating
-      // *this* switch, not each handler in turn, and invariants over
-      // the whole MC stream (the "any other write clobbers SCC"
-      // dependency of the pending-low state) are checkable against
-      // `di.defsSCC` directly without plumbing hint flags through the
-      // HandlerResult.
-      if (ctx.userSgprLayout != nullptr) {
-        const int kaLo = ctx.userSgprLayout->kernargSegmentPtrSgpr;
-        if (kaLo >= 0)
-          KernargSgprProvenanceUpdater(ctx, di, op, kaLo).update();
-      }
-      if (di.numDefs > 0 && di.isReg(0)) {
-        ParsedReg dst = op.dst();
-        if (dst.kind == ParsedReg::VGPR) {
-          bool knownZero = false;
-          if (di.semOp == SemOp::V_MOV_B32 && di.numSrcs >= 1) {
-            unsigned src0 = di.srcMap[0];
-            knownZero = di.isImm(src0) && di.getImm(src0) == 0;
-          }
-          ctx.setVgprZeroProvenance(dst, knownZero);
-        }
-      }
       raisedCount++;
       continue;
     }

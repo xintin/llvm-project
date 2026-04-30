@@ -11,7 +11,6 @@ const char *reasonString(RaiseFailureReason r) {
   case RaiseFailureReason::UnsupportedShape:        return "UnsupportedShape";
   case RaiseFailureReason::SPEUnsafeExecWriter:
     return "SPE-unmodeled-EXEC-writer";
-  case RaiseFailureReason::SMEMKernargMiss:         return "SMEMKernargMiss";
   case RaiseFailureReason::TargetMachineCreationFailed:
     return "TargetMachineCreationFailed";
   case RaiseFailureReason::IRVerificationFailed:
@@ -47,15 +46,6 @@ RaiseFailure RaiseFailure::unsupportedShape(const DecodedInst &di,
   f.format = format.str();
   f.offset = di.offset;
   f.detail = detail.str();
-  return f;
-}
-
-RaiseFailure RaiseFailure::smemKernargMiss(const DecodedInst &di) {
-  RaiseFailure f;
-  f.reason = RaiseFailureReason::SMEMKernargMiss;
-  f.mnemonic = di.mnemonic;
-  f.format = "SMEM";
-  f.offset = di.offset;
   return f;
 }
 

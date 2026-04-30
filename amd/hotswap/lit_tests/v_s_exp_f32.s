@@ -12,8 +12,13 @@
 ; denormals. Preserve that special-function contract through the AMDGPU
 ; intrinsic instead of generic llvm.exp2.
 
+; v_s_exp_f32 must lift through the AMDGPU exp2 intrinsic, not the
+; generic libm `llvm.exp2`.  Kernarg fetches now go through
+; `llvm.amdgcn.kernarg.segment.ptr` + a real load (the i32 source
+; reaches the bitcast via that path).
 ; CHECK-LABEL: define amdgpu_kernel void @v_s_exp_f32_kernel(
-; CHECK: [[SRC:%[^ ]+]] = bitcast i32 %arg1 to float
+; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
+; CHECK: [[SRC:%[^ ]+]] = bitcast i32 %{{[^ ]+}} to float
 ; CHECK: [[EXP:%[^ ]+]] = call float @llvm.amdgcn.exp2.f32(float [[SRC]])
 ; CHECK: bitcast float [[EXP]] to i32
 ; CHECK-NOT: call {{.*}}@llvm.exp2.f32

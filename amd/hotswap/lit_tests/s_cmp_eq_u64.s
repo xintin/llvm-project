@@ -10,9 +10,11 @@
 ;
 ; INVARIANTS PINNED:
 ;
-;   1. The kernel signature carries the i64 source-operand arguments
-;      directly (`i64 %arg1, i64 %arg2`); no narrowing to i32. This
-;      pins the typical SOPC_CMP_64 corpus shape.
+;   1. The lifted kernel has a single `[kernarg_segment_size x i8]`
+;      placeholder argument; kernarg loads flow through
+;      `amdgcn_kernarg_segment_ptr` + GEP. Operand-width preservation
+;      is therefore a body-level invariant (see #2 below) rather
+;      than a signature-level one.
 ;
 ;   2. The lift emits a single `icmp eq i64`. The handler reads
 ;      both operands via `op.src64(...)` (i64 SGPR-pair reads,
@@ -34,9 +36,7 @@
 ;      i64-wide source.
 
 ; CHECK-LABEL: define amdgpu_kernel void @s_cmp_eq_u64_kernel(
-; CHECK-SAME: ptr addrspace(1) %arg0
-; CHECK-SAME: i64 %arg1
-; CHECK-SAME: i64 %arg2
+; CHECK-SAME: ptr addrspace(4) byref([280 x i8]) align 16 %kargs
 
 ; The s_cmp_eq_u64 lift. The handler-emitted value-name `scmp64`
 ; appears verbatim, and the operand types are i64.

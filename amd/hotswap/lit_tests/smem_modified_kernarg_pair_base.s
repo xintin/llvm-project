@@ -12,18 +12,19 @@
 ;   s_load_b64   s[M:M+1], s[0:1], 8
 ;
 ; The base register number is still the source-ABI kernarg pair, but its
-; value is no longer the entry kernarg segment pointer. The raiser must
-; lower the subsequent SMEM as normal scalar memory loads, not route them
-; through `extractKernargDword` and not refuse as an unknown kernarg delta.
+; value is no longer the entry kernarg segment pointer. The raiser
+; lifts the SMEM loads as `addrspace(1)` GEP+load against whatever the
+; SGPR pair currently holds; the AMDGPU backend's lowering picks SMEM
+; vs VMEM from load uniformity at codegen time.
 
 ; CHECK-LABEL: define amdgpu_kernel void @smem_modified_kernarg_pair_base_kernel(
-; CHECK-SAME: ptr addrspace(1) %arg0
-; CHECK-SAME: ptr addrspace(1) %arg1
+; CHECK-SAME: ptr addrspace(4) byref([16 x i8]) align 16 %kargs
 
-; The preloaded input pointer is materialised from %arg0, then the modified
-; s[0:1] base is used by the ordinary SMEM path. A regression to the kernarg
-; extractor path would not emit these `smem_load` memory operations.
-; CHECK: ptrtoint ptr addrspace(1) %arg0 to i64
+; The preloaded input pointer is materialised via
+; `amdgcn_kernarg_segment_ptr` (which always returns `ptr addrspace(4)`),
+; then the modified s[0:1] base is used by the ordinary SMEM path
+; against `addrspace(1)`.
+; CHECK: call ptr addrspace(4) @llvm.amdgcn.kernarg.segment.ptr()
 ; CHECK: %smem_load = load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 ; CHECK: %smem_load{{[0-9]*}} = load i32, ptr addrspace(1) %{{[^,]+}}, align 4
 ; CHECK: %smem_load{{[0-9]*}} = load i32, ptr addrspace(1) %{{[^,]+}}, align 4

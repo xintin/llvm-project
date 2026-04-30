@@ -30,8 +30,6 @@ enum class RaiseFailureReason : uint16_t {
   // Phase 1.5 gate: an EXEC-writing instruction whose SemOp does not
   // have `routesExecThroughStoreExec` set in `sem_op_attrs.cpp`.
   SPEUnsafeExecWriter,
-  // SMEM load's scalar base does not match any known kernarg slot.
-  SMEMKernargMiss,
   // Phase 2: `TargetRegistry::createTargetMachine` returned null.
   TargetMachineCreationFailed,
   // Phase 7: `verifyModule` rejected the emitted IR.
@@ -116,9 +114,6 @@ struct RaiseFailure {
   static RaiseFailure unsupportedShape(const DecodedInst &di,
                                         llvm::StringRef format,
                                         const llvm::Twine &detail = {});
-
-  // SMEM load's scalar base doesn't match any known kernarg slot.
-  static RaiseFailure smemKernargMiss(const DecodedInst &di);
 
   // Raiser main loop / pre-translation gates. These are only built by
   // `raiser.cpp` — the factories live here so every reason is

@@ -15,7 +15,8 @@
 ;   1. `loadSGPR64` of the base SGPR pair, composed from the two
 ;      i32 dwords already live in the reg-file (these in turn come
 ;      from the earlier `s_load_b128 s[0:3], s[0:1], 0x0` kernarg
-;      preload, which routes through `extractKernargDword`).
+;      preload, which lifts to a GEP+load against
+;      `amdgcn_kernarg_segment_ptr`).
 ;   2. `inttoptr` of the i64 base into `ptr addrspace(1)` — global
 ;      address space, matching the existing `S_LOAD_B*` convention
 ;      (no `addrspace(4)` opt-in because we cannot prove the memory
