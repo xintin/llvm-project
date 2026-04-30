@@ -91,14 +91,14 @@ set(SOURCES
   src/comgr-unbundle-command.cpp
   src/time-stat/time-stat.cpp)
 
-# Hotswap binary transpiler, opt-in. The hotswap project lives at
-# amd/hotswap/ as a sibling CMake subproject.
+# Hotswap binary transpiler, opt-in. The hotswap project lives under
+# amd/comgr/hotswap as a private COMGR subproject.
 # When enabled, we compile the comgr-hotswap-transpile.cpp entry point and link
 # the hotswap static library into amd_comgr; when disabled, the
 # amd_comgr_hotswap_transpile API is simply not provided.
 option(COMGR_ENABLE_HOTSWAP_TRANSPILE
   "Build the hotswap-transpiler-backed amd_comgr_hotswap_transpile entry point" OFF)
-set(COMGR_HOTSWAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../hotswap"
+set(COMGR_HOTSWAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hotswap"
   CACHE PATH "Path to the hotswap-transpiler CMake subproject")
 if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
   if(NOT EXISTS "${COMGR_HOTSWAP_DIR}/CMakeLists.txt")
@@ -188,21 +188,12 @@ target_include_directories(amd_comgr
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# The hotswap CMakeLists exposes the hotswap::transpiler target. CMake
-# targets are visible across sibling LLVM_EXTERNAL_PROJECTS directories, so
-# COMGR can consume the same target whether LLVM added hotswap first or COMGR
-# adds it here. The target's PUBLIC usage requirements carry the hotswap include
-# root needed for `#include "hotswap/pipeline.hpp"`.
+# The hotswap CMakeLists exposes the hotswap::transpiler target. Its
+# PUBLIC usage requirements carry the hotswap include root needed for
+# `#include "hotswap/pipeline.hpp"`.
 if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
-  if(NOT TARGET hotswap::transpiler)
-    add_subdirectory("${COMGR_HOTSWAP_DIR}"
-                     "${CMAKE_CURRENT_BINARY_DIR}/hotswap")
-  endif()
-  if(NOT TARGET hotswap::transpiler)
-    message(FATAL_ERROR
-      "COMGR_ENABLE_HOTSWAP_TRANSPILE=ON but the hotswap CMake subproject at "
-      "'${COMGR_HOTSWAP_DIR}' did not define the hotswap::transpiler target.")
-  endif()
+  add_subdirectory("${COMGR_HOTSWAP_DIR}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/hotswap")
   target_link_libraries(amd_comgr PRIVATE hotswap::transpiler)
   target_compile_definitions(amd_comgr PRIVATE COMGR_ENABLE_HOTSWAP_TRANSPILE=1)
 endif()

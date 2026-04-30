@@ -1,12 +1,12 @@
 # AMD Hotswap Transpiler
 
 > **Migration note:** This project has just moved from the ROCR
-> `hotswap/transpiler` tree into LLVM under `amd/hotswap`. The source code and
+> `hotswap/transpiler` tree into COMGR under `amd/comgr/hotswap`. The source code and
 > focused COMGR validation are current, but some design notes, comments, and
 > docs may still describe the old ROCR-local layout or lag the new
-> LLVM/COMGR-owned integration shape.
+> COMGR-owned integration shape.
 
-`amd/hotswap` contains the compiler-side AMDGPU binary translation library used
+`amd/comgr/hotswap` contains the compiler-side AMDGPU binary translation library used
 by the COMGR hotswap-transpile prototype. It lifts AMDGPU code objects to LLVM
 IR, lowers them through the in-tree AMDGPU backend for a target ISA, and returns
 a translated HSACO.
@@ -19,17 +19,15 @@ LLVM tree.
 
 ### LLVM External Project
 
-The intended in-tree development configuration is to build hotswap as an LLVM
-external project together with COMGR and device-libs:
+The intended in-tree development configuration is to build COMGR as an LLVM external project with hotswap enabled:
 
 ```bash
 cmake -S llvm -B <build-dir> -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
   -DLLVM_TARGETS_TO_BUILD="X86;AMDGPU" \
-  -DLLVM_EXTERNAL_PROJECTS="device-libs;hotswap;comgr" \
+  -DLLVM_EXTERNAL_PROJECTS="device-libs;comgr" \
   -DLLVM_EXTERNAL_DEVICE_LIBS_SOURCE_DIR=<llvm-project>/amd/device-libs \
-  -DLLVM_EXTERNAL_HOTSWAP_SOURCE_DIR=<llvm-project>/amd/hotswap \
   -DLLVM_EXTERNAL_COMGR_SOURCE_DIR=<llvm-project>/amd/comgr \
   -DCOMGR_ENABLE_HOTSWAP_TRANSPILE=ON \
   -DLLVM_USE_LINKER=lld
@@ -51,10 +49,10 @@ LLVM install tree is not sufficient because hotswap uses AMDGPU target-private
 headers and generated TableGen include files.
 
 ```bash
-cmake -S amd/hotswap -B amd/hotswap/build -G Ninja \
+cmake -S amd/comgr/hotswap -B amd/comgr/hotswap/build -G Ninja \
   -DLLVM_DIR=<build-dir>/lib/cmake/llvm \
   -DCMAKE_CXX_COMPILER=clang++
-cmake --build amd/hotswap/build --target hotswap-transpiler
+cmake --build amd/comgr/hotswap/build --target hotswap-transpiler
 ```
 
 ## COMGR Integration
@@ -99,7 +97,7 @@ A direct manual invocation is also possible:
 
 ```bash
 <build-dir>/tools/comgr/test-lit/hotswap-transpile \
-  amd/hotswap/tests/vecadd_gfx950.co \
+  amd/comgr/hotswap/tests/vecadd_gfx950.co \
   amdgcn-amd-amdhsa--gfx950 \
   amdgcn-amd-amdhsa--gfx942 \
   --output=/tmp/vecadd_gfx942.co

@@ -12,8 +12,8 @@
 /// object to the hotswap pipeline - every kernel is disassembled, raised to
 /// LLVM IR, re-lowered through the stock AMDGPU backend for the target ISA,
 /// and re-linked into a single merged HSACO via
-/// `transpiler::runPipelineAllKernels` (see amd/hotswap/pipeline.hpp and
-/// amd/hotswap/raise_cli.cpp for the standalone driver this entry point
+/// `transpiler::runPipelineAllKernels` (see amd/comgr/hotswap/pipeline.hpp and
+/// amd/comgr/hotswap/raise_cli.cpp for the standalone driver this entry point
 /// mirrors).
 ///
 /// Failure is loud: any per-kernel raise failure surfaced by the hotswap
@@ -48,7 +48,7 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile(
   // pipeline. We do not gate on the processor name here — hotswap decides
   // per-kernel whether the source/target pair is supported, and surfaces
   // unsupported instructions as a pipeline failure (see
-  // RaiseFailure::reason in amd/hotswap/raise_failure.hpp).
+  // RaiseFailure::reason in amd/comgr/hotswap/raise_failure.hpp).
   TargetIdentifier SourceIdent, TargetIdent;
   if (parseTargetIdentifier(source_isa_name, SourceIdent) ||
       parseTargetIdentifier(target_isa_name, TargetIdent))

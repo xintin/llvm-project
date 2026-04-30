@@ -48,13 +48,13 @@
 
 // COM: End-to-end transpile of a real HSACO. The hotswap tree ships a tiny
 // COM: gfx950 vecadd code object (single kernel, no cross-lane / MFMA / wave
-// COM: ops) under amd/hotswap/tests/. Re-lower it to gfx942 and verify both
+// COM: ops) under amd/comgr/hotswap/tests/. Re-lower it to gfx942 and verify both
 // COM: the API contract (SUCCESS + non-empty bytes) and the binary contents
 // COM: (ELF e_flags retargeted to gfx942, kernel symbol preserved). The
 // COM: hotswap backend shells out to llc and ld.lld; the lit site config
 // COM: prepends llvm_tools_dir to PATH so both are reachable from the test
 // COM: environment.
-// RUN: hotswap-transpile %S/../../hotswap/tests/vecadd_gfx950.co \
+// RUN: hotswap-transpile %S/../hotswap/tests/vecadd_gfx950.co \
 // RUN:                   amdgcn-amd-amdhsa--gfx950 \
 // RUN:                   amdgcn-amd-amdhsa--gfx942 \
 // RUN:                   --output=%t.gfx942.co \
@@ -64,7 +64,7 @@
 // COM: Sanity-check the source binary's e_flags so the negative check below
 // COM: is meaningful: confirm it really is a gfx950 ELF before asserting
 // COM: that the *output* is not.
-// RUN: %llvm-readelf -h %S/../../hotswap/tests/vecadd_gfx950.co \
+// RUN: %llvm-readelf -h %S/../hotswap/tests/vecadd_gfx950.co \
 // RUN:   | %FileCheck --check-prefix=SRCISA %s
 // SRCISA: Flags: {{.*}}gfx950
 

@@ -28,8 +28,7 @@ endif()
 # We support three configurations:
 #
 #   1. In-tree LLVM build. Hotswap was added via add_subdirectory() from
-#      LLVM's own CMake (e.g. through LLVM_EXTERNAL_PROJECTS=hotswap, or
-#      from a future amd/CMakeLists.txt wired into llvm/). LLVM has
+#      COMGR's CMake via add_subdirectory(). LLVM has
 #      already populated LLVM_MAIN_SRC_DIR / LLVM_BINARY_DIR and the LLVM
 #      library targets; AddLLVM.cmake is loaded. No find_package needed.
 #
@@ -37,9 +36,9 @@ endif()
 #      ...) that already called find_package(LLVM). Variables are
 #      populated; the find_package call below becomes a no-op.
 #
-#   3. Standalone (cmake -S amd/hotswap -B build). We need find_package(LLVM)
-#      to resolve LLVM_DIR. Since hotswap now lives at
-#      <llvm-project>/amd/hotswap, default LLVM_DIR to the conventional
+#   3. Standalone (cmake -S amd/comgr/hotswap -B build). We need
+#      find_package(LLVM) to resolve LLVM_DIR. Since hotswap now lives at
+#      <llvm-project>/amd/comgr/hotswap, default LLVM_DIR to the conventional
 #      <llvm-project>/build tree if the user did not pass one explicitly.
 if(TARGET LLVMSupport AND DEFINED LLVM_MAIN_SRC_DIR)
   # Case 1. Mirror the variable name find_package(LLVM) would have set
@@ -49,9 +48,9 @@ if(TARGET LLVMSupport AND DEFINED LLVM_MAIN_SRC_DIR)
 else()
   # Cases 2 and 3.
   if(NOT DEFINED LLVM_DIR OR NOT LLVM_DIR)
-    # amd/hotswap/ -> amd/ -> <llvm-project>/
+    # amd/comgr/hotswap/ -> amd/comgr/ -> amd/ -> <llvm-project>/
     set(_hotswap_default_llvm_build
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../build/lib/cmake/llvm")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../build/lib/cmake/llvm")
     if(EXISTS "${_hotswap_default_llvm_build}/LLVMConfig.cmake")
       get_filename_component(_hotswap_default_llvm_build
                              "${_hotswap_default_llvm_build}" ABSOLUTE)
