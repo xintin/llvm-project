@@ -48,10 +48,10 @@
 
 // COM: End-to-end transpile of a real HSACO. The hotswap tree ships a tiny
 // COM: gfx950 vecadd code object (single kernel, no cross-lane / MFMA / wave
-// COM: ops) under amd/comgr/hotswap/tests/. Re-lower it to gfx942 and verify both
-// COM: the API contract (SUCCESS + non-empty bytes) and the binary contents
-// COM: (ELF e_flags retargeted to gfx942, kernel symbol preserved). The
-// COM: hotswap backend shells out to llc and ld.lld; the lit site config
+// COM: ops) under amd/comgr/hotswap/tests/. Re-lower it to gfx942 and verify
+// COM: both the API contract (SUCCESS + non-empty bytes) and the binary
+// COM: contents (ELF e_flags retargeted to gfx942, kernel symbol preserved).
+// COM: The hotswap backend shells out to llc and ld.lld; the lit site config
 // COM: prepends llvm_tools_dir to PATH so both are reachable from the test
 // COM: environment.
 // RUN: hotswap-transpile %S/../hotswap/tests/vecadd_gfx950.co \

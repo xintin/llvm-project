@@ -35,6 +35,59 @@ cmake --build <build-dir> \
   --parallel 16
 ```
 
+### TheRock Compiler/COMGR Build
+
+TheRock builds hotswap as part of COMGR. The hotswap tree is reached from
+`amd/comgr/CMakeLists.txt`; it should not be listed as a separate LLVM external
+project.
+
+Before configuring TheRock, make sure the TheRock `compiler/amd-llvm` source
+directory is an LLVM checkout that contains this tree at `amd/comgr/hotswap`.
+Then pass the hotswap option through the `amd-comgr` subproject:
+
+```bash
+THEROCK_SRC=<therock-source-dir>
+THEROCK_BUILD=<therock-build-dir>
+
+cmake -S "${THEROCK_SRC}" -B "${THEROCK_BUILD}" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTHEROCK_AMDGPU_FAMILIES=<gfx-target-or-family> \
+  -DTHEROCK_ENABLE_ALL=OFF \
+  -DTHEROCK_ENABLE_COMPILER=ON \
+  -Damd-llvm_CMAKE_ARGS="-DLLVM_BUILD_TOOLS=ON;-DLLVM_INSTALL_UTILS=ON" \
+  -Damd-comgr_CMAKE_ARGS="-DCOMGR_ENABLE_HOTSWAP_TRANSPILE=ON;-DBUILD_TESTING=ON"
+```
+
+The `amd-llvm_CMAKE_ARGS` list builds and installs LLVM tools and utilities.
+The `BUILD_TESTING=ON` entry in `amd-comgr_CMAKE_ARGS` keeps COMGR lit tests
+available. The hotswap pipeline currently shells out to `llc`, `llvm-mc`, and
+`ld.lld`; the focused lit test also uses `FileCheck`, `llvm-readelf`, and
+`llvm-objdump`.
+
+Build the compiler/COMGR components:
+
+```bash
+cmake --build "${THEROCK_BUILD}" --target amd-comgr --parallel 16
+```
+
+Verify that COMGR exports the hotswap entry point:
+
+```bash
+nm -D "${THEROCK_BUILD}/compiler/amd-comgr/stage/lib/libamd_comgr.so" \
+  | rg ' amd_comgr_hotswap_transpile$'
+```
+
+Run the focused COMGR lit test:
+
+```bash
+"${THEROCK_BUILD}/compiler/amd-llvm/build/bin/llvm-lit" -v \
+  "${THEROCK_BUILD}/compiler/amd-comgr/build/test-lit" \
+  --filter hotswap-transpile.c
+```
+
+Runtime validation should remain a separate integration test. ROCR should call
+COMGR's `amd_comgr_hotswap_transpile` API rather than linking hotswap internals.
+
 ### Standalone Hotswap Library
 
 For local library-only iteration, point `LLVM_DIR` at an LLVM build tree. An
@@ -93,7 +146,7 @@ A direct manual invocation is also possible:
   amd/comgr/hotswap/tests/vecadd_gfx950.co \
   amdgcn-amd-amdhsa--gfx950 \
   amdgcn-amd-amdhsa--gfx942 \
-  --output=/tmp/vecadd_gfx942.co
+  --output=<scratch-dir>/vecadd_gfx942.co
 ```
 
 ## Tests Kept In Tree
