@@ -67,6 +67,11 @@ add_library(hotswap-transpiler STATIC
   translation_cache.cpp
   handle_smem.cpp
   handle_sopk.cpp
+  flat_addr.cpp
+  mubuf_addr.cpp
+  handle_flat.cpp
+  handle_mubuf.cpp
+  handle_ds.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
