@@ -461,6 +461,9 @@ static const Entry kCanonTable[] = {
     // V_ADD_NC_U16_t16_e64 and V_ADD_NC_U16_fake16_e64 onto this
     // base entry automatically, so a single mapping suffices.
     E(V_ADD_NC_U16_e64, V_ADD_NC_U16),
+    // gfx1250 add-then-min VOP3. The real subtarget opcodes canonicalize
+    // through this pseudo via AMDGPU::getMCOpcode-derived tables.
+    E(V_ADD_MIN_U32_e64, V_ADD_MIN_U32),
     E(V_BFE_U32_e64, V_BFE_U32),
     E(V_BFE_I32_e64, V_BFE_I32),
     // gfx6+ VOP3 bit-field insert. Ternary, e64-only (no VOP1/VOP2

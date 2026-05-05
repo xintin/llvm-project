@@ -43,8 +43,13 @@ endif()
 
 set(LIT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(TRANSPILER_BUILD_DIR "${CMAKE_BINARY_DIR}")
-# Single-config Ninja: raise_cli lands next to this project in the build tree.
-set(LIT_TOOL_RAISE_CLI "${CMAKE_BINARY_DIR}/raise_cli")
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  # Standalone hotswap build: raise_cli is emitted at the standalone build root.
+  set(LIT_TOOL_RAISE_CLI "${CMAKE_BINARY_DIR}/raise_cli")
+else()
+  # LLVM external-project build: LLVM routes executables to the shared bin dir.
+  set(LIT_TOOL_RAISE_CLI "${LLVM_BINARY_DIR}/bin/raise_cli")
+endif()
 set(LIT_TOOL_FILECHECK "${LIT_FILECHECK_EXE}")
 set(LIT_TOOL_NOT "${LIT_NOT_EXE}")
 set(LIT_TOOL_LLVM_MC "${LIT_LLVM_MC_EXE}")

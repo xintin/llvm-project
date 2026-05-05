@@ -6,6 +6,7 @@
 #include "semop.hpp"
 #include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -23,6 +24,33 @@ using namespace llvm;
 namespace transpiler {
 
 namespace {
+
+std::optional<int64_t> readNamedImmOperand(const DecodedInst &di,
+                                           AMDGPU::OpName name) {
+  int idx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(), name);
+  if (idx < 0 || static_cast<unsigned>(idx) >= di.inst.getNumOperands())
+    return std::nullopt;
+  unsigned operandIdx = static_cast<unsigned>(idx);
+  if (!di.isImm(operandIdx))
+    return std::nullopt;
+  return di.getImm(operandIdx);
+}
+
+std::optional<bool> readVOP3Clamp(const DecodedInst &di, HandlerResult &hr,
+                                  const char *opName) {
+  std::optional<int64_t> clamp =
+      readNamedImmOperand(di, AMDGPU::OpName::clamp);
+  if (!clamp) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOP3",
+        (Twine(opName) +
+         " missing immediate clamp operand; operand table layout does not "
+         "match the expected VOP3 profile")
+            .str());
+    return std::nullopt;
+  }
+  return *clamp != 0;
+}
 
 // ============================================================================
 // Carry-chain scalar-operand routing for VOP2-CI / VOP3B-CI instructions.
@@ -1484,6 +1512,38 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // gfx1250 v_add_min_u32: dst = umin(uaddsat(src0, src1), src2).
+  //
+  // LLVM also exposes llvm.amdgcn.add.min.u32 with an immediate clamp bit, but
+  // that target intrinsic cannot be selected for non-gfx1250 targets such as
+  // gfx942. Use the generic LLVM form instead: the AMDGPU backend has an
+  // explicit selection pattern for it
+  // (`ThreeOp_i32_Pats<uaddsat, umin, V_ADD_MIN_U32_e64>`), and it remains
+  // target-independent when the destination ISA lacks this opcode.
+  //
+  // Clamp handling: LLVM's AMDGPU modifier docs define integer clamp as
+  // clamping to the operation type's representable range. For the U32 add-min
+  // operation, `uadd.sat.i32` already produces a value in [0, UINT32_MAX], and
+  // the unsigned min with src2 stays in that same range. The clamp bit is
+  // therefore semantically redundant for this SemOp, but we still require the
+  // generated immediate operand to be present so an unexpected operand-table
+  // shape refuses loudly instead of being guessed.
+  if (sop == SemOp::V_ADD_MIN_U32) {
+    std::optional<bool> clamp = readVOP3Clamp(di, hr, "v_add_min_u32");
+    if (!clamp)
+      return hr;
+    Function *uaddSatFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::uadd_sat, {ctx.i32Ty});
+    Function *uminFn =
+        Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::umin,
+                                          {ctx.i32Ty});
+    Value *sum = ctx.B.CreateCall(uaddSatFn, {op.src(0), op.src(1)},
+                                  "vadd_min_sum");
+    ctx.writeReg32(op.dst(),
+                   ctx.B.CreateCall(uminFn, {sum, op.src(2)}, "vadd_min"));
+    hr.handled = true;
+    return hr;
+  }
   if (sop == SemOp::V_BITOP3_B32 || sop == SemOp::V_BITOP3_B16) {
     // v_bitop3 dst, src0, src1, src2, imm8
     // For each bit position i, dst[i] = LUT[4*src0[i] + 2*src1[i] + src2[i]]
@@ -1497,7 +1557,6 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       lutIsConst = true;
     }
     Value *na = ctx.B.CreateNot(a), *nb = ctx.B.CreateNot(b), *nc = ctx.B.CreateNot(c);
-    Value *allOnes = ConstantInt::get(ctx.i32Ty, ~0U);
     Value *result = ConstantInt::get(ctx.i32Ty, 0);
     Value *minterms[8] = {
       ctx.B.CreateAnd(ctx.B.CreateAnd(na, nb), nc),  // 0: ~a & ~b & ~c
