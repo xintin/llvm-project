@@ -5,26 +5,33 @@
 ; RDNA4 VOP3PX2 opcode 0x033, ScaledWMMA family). Pins the contractual
 ; cross-target loud-failure behaviour of
 ; transpiler/handle_valu_vop3p.cpp under
-; SemOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4. Companion fixture to
+; CanonicalOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4. Companion fixture to
 ; `wmma_scale_f32_16x16x128_f8f6f4_same_target.ll`, which pins the
 ; same-target (gfx1250 -> gfx1250) intrinsic-emit path.
 ;
-; gfx942 has no scaled-WMMA hardware. The closest sibling on gfx942
-; is `mfma_scale_f32_16x16x128_f8f6f4` (already mapped via
-; `SemOp::V_MFMA_SCALE_F32_16x16x128_F8F6F4` and handled in
-; `handle_mfma.cpp`), but the WMMA→MFMA lane redistribution for
-; K=128 + per-matrix-fmt selection + the
-; `matrix_a/b_scale_fmt × scale_src0/src1` exponent application is
-; not modelled in `wmma_lowering.cpp` (only K=32 / K=64 fp16 / bf16 /
-; fp8 / bf8 / iu8 paths exist there). Per the user-rules (no silent
-; fallbacks) and consistent with the gfx1250-only refusal contract
-; applied to `V_WMMA_F32_16x16x4_F32`, the handler refuses loudly via
-; `RaiseFailure::unsupportedShape` to surface both the cross-target
-; capability gap AND the missing scaled-WMMA decomposition path. The
-; native LLVM intrinsic `int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4`
-; is itself gated `isGFX125xOnly` in IntrinsicsAMDGPU.td:4138, so
-; even an intrinsic-emit on a non-gfx1250 target would fail at
-; codegen — the principled lift is the loud refusal pinned here.
+; gfx942 has no scaled-WMMA hardware AND no scaled-F8F6F4 MFMA family
+; (gfx942's MFMA stops at the non-scaled `mfma_f32_16x16x32_*` shapes;
+; the scaled `int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4`, IntrinsicsAMDGPU.td:3694,
+; is gated on the `FeatureGFX950Insts` subtarget feature and is gfx950+
+; only). The dispatch in `handle_valu_vop3p.cpp` therefore admits two
+; targets and refuses the rest:
+;
+;   - gfx1250 (`hasTensorOps`): emit the native
+;     `int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4` intrinsic.
+;   - gfx950  (`hasGfx950Insts`): rewrite to the gfx950 scaled MFMA via
+;     `wmma_lowering.cpp::emitWMMAScaleF8F6F4toMFMA` (Wave32→Wave64
+;     redistribution + intrinsic swap; no software scale-exponent emul).
+;   - Everything else (gfx942 with `hasMFMA == true` but
+;     `hasGfx950Insts == false`, gfx900, gfx10/11 base, ...): refuse
+;     loudly via `RaiseFailure::unsupportedShape`.
+;
+; A WMMA-scale → multi-MFMA decomposition with software scale-exponent
+; application is *possible* on gfx942 but not implemented; per the
+; user-rules (no silent fallbacks), the handler surfaces the capability
+; gap rather than guessing.  The companion gfx950-acceptance RUN line
+; at the bottom of this fixture pins the gfx950 cross-target path; the
+; same-target gfx1250 → gfx1250 RUN line below pins the native-emit
+; path.
 ;
 ; We assert two things:
 ;
@@ -44,10 +51,11 @@
 ; STDERR: raise_cli: kernel 'wmma_scale_f32_16x16x128_f8f6f4_kernel' failed to raise:
 ; STDERR-SAME: v_wmma_scale_f32_16x16x128_f8f6f4
 ; STDERR-SAME: [VOP3P]
-; STDERR-SAME: gfx1250-only
+; STDERR-SAME: hasTensorOps
 ; STDERR-SAME: int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4
-; STDERR-SAME: AMDGPUWMMAIntrinsicsGFX1250
-; STDERR-SAME: K=128 scaled-WMMA
+; STDERR-SAME: hasGfx950Insts
+; STDERR-SAME: int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4
+; STDERR-SAME: gfx942
 
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx1250 --emit-ir=wmma_scale_f32_16x16x128_f8f6f4_kernel 2>&1 | %FileCheck %s --check-prefix=IR
@@ -56,12 +64,12 @@
 ; VOP3PX2 opcode 0x033, ScaledWMMA family) — same-target
 ; (gfx1250 -> gfx1250) intrinsic-emit path. Pins the principled lift
 ; in transpiler/handle_valu_vop3p.cpp under
-; SemOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4 when
+; CanonicalOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4 when
 ; `ctx.targetIsa.hasTensorOps` is true. Companion fixture to
 ; `wmma_scale_f32_16x16x128_f8f6f4.ll`, which pins the cross-target
 ; (gfx942) loud refusal.
 ;
-; 18 MC pseudos collapse onto this single SemOp (9 mantissa pairs
+; 18 MC pseudos collapse onto this single CanonicalOp (9 mantissa pairs
 ; `{f4,f6,f8} A × {f4,f6,f8} B` × `_twoaddr`/`_threeaddr`), per
 ; `WMMA_F8F6F4_Profiles` in VOP3PInstructions.td:1908. The per-matrix
 ; dword count is encoded by the opcode's `_fA_fB_w32_*` suffix
@@ -160,6 +168,44 @@
 ; IR-NOT: @llvm.amdgcn.wmma.f32.16x16x32.
 ; IR-NOT: @llvm.amdgcn.wmma.f32.16x16x64.
 ; IR-NOT: @llvm.amdgcn.wmma.f32.16x16x4.
+
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco --target-isa=gfx950 --emit-ir=wmma_scale_f32_16x16x128_f8f6f4_kernel 2>&1 | %FileCheck %s --check-prefix=IR_GFX950
+;
+; Cross-target lift fixture for v_wmma_scale_f32_16x16x128_f8f6f4
+; (gfx1250 RDNA4 source) → gfx950 (CDNA4 target). Pins the
+; `emitWMMAScaleF8F6F4toMFMA` path in `wmma_lowering.cpp` dispatched
+; by `ctx.targetIsa.hasGfx950Insts` in `handle_valu_vop3p.cpp` under
+; `CanonicalOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4`. The lift runs Wave32 →
+; Wave64 lane redistribution, applies C_mod via IR fneg/fabs on the
+; redistributed accumulator, and emits one or two calls (depending
+; on `numSourceWavesPerTarget()`) to the gfx950 native scaled MFMA
+; intrinsic `int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4`
+; (IntrinsicsAMDGPU.td:3694), which covers the same K=128 F8/F6/F4
+; matmul shape on gfx950's MAI pipe.
+;
+; The discriminator predicate is `hasGfx950Insts`, NOT `hasMFMA` —
+; gfx942 also has `hasMFMA == true` but lacks the scaled F8F6F4 MFMA
+; family, so the dispatch must gate on `FeatureGFX950Insts`
+; (`isa_profile.hpp::ISAProfile::hasGfx950Insts`). The companion
+; gfx942-refusal RUN line at the top of this fixture pins that
+; gfx942 still refuses; this RUN line pins that gfx950 accepts.
+;
+; IR_GFX950-LABEL: define amdgpu_kernel void @wmma_scale_f32_16x16x128_f8f6f4_kernel(
+;
+; The gfx950 cross-target MFMA-scaled intrinsic. Mangled types
+; reflect the `<8 x i32>` A/B fragment width chosen by
+; `emitWMMAScaleF8F6F4toMFMA` (widest case; `cbsz`/`blgp` narrow
+; the active subset for f6/f4) and the `<4 x f32>` accumulator.
+; IR_GFX950: call <4 x float> @llvm.amdgcn.mfma.scale.f32.16x16x128.f8f6f4.
+
+; Negative: no native gfx1250 scaled-WMMA intrinsic in the gfx950
+; IR — would mean the cross-target dispatch silently mis-fired.
+; IR_GFX950-NOT: @llvm.amdgcn.wmma.scale.f32.16x16x128.f8f6f4
+
+; Negative: no non-scaled WMMA family in the gfx950 IR — would
+; indicate dropped scale operands or cross-K dispatch confusion.
+; IR_GFX950-NOT: @llvm.amdgcn.wmma.f32.16x16x
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
 	.amdhsa_code_object_version 6

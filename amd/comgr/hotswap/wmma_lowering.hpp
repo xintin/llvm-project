@@ -171,6 +171,70 @@ llvm::Value *emitWMMAtoMFMA_F32_16x16x4(RaiseContext &ctx,
                                          llvm::Value *b,
                                          llvm::Value *c);
 
+/// Lower a Wave32 v_wmma_scale_f32_16x16x128_f8f6f4 (gfx1250 RDNA4 VOP3PX2)
+/// to a Wave64 v_mfma_scale_f32_16x16x128_f8f6f4 (gfx950 CDNA4 VOP3PX) via
+/// ds_bpermute lane redistribution + the gfx950 scaled-MFMA intrinsic.
+///
+/// Structurally simpler than the K=32/K=64 emitWMMAtoMFMA path because the
+/// gfx950 MFMA scaled F8F6F4 already covers the full K=128 in one call, so
+/// there is no K-decomposition (no chained-MFMA-pair). The lane redistribution
+/// is the "halve dwords-per-lane to spread Wave32's data across Wave64"
+/// pattern, extended to the variable-width A/B fragment (16/12/8 dwords on the
+/// WMMA side for f8/f6/f4; 8/6/4 dwords on the MFMA side after redistribution).
+///
+/// Layout assumption (extrapolated from the K=32/K=64 documented pattern,
+/// pending hardware validation for K=128 F8F6F4):
+///
+///   WMMA Wave32 lane indexing (per source wave32 group of 32 lanes):
+///     - Lanes 0-15 hold the lower-K half of the A/B matrix
+///     - Lanes 16-31 hold the upper-K half
+///     - Within a lane, the wmmaDwords[0..N-1] array stores K-elements in
+///       linear order (no GPR-pair-K interleaving for K=128 — extension of
+///       the simpler-half / second-half decomposition that K=64 uses)
+///
+///   MFMA Wave64 lane indexing:
+///     - Lane group LG_g (g=0..3, 16 lanes each) holds K-quarter g
+///     - Each LG's mfmaDwords[i] reads from WMMA's
+///         lower-W32-half if g is even, upper-W32-half if g is odd
+///         first-half wmmaDwords[0..mfmaDw-1] if g/2==0
+///         second-half wmmaDwords[mfmaDw..2*mfmaDw-1] if g/2==1
+///
+/// Operand mapping (gfx1250 WMMA -> gfx950 MFMA):
+///   matrix_a_fmt (i32: F8/F6/F4 enum)   -> cbsz
+///   matrix_b_fmt                        -> blgp
+///   matrix_a_scale + matrix_a_scale_fmt -> op_sel_A (2-bit; first cut: 0)
+///   scale_src0 (i32 VGPR)               -> scale src A (direct)
+///   matrix_b_scale + matrix_b_scale_fmt -> op_sel_B
+///   scale_src1                          -> scale src B
+///   C_mod (i16: 0=none, 1=neg, 2=abs, 3=neg(abs)) -> apply via fneg/fabs
+///                                                   on C in IR before MFMA
+///   matrix_a_reuse, matrix_b_reuse      -> dropped (perf hint, not
+///   correctness)
+///
+/// Returns nullptr if the helper cannot lower the call (e.g. unsupported
+/// fragment width). Caller produces an unsupportedShape refusal.
+///
+/// \param a       WMMA A fragment (`<aDwords x i32>` per Wave32 lane;
+///                aDwords = 16/12/8 for f8/f6/f4)
+/// \param b       WMMA B fragment (`<bDwords x i32>` per Wave32 lane)
+/// \param c       WMMA accumulator (`<8 x f32>` per Wave32 lane, same as
+///                the K=32/K=64 family)
+/// \param matrixAFmt, matrixBFmt   per-matrix format selectors (i32 const)
+/// \param cMod    accumulator modifier (i16 const: 0/1/2/3 =
+/// none/neg/abs/neg(abs))
+/// \param matrixAScale, matrixAScaleFmt, scaleSrc0   A-side scale operands
+/// \param matrixBScale, matrixBScaleFmt, scaleSrc1   B-side scale operands
+/// \param aDwords, bDwords   per-Wave32-lane WMMA dword counts (16/12/8)
+/// \returns       `<8 x float>` in Wave32 D-layout (caller writes back via
+///                ctx.writeRegVec); nullptr on unrecoverable shape error.
+llvm::Value *emitWMMAScaleF8F6F4toMFMA(
+    RaiseContext &ctx, llvm::Value *a, llvm::Value *b, llvm::Value *c,
+    llvm::Value *matrixAFmt, llvm::Value *matrixBFmt, llvm::Value *cMod,
+    llvm::Value *matrixAScale, llvm::Value *matrixAScaleFmt,
+    llvm::Value *scaleSrc0, llvm::Value *matrixBScale,
+    llvm::Value *matrixBScaleFmt, llvm::Value *scaleSrc1, unsigned aDwords,
+    unsigned bDwords);
+
 } // namespace transpiler
 
 #endif

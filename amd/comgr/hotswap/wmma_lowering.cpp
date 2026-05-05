@@ -803,4 +803,257 @@ Value *emitWMMAtoMFMA_F32_16x16x4(RaiseContext &ctx, Value *a, Value *b,
                      FixedVectorType::get(ctx.f32Ty, 8));
 }
 
+// ----------------------------------------------------------------------
+// v_wmma_scale_f32_16x16x128_f8f6f4 -> v_mfma_scale_f32_16x16x128_f8f6f4
+// ----------------------------------------------------------------------
+//
+// Source (gfx1250 RDNA4, Wave32, VOP3PX2):
+//   int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4 -- 14-arg intrinsic.
+//   Per Wave32 lane:
+//     A: <aDwords x i32>   (aDwords = 16/12/8 for f8/f6/f4)
+//     B: <bDwords x i32>   (same encoding)
+//     C/D: <8 x f32>        (same as the K=32/K=64 WMMA family)
+//
+// Target (gfx950 CDNA4, Wave64, VOP3PX):
+//   int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4 -- 9-arg intrinsic, overloaded
+//   on AB type.  Per handle_mfma.cpp convention we declare it with a uniform
+//   <8 x i32> A/B type (the widest case, F8) and let cbsz / blgp select the
+//   active subset of dwords per the LLVM TableGen rule.
+//   Per Wave64 lane:
+//     A, B: <8 x i32>       (logical: 8/6/4 dwords for f8/f6/f4; upper
+//                           dwords are poison and ignored by hardware
+//                           when cbsz / blgp narrow the width)
+//     C/D:  <4 x f32>
+//
+// K decomposition:
+//   None.  gfx950 MFMA scaled F8F6F4 covers the full K=128 in one call, so
+//   the lowering is structurally simpler than emitWMMAtoMFMA's K=32 -> 2 x
+//   K=16 chain.  We emit ONE MFMA call per virtual-W32-group pass.
+//
+// Lane redistribution (LINEAR-K extrapolation; pending hardware validation):
+//   Per virtual Wave32 group at groupBase in {0, 32}, the A/B fragments live
+//   in W64 lanes [groupBase .. groupBase+31].  The MFMA per-LG K-quarter
+//   mapping is:
+// clang-format off
+//     LG0 (W64 lanes 0-15):   K = 0..31     <- WMMA dwords [0..mfmaDw-1] in W32 lower half
+//     LG1 (W64 lanes 16-31):  K = 32..63    <- WMMA dwords [mfmaDw..2*mfmaDw-1] in W32 lower half
+//     LG2 (W64 lanes 32-47):  K = 64..95    <- WMMA dwords [0..mfmaDw-1] in W32 upper half
+//     LG3 (W64 lanes 48-63):  K = 96..127   <- WMMA dwords [mfmaDw..2*mfmaDw-1] in W32 upper half
+// clang-format on
+//   (mfmaDw = wmmaDw / 2 = 8/6/4 for f8/f6/f4.)
+//
+//   This is the "linear-K halves" model -- WMMA's two-lane-half split holds
+//   the two K-halves linearly (lower-K then upper-K), and within each lane
+//   the dwords run linearly over the K-range.  Contrast with the K=32 / K=64
+//   16-bit family's interleaved layout (documented in this file's header
+//   block) which alternates k between the lane halves.  Without an explicit
+//   K=128 F8F6F4 layout doc in the AMD Matrix Instruction Calculator we
+//   choose the simpler linear model; if the hardware layout turns out to be
+//   the interleaved variant we adjust the redistribution below to match
+//   (a one-line change in the lambda).
+//
+// C_mod application:
+//   gfx1250 WMMA carries an i16 immediate (0 = none, 1 = neg, 2 = abs,
+//   3 = neg(abs)) that gates the C-input modifier.  gfx950 MFMA has no
+//   equivalent argument, so we apply it as IR fneg / fabs on the redistributed
+//   <4 x f32> C input *before* the MFMA call.  The cMod argument is required
+//   to be a ConstantInt -- callers pass an immediate-derived value, and any
+//   non-constant trips the report_fatal_error branch (matching the
+//   discipline of the WMMA-side fast path which also assumes a constant).
+//
+// Scale operand layout:
+//   The MFMA scaled intrinsic takes one i32 scale per side, plus a 2-bit
+//   op_sel encoding scale-format selection.  We pass scaleSrc0 / scaleSrc1
+//   through directly (each Wave64 lane reads its own scale value, which
+//   under WaveNativeProjection is already in the right per-source-lane
+//   layout) and conservatively set op_sel = 0 for both A and B.  The exact
+//   WMMA matrix_*_scale + matrix_*_scale_fmt -> MFMA op_sel mapping is not
+//   documented in our reference materials; passing 0 selects the default
+//   bit-position-zero scale, which is correct for the common UE8M0 scale
+//   format that the MXFP attention kernels in our corpus use.  TODO: refine
+//   if a kernel emits a non-default scale_fmt.
+//
+// EXEC handling:
+//   Same as emitWMMAtoMFMA -- the MFMA/bpermute chain runs under the
+//   kernel-wide HW EXEC = -1 ambient set by WaveNativeProjection's
+//   init_whole_wave; under MODREP the wrapAsWWMValue calls keep the chain
+//   inside SIWholeQuadMode's WWM region.
+
+llvm::Value *emitWMMAScaleF8F6F4toMFMA(
+    RaiseContext &ctx, Value *a, Value *b, Value *c, Value *matrixAFmt,
+    Value *matrixBFmt, Value *cMod, Value *matrixAScale, Value *matrixAScaleFmt,
+    Value *scaleSrc0, Value *matrixBScale, Value *matrixBScaleFmt,
+    Value *scaleSrc1, unsigned aDwords, unsigned bDwords) {
+  IRBuilder<> &B = ctx.B;
+  Module &M = ctx.M;
+
+  // Accept only the documented WMMA F8F6F4 widths.  The MC-pseudo decoder
+  // in handle_valu_vop3p.cpp already rejects everything else with
+  // unsupportedShape; we re-check here so that any future extension that
+  // changes those values trips loudly rather than silently producing a
+  // mismatched lane redistribution.
+  if (!(aDwords == 16 || aDwords == 12 || aDwords == 8) ||
+      !(bDwords == 16 || bDwords == 12 || bDwords == 8))
+    return nullptr;
+
+  const unsigned mfmaADw = aDwords / 2;
+  const unsigned mfmaBDw = bDwords / 2;
+
+  // Unused parameters that the WMMA encoding carries but the MFMA
+  // intrinsic has no slot for. Reference them here so the build doesn't
+  // warn about unused params; consult the operand-mapping comment above
+  // for the rationale.
+  (void)matrixAScale;
+  (void)matrixAScaleFmt;
+  (void)matrixBScale;
+  (void)matrixBScaleFmt;
+
+  // The MFMA scaled intrinsic is overloaded on the AB vector type.  Match
+  // handle_mfma.cpp's convention: declare with the widest case (<8 x i32>)
+  // and let cbsz / blgp select the active subset.
+  auto *mfmaABTy = FixedVectorType::get(ctx.i32Ty, 8);
+  auto *mfmaAccTy = FixedVectorType::get(ctx.f32Ty, 4);
+
+  // Unpack source vectors into per-lane dword arrays.
+  SmallVector<Value *, 16> aDwordsArr(aDwords);
+  SmallVector<Value *, 16> bDwordsArr(bDwords);
+  Value *cDwords[8];
+  unpackDwords(B, a, aDwords, ctx.i32Ty, aDwordsArr.data());
+  unpackDwords(B, b, bDwords, ctx.i32Ty, bDwordsArr.data());
+  unpackDwords(B, c, 8, ctx.i32Ty, cDwords);
+
+  Value *laneId = emitLaneId(B, M, ctx.i32Ty);
+
+  const unsigned numSrcWaves = ctx.projection.numSourceWavesPerTarget();
+  if (numSrcWaves != 1 && numSrcWaves != 2)
+    report_fatal_error(
+        "WMMA-scale F8F6F4 -> MFMA lowering defined only for wave32 source "
+        "projections; numSourceWavesPerTarget() must be 1 (MODREP) or 2 "
+        "(WaveNative cross-widen).");
+
+  // Extract C_mod constant for compile-time fneg / fabs application.
+  // Callers in handle_valu_vop3p.cpp construct cMod via
+  // ConstantInt::get(...), so it is always a ConstantInt by construction;
+  // cast<> here documents the precondition and crashes nicely (via the
+  // assertion build) if a future caller violates it.
+  int64_t cModVal = cast<ConstantInt>(cMod)->getZExtValue();
+
+  // cbsz / blgp come straight from the WMMA matrix_*_fmt operands.
+  // Both encodings use the same {FP8, BF8, FP6, BF6, FP4} enum from
+  // SIDefines.h::MatrixFMT, so direct passthrough is correct as long as
+  // the enum stays unified across WMMA and MFMA scaled families (it does
+  // today; if it ever forks, this is the place to remap).
+  Value *cbsz = matrixAFmt;
+  Value *blgp = matrixBFmt;
+
+  // Conservative op_sel = 0 for both sides.  See block comment for why.
+  Value *opSelA = ConstantInt::get(ctx.i32Ty, 0);
+  Value *opSelB = ConstantInt::get(ctx.i32Ty, 0);
+
+  // Lane-redistribution lambda: take a Wave32-layout dword array (wmmaDw
+  // dwords per source-wave32 lane) and emit the per-Wave64-lane MFMA dword
+  // array (wmmaDw / 2 entries) under the linear-K assumption documented
+  // above.
+  auto redistributeF8F6F4Input = [&](ArrayRef<Value *> wmmaDwords,
+                                     Value *addrLo, Value *addrHi,
+                                     Value *laneGroup, unsigned mfmaDw,
+                                     SmallVectorImpl<Value *> &mfmaOut) {
+    mfmaOut.resize(mfmaDw);
+    for (unsigned i = 0; i < mfmaDw; ++i) {
+      // LG0: lower-W32-half, first-half of WMMA dwords
+      // LG1: lower-W32-half, second-half
+      // LG2: upper-W32-half, first-half
+      // LG3: upper-W32-half, second-half
+      Value *v0 = emitDSBpermute(B, M, addrLo, wmmaDwords[i]);
+      Value *v1 = emitDSBpermute(B, M, addrLo, wmmaDwords[i + mfmaDw]);
+      Value *v2 = emitDSBpermute(B, M, addrHi, wmmaDwords[i]);
+      Value *v3 = emitDSBpermute(B, M, addrHi, wmmaDwords[i + mfmaDw]);
+      mfmaOut[i] = selectByLaneGroup(B, laneGroup, v0, v1, v2, v3);
+    }
+  };
+
+  // One pass per virtual W32 group: groupBase in {0, 32}.
+  auto runScaledPass = [&](unsigned groupBase,
+                           SmallVectorImpl<Value *> &resultDwords) {
+    Value *laneMod16 = B.CreateAnd(laneId, B.getInt32(15), "lane16");
+    Value *loLane = B.CreateAdd(laneMod16, B.getInt32(groupBase), "lo_lane");
+    Value *hiLane =
+        B.CreateAdd(laneMod16, B.getInt32(groupBase + 16), "hi_lane");
+    Value *addrLo = B.CreateShl(loLane, B.getInt32(2), "addr_lo");
+    Value *addrHi = B.CreateShl(hiLane, B.getInt32(2), "addr_hi");
+    Value *laneGroup = B.CreateLShr(laneId, B.getInt32(4), "lane_grp");
+
+    SmallVector<Value *, 8> mfmaA, mfmaB;
+    redistributeF8F6F4Input(aDwordsArr, addrLo, addrHi, laneGroup, mfmaADw,
+                            mfmaA);
+    redistributeF8F6F4Input(bDwordsArr, addrLo, addrHi, laneGroup, mfmaBDw,
+                            mfmaB);
+
+    Value *mfmaC[4];
+    redistributeAcc(B, M, cDwords, addrLo, addrHi, laneGroup, mfmaC);
+
+    // Pad MFMA A / B fragments to <8 x i32> with poison in the unused
+    // upper lanes for f6 / f4 (cbsz / blgp tell hardware which subset
+    // is active).
+    Value *aPacked = PoisonValue::get(mfmaABTy);
+    for (unsigned i = 0; i < mfmaADw; ++i)
+      aPacked = B.CreateInsertElement(aPacked, mfmaA[i], i, "a_pack");
+    Value *bPacked = PoisonValue::get(mfmaABTy);
+    for (unsigned i = 0; i < mfmaBDw; ++i)
+      bPacked = B.CreateInsertElement(bPacked, mfmaB[i], i, "b_pack");
+
+    Value *acc = packDwords(B, mfmaC, 4, ctx.i32Ty, mfmaAccTy);
+
+    // Apply C_mod (neg / abs / neg(abs)) on the redistributed C before
+    // MFMA.  The bits are: 0 = none, 1 = neg, 2 = abs, 3 = neg(abs).
+    if (cModVal & 2)
+      acc = B.CreateUnaryIntrinsic(Intrinsic::fabs, acc, nullptr, "c_abs");
+    if (cModVal & 1)
+      acc = B.CreateFNeg(acc, "c_neg");
+
+    Function *mfmaFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::amdgcn_mfma_scale_f32_16x16x128_f8f6f4,
+        {mfmaABTy, mfmaABTy});
+    Value *mfmaResult = ctx.projection.wrapAsWWMValue(
+        B,
+        B.CreateCall(mfmaFn,
+                     {aPacked, bPacked, acc, cbsz, blgp, opSelA, scaleSrc0,
+                      opSelB, scaleSrc1},
+                     "mfma_scale"),
+        "mfma_scale_wwm");
+
+    Value *mfmaDst[4];
+    unpackDwords(B, mfmaResult, 4, ctx.i32Ty, mfmaDst);
+
+    Value *w32Lane = B.CreateAnd(laneId, B.getInt32(31), "w32_lane");
+    resultDwords.resize(8);
+    collectResult(B, M, mfmaDst, w32Lane, resultDwords.data());
+
+    // Wrap collect outputs as WWM under MODREP for the same reason as
+    // emitWMMAtoMFMA -- the bpermute writes are HW-EXEC-gated and need
+    // SIWholeQuadMode to widen the active mask.  No-op under WaveNative.
+    for (unsigned i = 0; i < 8; ++i)
+      resultDwords[i] = ctx.projection.wrapAsWWMValue(B, resultDwords[i],
+                                                      "wmma_scale_collect_wwm");
+  };
+
+  SmallVector<Value *, 8> result0;
+  runScaledPass(0, result0);
+
+  Value *finalDwords[8];
+  if (numSrcWaves == 1) {
+    for (unsigned i = 0; i < 8; ++i)
+      finalDwords[i] = result0[i];
+  } else {
+    SmallVector<Value *, 8> result1;
+    runScaledPass(32, result1);
+    Value *isGroup1 = B.CreateICmpUGE(laneId, B.getInt32(32), "is_group1");
+    for (unsigned i = 0; i < 8; ++i)
+      finalDwords[i] = B.CreateSelect(isGroup1, result1[i], result0[i], "sel");
+  }
+
+  return packDwords(B, finalDwords, 8, ctx.i32Ty,
+                    FixedVectorType::get(ctx.f32Ty, 8));
+}
+
 } // namespace transpiler

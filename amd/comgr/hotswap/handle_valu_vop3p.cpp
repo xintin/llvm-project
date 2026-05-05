@@ -854,24 +854,26 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   // the `matrix_a_fmt` / `matrix_b_fmt` named-immediate operands
   // (`enum MatrixFMT`, SIDefines.h:1052-1058).
   //
-  // Cross-target gfx942 has no scaled-WMMA hardware and the
-  // WMMA→MFMA decomposition path for K=128 + per-matrix scale
-  // exponents is not implemented in `wmma_lowering.cpp`, so we
-  // refuse loudly per user-rules (no silent fallbacks) — same
-  // contract as `V_WMMA_F32_16x16x4_F32` above.
+  // Cross-target lowering paths for v_wmma_scale_f32_16x16x128_f8f6f4:
+  //
+  //   * gfx1250 (hasTensorOps): emit the native
+  //     `int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4` intrinsic in place
+  //     (14-arg fast path below).
+  //   * gfx950 (hasGfx950Insts): rewrite to the gfx950 scaled MFMA via
+  //     `emitWMMAScaleF8F6F4toMFMA` in `wmma_lowering.cpp`, which does
+  //     the wave32->wave64 lane redistribution and lowers to
+  //     `int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` (the gfx950 has
+  //     a near-1:1 MFMA equivalent for this WMMA, in the same K=128
+  //     F8F6F4 shape; only the wave size and per-lane fragment width
+  //     differ, both of which the redistribution helper handles).
+  //     Note `hasGfx950Insts` (NOT `hasMFMA`) -- gfx942 also has
+  //     hasMFMA == true but lacks the scaled F8F6F4 family.
+  //   * Otherwise (e.g. gfx942 -- has hasMFMA == true but not the scaled
+  //     F8F6F4 family): refuse loudly.  gfx942's MFMA family stops at
+  //     `mfma_f32_16x16x32_*` (non-scaled, K=32); a WMMA-scale
+  //     decomposition into multiple gfx942 MFMAs plus a software
+  //     scale-exponent application is *possible* but not implemented.
   case CanonicalOp::V_WMMA_SCALE_F32_16x16x128_F8F6F4: {
-    if (!ctx.targetIsa.hasTensorOps) {
-      hr.failure = RaiseFailure::unsupportedShape(
-          di, "VOP3P",
-          "v_wmma_scale_f32_16x16x128_f8f6f4 is a gfx1250-only opcode "
-          "(int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4 lives in "
-          "AMDGPUWMMAIntrinsicsGFX1250); cross-target lift to gfx942 "
-          "would need a K=128 scaled-WMMA → MFMA decomposition with "
-          "per-matrix scale-exponent application that no corpus path "
-          "currently exercises");
-      return hr;
-    }
-
     // Extract per-matrix dword count from the MC pseudo suffix
     // (`*_fA_fB_w32_{twoaddr,threeaddr}`). MCInstrInfo names the
     // pseudo verbatim from TableGen, so the suffix is the
@@ -960,23 +962,69 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
         Type::getInt1Ty(ctx.C),
         namedImm(AMDGPU::OpName::matrix_b_reuse));
 
-    // AMDGPUWmmaScaleIntrinsicModsC<i32>:
-    //   (matrix_a_fmt, A, matrix_b_fmt, B, C_mod, C,
-    //    matrix_a_scale, matrix_a_scale_fmt, scale_src0,
-    //    matrix_b_scale, matrix_b_scale_fmt, scale_src1,
-    //    matrix_a_reuse, matrix_b_reuse)
-    // Overloaded on D, A, B element vector types.
-    Function *wmmaFn = Intrinsic::getOrInsertDeclaration(
-        &ctx.M, Intrinsic::amdgcn_wmma_scale_f32_16x16x128_f8f6f4,
-        {cdTy, aTy, bTy});
-    Value *result_val = ctx.B.CreateCall(wmmaFn, {
-        matrixAFmt, a,
-        matrixBFmt, b,
-        cMod, c,
-        matrixAScale, matrixAScaleFmt, scaleSrc0,
-        matrixBScale, matrixBScaleFmt, scaleSrc1,
-        matrixAReuse, matrixBReuse
-    }, "wmma_scale");
+    Value *result_val = nullptr;
+
+    if (ctx.targetIsa.hasTensorOps) {
+      // Same-target gfx1250 -> gfx1250 fast path: native scaled WMMA.
+      //
+      // AMDGPUWmmaScaleIntrinsicModsC<i32>:
+      //   (matrix_a_fmt, A, matrix_b_fmt, B, C_mod, C,
+      //    matrix_a_scale, matrix_a_scale_fmt, scale_src0,
+      //    matrix_b_scale, matrix_b_scale_fmt, scale_src1,
+      //    matrix_a_reuse, matrix_b_reuse)
+      // Overloaded on D, A, B element vector types.
+      Function *wmmaFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_wmma_scale_f32_16x16x128_f8f6f4,
+          {cdTy, aTy, bTy});
+      result_val = ctx.B.CreateCall(wmmaFn,
+                                    {matrixAFmt, a, matrixBFmt, b, cMod, c,
+                                     matrixAScale, matrixAScaleFmt, scaleSrc0,
+                                     matrixBScale, matrixBScaleFmt, scaleSrc1,
+                                     matrixAReuse, matrixBReuse},
+                                    "wmma_scale");
+    } else if (ctx.targetIsa.hasGfx950Insts) {
+      // Cross-target gfx1250 -> gfx950 path: WMMA-scale -> MFMA-scale.
+      //
+      // The gfx950 scaled F8F6F4 MFMA (introduced as part of the gfx950
+      // MAI family in LLVM upstream) covers the same K=128 F8/F6/F4 shape
+      // as the gfx1250 WMMA, so the lowering is a pure wave32->wave64
+      // lane redistribution + intrinsic swap (no K-decomposition, no
+      // software scale emulation).  Implementation in
+      // `wmma_lowering.cpp::emitWMMAScaleF8F6F4toMFMA`.
+      //
+      // matrix_a_reuse / matrix_b_reuse are perf hints (not correctness)
+      // and have no MFMA equivalent; the helper drops them.
+      result_val = emitWMMAScaleF8F6F4toMFMA(
+          ctx, a, b, c, matrixAFmt, matrixBFmt, cMod, matrixAScale,
+          matrixAScaleFmt, scaleSrc0, matrixBScale, matrixBScaleFmt, scaleSrc1,
+          aDwords, bDwords);
+      // Reference reuse hints so -Wunused-variable doesn't flag them
+      // when this branch is taken.  (The hints are extracted up-top and
+      // the gfx1250 arm above passes them through, so they always have
+      // a use at the IR level; this is purely about the compiler's view
+      // of this scope.)
+      (void)matrixAReuse;
+      (void)matrixBReuse;
+      if (!result_val) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3P",
+            "emitWMMAScaleF8F6F4toMFMA refused this fragment width "
+            "(aDwords/bDwords outside f8/f6/f4 set)");
+        return hr;
+      }
+    } else {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P",
+          "v_wmma_scale_f32_16x16x128_f8f6f4 requires either hasTensorOps "
+          "(gfx1250 native scaled WMMA, "
+          "int_amdgcn_wmma_scale_f32_16x16x128_f8f6f4) or hasGfx950Insts "
+          "(gfx950 scaled-MFMA F8F6F4, "
+          "int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4 via "
+          "emitWMMAScaleF8F6F4toMFMA); this target has neither.  "
+          "(gfx942 has hasMFMA == true but no scaled-F8F6F4 family; a "
+          "software decomposition is not yet implemented.)");
+      return hr;
+    }
 
     ctx.writeRegVec(dest, result_val);
     hr.handled = true;
