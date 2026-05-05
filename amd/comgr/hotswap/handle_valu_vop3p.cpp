@@ -5,8 +5,8 @@
 
 #include "Utils/AMDGPUBaseInfo.h" // AMDGPU::getNamedOperandIdx, AMDGPU::OpName
 #include "SIDefines.h"            // SISrcMods::NEG
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -22,25 +22,146 @@ namespace transpiler {
 
 namespace {
 
-// Parse a `key:[a,b,c]` bracketed int list out of the disassembled
-// instruction text. Used for VOP3P modifiers (op_sel_hi, neg_lo,
-// neg_hi, op_sel) that LLVM's MC layer doesn't surface as first-class
-// operands. Leaves `out[]` untouched for indices whose parse fails.
-void parseBracketList3(StringRef text, StringRef key, int out[3]) {
-  auto pos = text.find(key);
-  if (pos == StringRef::npos) return;
-  auto brk = text.find('[', pos);
-  if (brk == StringRef::npos) return;
-  auto end = text.find(']', brk);
-  if (end == StringRef::npos) return;
-  StringRef inner = text.slice(brk + 1, end);
-  SmallVector<StringRef, 3> parts;
-  inner.split(parts, ',');
-  for (unsigned i = 0; i < parts.size() && i < 3; i++) {
-    int val = 0;
-    if (!parts[i].trim().getAsInteger(10, val))
-      out[i] = val;
+struct PackedSrcOptions {
+  // Register operands in the packed-f32 family are VGPR pairs that should be
+  // read as `<2 x elem>` directly. Packed-f16/i16 operands are one i32 VGPR
+  // whose low/high halves are bitcast to `<2 x elem>`.
+  bool RegisterSourceIsVector = false;
+  // Packed-f32 immediates are scalar 32-bit literals broadcast to both lanes.
+  // Packed-f16/i16 immediates are raw packed i32 payloads decoded by LLVM MC.
+  bool ImmediateIsScalarBroadcast = false;
+  // Floating-point packed families use NEG / NEG_HI as per-lane fneg bits.
+  // Integer packed families reject those bits before calling the helper.
+  bool ApplyFloatNeg = false;
+  // IRBuilder base name used for temporary values from this source family.
+  const char *Name = "pk_src";
+};
+
+StringRef diagnosticMnemonic(const DecodedInst &di) {
+  return di.mnemonic.empty() ? StringRef(semOpName(di.semOp))
+                             : StringRef(di.mnemonic);
+}
+
+bool readSourceMods(const DecodedInst &di, OpResolver &op, unsigned numSrcs,
+                    unsigned allowedMods, unsigned mods[3],
+                    HandlerResult &hr) {
+  StringRef instrName = diagnosticMnemonic(di);
+  if (op.nSrcs() < numSrcs) {
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOP3P", (instrName + " requires more source operands").str());
+    return false;
   }
+
+  for (unsigned i = 0; i < numSrcs; ++i) {
+    unsigned modIdx = di.modMap[i];
+    if (modIdx == UINT_MAX || !di.isImm(modIdx)) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P",
+          (instrName + " missing immediate srcN_modifiers operand").str());
+      return false;
+    }
+    mods[i] = static_cast<unsigned>(di.getImm(modIdx));
+    if ((mods[i] & ~allowedMods) != 0) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P",
+          (instrName + " has unsupported srcN_modifiers bits").str());
+      return false;
+    }
+  }
+  return true;
+}
+
+bool readPackedSrcMods(const DecodedInst &di, OpResolver &op, unsigned numSrcs,
+                       unsigned allowedMods, unsigned mods[3],
+                       HandlerResult &hr) {
+  if (!readSourceMods(di, op, numSrcs, allowedMods, mods, hr))
+    return false;
+
+  StringRef instrName = diagnosticMnemonic(di);
+  for (unsigned i = 0; i < numSrcs; ++i) {
+    unsigned srcIdx = op.srcIdx(i);
+    if (!di.isReg(srcIdx) && !di.isImm(srcIdx)) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P",
+          (instrName + " source is neither a register nor an immediate").str());
+      return false;
+    }
+  }
+  return true;
+}
+
+Value *readPacked2Src(RaiseContext &ctx, OpResolver &op, unsigned i,
+                      Type *elemTy, unsigned mods,
+                      const PackedSrcOptions &opts) {
+  auto *vecTy = FixedVectorType::get(elemTy, 2);
+  Value *natLo = nullptr;
+  Value *natHi = nullptr;
+
+  if (opts.RegisterSourceIsVector && op.isSrcReg(i)) {
+    Value *vec = ctx.regs.readRegVec(ctx.B, op.srcReg(i), vecTy);
+    natLo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
+    natHi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
+  } else if (opts.ImmediateIsScalarBroadcast && !op.isSrcReg(i)) {
+    Value *scalar = ctx.B.CreateBitCast(op.src(i), elemTy);
+    natLo = scalar;
+    natHi = scalar;
+  } else {
+    Value *raw = op.src(i);
+    if (raw->getType() != ctx.i32Ty)
+      raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
+    Value *vec = ctx.B.CreateBitCast(raw, vecTy, opts.Name);
+    natLo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
+    natHi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
+  }
+
+  Value *lo = (mods & SISrcMods::OP_SEL_0) ? natHi : natLo;
+  Value *hi = (mods & SISrcMods::OP_SEL_1) ? natHi : natLo;
+
+  if (opts.ApplyFloatNeg) {
+    if (mods & SISrcMods::NEG)
+      lo = ctx.B.CreateFNeg(lo, (Twine(opts.Name) + "_neg_lo").str());
+    if (mods & SISrcMods::NEG_HI)
+      hi = ctx.B.CreateFNeg(hi, (Twine(opts.Name) + "_neg_hi").str());
+  }
+
+  Value *r = UndefValue::get(vecTy);
+  r = ctx.B.CreateInsertElement(r, lo, static_cast<uint64_t>(0));
+  r = ctx.B.CreateInsertElement(r, hi, static_cast<uint64_t>(1));
+  return r;
+}
+
+Value *applyF32InputMods(RaiseContext &ctx, Value *v, unsigned mods,
+                         const Twine &name) {
+  if (v->getType() != ctx.f32Ty)
+    v = ctx.B.CreateBitCast(v, ctx.f32Ty);
+  if (mods & SISrcMods::ABS)
+    v = ctx.B.CreateUnaryIntrinsic(Intrinsic::fabs, v, nullptr,
+                                   (name + "_abs").str());
+  if (mods & SISrcMods::NEG)
+    v = ctx.B.CreateFNeg(v, (name + "_neg").str());
+  return v;
+}
+
+Value *readMixF32Src(RaiseContext &ctx, OpResolver &op, unsigned i,
+                     Type *narrowTy, unsigned mods, StringRef cvtName) {
+  Value *raw = op.src(i);
+  if ((mods & SISrcMods::OP_SEL_1) == 0)
+    return applyF32InputMods(ctx, raw, mods, "mix_full");
+
+  if (raw->getType() == ctx.f32Ty)
+    raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
+
+  Value *bits = nullptr;
+  bool isImmediateOperand = !op.isSrcReg(i);
+  if (!isImmediateOperand && (mods & SISrcMods::OP_SEL_0))
+    bits = ctx.B.CreateTrunc(ctx.B.CreateLShr(raw, 16),
+                              Type::getInt16Ty(ctx.C));
+  else
+    bits = ctx.B.CreateTrunc(raw, Type::getInt16Ty(ctx.C));
+
+  Value *narrowVal = ctx.B.CreateBitCast(bits, narrowTy);
+  Value *extended = ctx.B.CreateFPExt(narrowVal, ctx.f32Ty, cvtName);
+  return applyF32InputMods(ctx, extended, mods, cvtName);
 }
 
 // Read the C (accumulator) operand of a WMMA instruction, handling the
@@ -134,32 +255,12 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
   case SemOp::V_PK_FMA_F16: {
-    if (op.nSrcs() < 3) {
-      hr.failure = RaiseFailure::unsupportedShape(
-          di, "VOP3P", "v_pk_fma_f16 requires three source operands");
-      return hr;
-    }
-
     constexpr unsigned KnownPkF16Mods =
         SISrcMods::NEG | SISrcMods::NEG_HI | SISrcMods::OP_SEL_0 |
         SISrcMods::OP_SEL_1;
     unsigned mods[3] = {};
-    for (unsigned i = 0; i < 3; ++i) {
-      unsigned modIdx = di.modMap[i];
-      if (modIdx == UINT_MAX || !di.isImm(modIdx)) {
-        hr.failure = RaiseFailure::unsupportedShape(
-            di, "VOP3P",
-            "v_pk_fma_f16 missing immediate srcN_modifiers operand");
-        return hr;
-      }
-      mods[i] = static_cast<unsigned>(di.getImm(modIdx));
-      if ((mods[i] & ~KnownPkF16Mods) != 0) {
-        hr.failure = RaiseFailure::unsupportedShape(
-            di, "VOP3P",
-            "v_pk_fma_f16 has unsupported srcN_modifiers bits");
-        return hr;
-      }
-    }
+    if (!readPackedSrcMods(di, op, 3, KnownPkF16Mods, mods, hr))
+      return hr;
 
     int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
                                               AMDGPU::OpName::clamp);
@@ -175,43 +276,17 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
       return hr;
     }
 
-    for (unsigned i = 0; i < 3; ++i) {
-      unsigned srcIdx = op.srcIdx(i);
-      if (!di.isReg(srcIdx) && !di.isImm(srcIdx)) {
-        hr.failure = RaiseFailure::unsupportedShape(
-            di, "VOP3P",
-            "v_pk_fma_f16 source is neither a register nor an immediate");
-        return hr;
-      }
-    }
-
     auto *v2f16 = FixedVectorType::get(ctx.f16Ty, 2);
-    auto readPkF16Src = [&](unsigned i) -> Value * {
-      Value *raw = op.src(i);
-      // VSrc_v2f16 immediates are decoded by LLVM MC as the raw 32-bit
-      // packed source bits. Scalar f16 inline constants occupy the low
-      // half; OP_SEL_1 controls whether the high result lane also reads
-      // that low half, matching LLVM's own v_pk_fma_f16 patterns.
-      Value *vec = ctx.B.CreateBitCast(raw, v2f16, "pk_f16_src");
-      Value *natLo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
-      Value *natHi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
-      Value *lo = (mods[i] & SISrcMods::OP_SEL_0) ? natHi : natLo;
-      Value *hi = (mods[i] & SISrcMods::OP_SEL_1) ? natHi : natLo;
-
-      if (mods[i] & SISrcMods::NEG)
-        lo = ctx.B.CreateFNeg(lo, "pk_fma_f16_neg_lo");
-      if (mods[i] & SISrcMods::NEG_HI)
-        hi = ctx.B.CreateFNeg(hi, "pk_fma_f16_neg_hi");
-
-      Value *r = UndefValue::get(v2f16);
-      r = ctx.B.CreateInsertElement(r, lo, static_cast<uint64_t>(0));
-      r = ctx.B.CreateInsertElement(r, hi, static_cast<uint64_t>(1));
-      return r;
-    };
-
-    Value *s0 = readPkF16Src(0);
-    Value *s1 = readPkF16Src(1);
-    Value *s2 = readPkF16Src(2);
+    PackedSrcOptions opts;
+    opts.ApplyFloatNeg = true;
+    opts.Name = "pk_f16_src";
+    // VSrc_v2f16 immediates are decoded by LLVM MC as the raw 32-bit
+    // packed source bits. Scalar f16 inline constants occupy the low half;
+    // OP_SEL_1 controls whether the high result lane also reads that low
+    // half, matching LLVM's own v_pk_fma_f16 patterns.
+    Value *s0 = readPacked2Src(ctx, op, 0, ctx.f16Ty, mods[0], opts);
+    Value *s1 = readPacked2Src(ctx, op, 1, ctx.f16Ty, mods[1], opts);
+    Value *s2 = readPacked2Src(ctx, op, 2, ctx.f16Ty, mods[2], opts);
     Function *fmaFn = Intrinsic::getOrInsertDeclaration(
         &ctx.M, Intrinsic::fma, {v2f16});
     Value *res = ctx.B.CreateCall(fmaFn, {s0, s1, s2}, "pk_fma_f16");
@@ -243,15 +318,16 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   case SemOp::V_PK_MIN_F32: {
     auto *v2f32 = FixedVectorType::get(ctx.f32Ty, 2);
 
-    int opSelHi[3] = {1, 1, 1};  // default: high lane reads high element
-    int negLo[3] = {0, 0, 0};
-    int negHi[3] = {0, 0, 0};
-    StringRef text(di.fullText);
-    parseBracketList3(text, "op_sel_hi:", opSelHi);
-    parseBracketList3(text, "neg_lo:", negLo);
-    parseBracketList3(text, "neg_hi:", negHi);
+    constexpr unsigned KnownPkF32Mods =
+        SISrcMods::NEG | SISrcMods::NEG_HI | SISrcMods::OP_SEL_0 |
+        SISrcMods::OP_SEL_1;
+    unsigned mods[3] = {};
+    unsigned numSrcs = (sop == SemOp::V_PK_FMA_F32) ? 3 : 2;
+    if (!readPackedSrcMods(di, op, numSrcs, KnownPkF32Mods, mods, hr))
+      return hr;
 
-    // Read each source as <2 x f32>, apply element selection and negation.
+    // Read each source as <2 x f32>, applying source selection and negation
+    // from LLVM's decoded srcN_modifiers operand.
     //
     // Two operand shapes are accepted:
     //   * Register (the common case): reads a 64-bit VGPR pair as
@@ -264,41 +340,14 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     //     `v_pk_add_f32 vN, vM, 0x...` where the literal is a packed
     //     bias constant.  We model it by reading the i32, bit-casting
     //     to f32, and constructing a 2-lane vector with both lanes
-    //     equal to the literal — the high-lane source will then be
-    //     `lit_f32` regardless of `opSelHi[i]` (broadcast is
-    //     idempotent).  `negLo` / `negHi` still apply per-lane.
-    auto readPkSrc = [&](unsigned i) -> Value * {
-      Value *lo, *hi;
-      if (op.isSrcReg(i)) {
-        Value *vec = ctx.regs.readRegVec(ctx.B, op.srcReg(i), v2f32);
-        lo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
-        hi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
-        // op_sel_hi: if 0, high lane reads low element (broadcast).
-        if (opSelHi[i] == 0)
-          hi = lo;
-      } else {
-        // Inline 32-bit literal broadcast to both packed lanes.
-        Value *lit = ctx.B.CreateBitCast(op.src(i), ctx.f32Ty);
-        lo = lit;
-        hi = lit;
-      }
-      if (negLo[i])
-        lo = ctx.B.CreateFNeg(lo);
-      if (negHi[i])
-        hi = ctx.B.CreateFNeg(hi);
-      Value *r = UndefValue::get(v2f32);
-      r = ctx.B.CreateInsertElement(r, lo, static_cast<uint64_t>(0));
-      r = ctx.B.CreateInsertElement(r, hi, static_cast<uint64_t>(1));
-      return r;
-    };
-
-    Value *s0 = readPkSrc(0);
-    Value *s1 = readPkSrc(1);
-    if (!s0 || !s1) {
-      hr.failure = RaiseFailure::unsupportedShape(
-          di, "VALU", "V_PK_* missing packed operand");
-      return hr;
-    }
+    //     equal to the literal.  `neg_lo` / `neg_hi` still apply per lane.
+    PackedSrcOptions opts;
+    opts.RegisterSourceIsVector = true;
+    opts.ImmediateIsScalarBroadcast = true;
+    opts.ApplyFloatNeg = true;
+    opts.Name = "pk_f32_src";
+    Value *s0 = readPacked2Src(ctx, op, 0, ctx.f32Ty, mods[0], opts);
+    Value *s1 = readPacked2Src(ctx, op, 1, ctx.f32Ty, mods[1], opts);
 
     Value *res = nullptr;
     switch (sop) {
@@ -321,12 +370,7 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
       break;
     }
     case SemOp::V_PK_FMA_F32: {
-      Value *s2 = readPkSrc(2);
-      if (!s2) {
-        hr.failure = RaiseFailure::unsupportedShape(
-            di, "VALU", "V_PK_FMA_F32 missing src2");
-        return hr;
-      }
+      Value *s2 = readPacked2Src(ctx, op, 2, ctx.f32Ty, mods[2], opts);
       Function *fn = Intrinsic::getOrInsertDeclaration(
           &ctx.M, Intrinsic::fma, {v2f32});
       res = ctx.B.CreateCall(fn, {s0, s1, s2}, "pk_fma");
@@ -356,34 +400,17 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   case SemOp::V_PK_ADD_U16:
   case SemOp::V_PK_LSHLREV_B16: {
     auto *i16Ty = Type::getInt16Ty(ctx.C);
-    auto *v2i16 = FixedVectorType::get(i16Ty, 2);
 
-    // op_sel/op_sel_hi defaults match natural lo->lo / hi->hi packing.
-    // op_sel[i]    == 1 → lane 0 reads HIGH i16 of source i.
-    // op_sel_hi[i] == 0 → lane 1 reads LOW  i16 of source i (broadcast).
-    int opSel[3]   = {0, 0, 0};
-    int opSelHi[3] = {1, 1, 1};
-    StringRef text(di.fullText);
-    parseBracketList3(text, "op_sel:", opSel);
-    parseBracketList3(text, "op_sel_hi:", opSelHi);
+    constexpr unsigned KnownPkI16Mods =
+        SISrcMods::OP_SEL_0 | SISrcMods::OP_SEL_1;
+    unsigned mods[3] = {};
+    if (!readPackedSrcMods(di, op, 2, KnownPkI16Mods, mods, hr))
+      return hr;
 
-    auto readPkI16Src = [&](unsigned i) -> Value * {
-      Value *raw = op.src(i);
-      if (raw->getType() != ctx.i32Ty)
-        raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
-      Value *vec = ctx.B.CreateBitCast(raw, v2i16);
-      Value *natLo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
-      Value *natHi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
-      Value *lo = (opSel[i] != 0) ? natHi : natLo;
-      Value *hi = (opSelHi[i] == 0) ? natLo : natHi;
-      Value *r = UndefValue::get(v2i16);
-      r = ctx.B.CreateInsertElement(r, lo, static_cast<uint64_t>(0));
-      r = ctx.B.CreateInsertElement(r, hi, static_cast<uint64_t>(1));
-      return r;
-    };
-
-    Value *s0 = readPkI16Src(0);
-    Value *s1 = readPkI16Src(1);
+    PackedSrcOptions opts;
+    opts.Name = "pk_i16_src";
+    Value *s0 = readPacked2Src(ctx, op, 0, i16Ty, mods[0], opts);
+    Value *s1 = readPacked2Src(ctx, op, 1, i16Ty, mods[1], opts);
 
     Value *res = nullptr;
     switch (sop) {
@@ -995,38 +1022,19 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
     Type *bf16Ty = Type::getBFloatTy(ctx.C);
     Type *i16Ty = Type::getInt16Ty(ctx.C);
 
-    int opSel[3] = {0, 0, 0};
-    int opSelHi[3] = {0, 0, 0};
-    StringRef text(di.fullText);
-    parseBracketList3(text, "op_sel:", opSel);
-    parseBracketList3(text, "op_sel_hi:", opSelHi);
+    constexpr unsigned KnownMixMods =
+        SISrcMods::NEG | SISrcMods::ABS | SISrcMods::OP_SEL_0 |
+        SISrcMods::OP_SEL_1;
+    unsigned mods[3] = {};
+    if (!readSourceMods(di, op, 3, KnownMixMods, mods, hr))
+      return hr;
 
-    auto readMixBf16Src = [&](unsigned i) -> Value * {
-      Value *raw = op.srcF(i);
-      if (opSelHi[i] == 0) {
-        if (raw->getType() != ctx.f32Ty)
-          raw = ctx.B.CreateBitCast(raw, ctx.f32Ty);
-        return raw;
-      }
-
-      if (raw->getType() == ctx.f32Ty)
-        raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
-
-      Value *bits = nullptr;
-      bool isImmediateOperand = !op.isSrcReg(i);
-      if (!isImmediateOperand && opSel[i] == 1)
-        bits = ctx.B.CreateTrunc(ctx.B.CreateLShr(raw, 16),
-                                  i16Ty);
-      else
-        bits = ctx.B.CreateTrunc(raw, i16Ty);
-
-      Value *narrowVal = ctx.B.CreateBitCast(bits, bf16Ty);
-      return ctx.B.CreateFPExt(narrowVal, ctx.f32Ty, "mixlo_cvt_bf16");
-    };
-
-    Value *s0 = readMixBf16Src(0);
-    Value *s1 = readMixBf16Src(1);
-    Value *s2 = readMixBf16Src(2);
+    Value *s0 = readMixF32Src(ctx, op, 0, bf16Ty, mods[0],
+                              "mixlo_cvt_bf16");
+    Value *s1 = readMixF32Src(ctx, op, 1, bf16Ty, mods[1],
+                              "mixlo_cvt_bf16");
+    Value *s2 = readMixF32Src(ctx, op, 2, bf16Ty, mods[2],
+                              "mixlo_cvt_bf16");
     Function *fmaFn = Intrinsic::getOrInsertDeclaration(
         &ctx.M, Intrinsic::fma, {ctx.f32Ty});
     Value *fma = ctx.B.CreateCall(fmaFn, {s0, s1, s2}, "fma_mixlo_bf16");
@@ -1065,9 +1073,7 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   // dst = fma(cvt_f32(src0_part), cvt_f32(src1_part), cvt_f32(src2_part))
   //
   // Per-source selection is driven by the VOP3P op_sel / op_sel_hi
-  // modifier pair (parsed off the disassembly text because MC does not
-  // surface op_sel_hi as a first-class operand for VOP3P; see the
-  // V_PK_* handlers above for the same approach):
+  // modifier pair carried in LLVM's decoded srcN_modifiers operands:
   //
   //   op_sel_hi[i]==0  -> source i is the full f32 VGPR
   //   op_sel_hi[i]==1  -> source i is the 16-bit half selected by
@@ -1079,9 +1085,7 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   // The BF16 variant does NOT need a cross-target refusal because
   // `fpext bfloat to float` is universally lowered (it's a shift-left-16
   // + bitcast on every AMDGPU target); only the narrow element type
-  // switches. Unparsed op_sel / op_sel_hi bracket lists fall through to
-  // all-zero, which matches the hardware default (full-width f32
-  // sources on all three slots) — never silently corrupted.
+  // switches.
   case SemOp::V_FMA_MIX_F32:
   case SemOp::V_FMA_MIX_F32_BF16: {
     Type *narrowTy = (sop == SemOp::V_FMA_MIX_F32_BF16)
@@ -1091,59 +1095,21 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
                               ? "mix_cvt_bf16"
                               : "mix_cvt";
 
-    int opSel[3] = {0, 0, 0};
-    int opSelHi[3] = {0, 0, 0};
-    StringRef text(di.fullText);
-    parseBracketList3(text, "op_sel:", opSel);
-    parseBracketList3(text, "op_sel_hi:", opSelHi);
+    constexpr unsigned KnownMixMods =
+        SISrcMods::NEG | SISrcMods::ABS | SISrcMods::OP_SEL_0 |
+        SISrcMods::OP_SEL_1;
+    unsigned mods[3] = {};
+    if (!readSourceMods(di, op, 3, KnownMixMods, mods, hr))
+      return hr;
 
-    auto readMixSrc = [&](unsigned i) -> Value * {
-      Value *raw = op.srcF(i);
-      if (opSelHi[i] == 0) {
-        if (raw->getType() != ctx.f32Ty) raw = ctx.B.CreateBitCast(raw, ctx.f32Ty);
-        return raw;
-      }
-      if (raw->getType() == ctx.f32Ty) raw = ctx.B.CreateBitCast(raw, ctx.i32Ty);
-      Value *bits;
-      // `op_sel[i]` is a VGPR-half selector — it only makes sense
-      // when the source is a 32-bit VGPR that holds two packed
-      // 16-bit values.  For immediates (inline constants AND
-      // 32-bit literals), LLVM's AMDGPU disassembler pre-resolves
-      // narrow-width operands to their 16-bit value stored in the
-      // LOW 16 of the MCOperand's Imm (see
-      // `AMDGPUDisassembler.cpp::decodeMCOperand`'s
-      // `OPERAND_REG_INLINE_C_BF16` / `OPERAND_REG_IMM_BF16` arms
-      // and their `getInlineImmValBF16` / `getInlineImmValF16`
-      // helpers; upper 16 is zero-extended).  Applying the
-      // `op_sel[i]=1` high-half extraction to a pre-resolved
-      // narrow immediate silently truncates to bf16/fp16 `0.0`
-      // because the upper 16 is zero.  The bug surfaced as
-      // `v_fma_mix_f32_bf16 v9, v10, 1.0, v9 op_sel:[0,1,0]` (src1
-      // is inline bf16 `1.0` = MC Imm `0x3F80`; handler was
-      // extracting bits [31:16] = `0x0000`); the resulting
-      // `fma(bf16(v10), 0.0, v9) = v9` is a no-op, and every bf16
-      // reduction step silently dropped its multiplier.  Pinned
-      // end-to-end by `topk_forward_bisect_m1_const_in` (all-ones
-      // input produced output `1.0` instead of the expected sum
-      // `32.0`; b77e477908 lands that probe).
-      //
-      // Detection: `!op.isSrcReg(i)` — the logical source slot
-      // resolved to a non-register MCOperand (inline constant,
-      // literal, or expression).  For every such case the bits
-      // live in [15:0] of the MC Imm regardless of `op_sel[i]`.
-      bool isImmediateOperand = !op.isSrcReg(i);
-      if (!isImmediateOperand && opSel[i] == 1)
-        bits = ctx.B.CreateTrunc(ctx.B.CreateLShr(raw, 16),
-                                  Type::getInt16Ty(ctx.C));
-      else
-        bits = ctx.B.CreateTrunc(raw, Type::getInt16Ty(ctx.C));
-      Value *narrowVal = ctx.B.CreateBitCast(bits, narrowTy);
-      return ctx.B.CreateFPExt(narrowVal, ctx.f32Ty, cvtName);
-    };
-
-    Value *s0 = readMixSrc(0);
-    Value *s1 = readMixSrc(1);
-    Value *s2 = readMixSrc(2);
+    // `OP_SEL_0` is a VGPR-half selector and only makes sense when the source
+    // is a 32-bit VGPR that holds two packed 16-bit values. For immediates,
+    // LLVM's AMDGPU disassembler pre-resolves narrow-width operands to the
+    // 16-bit value in the low half of the MCOperand immediate; the helper
+    // therefore ignores OP_SEL_0 for non-register narrow sources.
+    Value *s0 = readMixF32Src(ctx, op, 0, narrowTy, mods[0], cvtName);
+    Value *s1 = readMixF32Src(ctx, op, 1, narrowTy, mods[1], cvtName);
+    Value *s2 = readMixF32Src(ctx, op, 2, narrowTy, mods[2], cvtName);
     Function *fmaFn = Intrinsic::getOrInsertDeclaration(
         &ctx.M, Intrinsic::fma, {ctx.f32Ty});
     ctx.writeReg32(op.dst(),

@@ -4,8 +4,8 @@
 ; RUN:   | %FileCheck %s
 ;
 ; Pins the VOP3P mixed-precision FMA family (V_FMA_MIX_F32 +
-; V_FMA_MIX_F32_BF16).  Both variants share the op_sel / op_sel_hi
-; parser and write-back shape in handle_valu_vop3p.cpp; only the
+; V_FMA_MIX_F32_BF16).  Both variants share the metadata-backed
+; op_sel / op_sel_hi source-modifier path in handle_valu_vop3p.cpp; only the
 ; narrow element type differs (f16 vs bf16).  The fixture exercises
 ; the exact shape the kerneldex `_attn_fwd` kernel emits
 ; (op_sel:[0,1,0] op_sel_hi:[1,1,0] — src0 LO-narrow, src1 HI-narrow,
@@ -73,6 +73,12 @@
 ; CHECK-DAG: %fma_mix{{[0-9]+}} = call float @llvm.fma.f32(float %{{[^,]+}}, float 1.000000e+00, float %{{[^)]+}})
 ; CHECK-DAG: %fma_mix{{[0-9]+}} = call float @llvm.fma.f32(float %{{[^,]+}}, float 1.000000e+00, float %{{[^)]+}})
 
+; Modifier pins: narrow-source neg is applied after narrow conversion, and
+; full-f32 abs is applied only after selecting the full-f32 source path.
+; CHECK-DAG: %mix_cvt_bf16_neg = fneg float %mix_cvt_bf16{{[0-9]+}}
+; CHECK-DAG: %mix_full_abs = call float @llvm.fabs.f32(float %{{[^)]+}})
+; CHECK-DAG: call float @llvm.fma.f32(float %mix_cvt_bf16{{[0-9]+}}, float 1.000000e+00, float %mix_full_abs)
+
 ; Negative pin: no `float 0.0` feeds any fma.f32 call in this fixture
 ; (the pre-fix miscompile shape).
 ; CHECK-NOT: call float @llvm.fma.f32(float %{{[^,]+}}, float 0.000000e+00,
@@ -99,19 +105,23 @@ v_fma_mix_f32_bf16_kernel:              ; @v_fma_mix_f32_bf16_kernel
 	v_dual_mov_b32 v1, s0 :: v_dual_mov_b32 v6, s0
 	;;#ASMSTART
 	v_fma_mix_f32_bf16 v2, v1, v3, v5 op_sel:[0,1,0] op_sel_hi:[1,1,0]
-	
+
 	;;#ASMEND
 	;;#ASMSTART
 	v_fma_mix_f32 v3, v6, v3, v5 op_sel:[0,1,0] op_sel_hi:[1,1,0]
-	
+
 	;;#ASMEND
 	;;#ASMSTART
-	v_fma_mix_f32_bf16 v4, v6, 1.0, v5 op_sel:[0,0,0] op_sel_hi:[1,1,0]
-	
+	v_fma_mix_f32_bf16 v4, -v6, 1.0, v5 op_sel:[0,0,0] op_sel_hi:[1,1,0]
+
 	;;#ASMEND
 	;;#ASMSTART
 	v_fma_mix_f32_bf16 v5, v6, 1.0, v5 op_sel:[0,1,0] op_sel_hi:[1,1,0]
-	
+
+	;;#ASMEND
+	;;#ASMSTART
+	v_fma_mix_f32_bf16 v6, v6, 1.0, |v5| op_sel:[0,0,0] op_sel_hi:[1,1,0]
+
 	;;#ASMEND
 	global_store_b128 v0, v[2:5], s[0:1] scale_offset
 	s_endpgm
