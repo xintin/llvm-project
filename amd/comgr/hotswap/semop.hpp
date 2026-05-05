@@ -509,6 +509,7 @@ enum class SemOp : uint16_t {
   // 16 bits of the multiply, naturally produced by `mul i16`.
   V_ADD_U16, V_SUB_U16, V_SUBREV_U16, V_MUL_LO_U16,
   V_DOT2C_I32_I16, V_DOT4C_I32_I8, V_DOT8C_I32_I4,
+  V_DOT4_I32_IU8,
   V_PK_FMAC_F16,
   V_PACK_B32_F16,
   V_CVT_PK_BF16_F32, V_CVT_PK_BF8_F32, V_CVT_PK_FP8_F32,

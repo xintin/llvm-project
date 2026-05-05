@@ -4,6 +4,7 @@
 #include "wmma_lowering.hpp"
 
 #include "Utils/AMDGPUBaseInfo.h" // AMDGPU::getNamedOperandIdx, AMDGPU::OpName
+#include "SIDefines.h"            // SISrcMods::NEG
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Constants.h"
@@ -305,6 +306,69 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
 
     ctx.writeReg32(op.dst(),
                    ctx.B.CreateBitCast(res, ctx.i32Ty, "pk_i16_pack"));
+    hr.handled = true;
+    return hr;
+  }
+
+  // ---- v_dot4_i32_iu8 ----
+  //
+  // Mixed signed/unsigned 4-byte dot product:
+  //   dst = src2 + sum_{i=0..3} extA(src0.byte[i]) * extB(src1.byte[i])
+  //
+  // AMDGPU models the input signedness through the VOP3P source modifier
+  // operands: SISrcMods::NEG set on src0/src1 means that source's packed bytes
+  // are signed, otherwise they are unsigned. LLVM's `VOP3PModsNeg` pattern in
+  // SIInstrInfo.td encodes the same contract. Lower to ordinary integer IR
+  // rather than a target dot intrinsic so gfx1250 same-target and gfx942
+  // cross-target paths share one verifier-clean semantic representation; the
+  // backend may rediscover a dot instruction where legal. A future
+  // target-native optimisation can route supporting targets through
+  // `llvm.amdgcn.sudot4`, but that should not be required for correctness.
+  case SemOp::V_DOT4_I32_IU8: {
+    int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                              AMDGPU::OpName::clamp);
+    bool clamp = false;
+    if (clampIdx >= 0 && di.isImm(static_cast<unsigned>(clampIdx)))
+      clamp = di.getImm(static_cast<unsigned>(clampIdx)) != 0;
+    if (clampIdx >= 0 && !di.isImm(static_cast<unsigned>(clampIdx))) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P", "v_dot4_i32_iu8 clamp operand is not an immediate");
+      return hr;
+    }
+
+    Value *src0 = op.src(0);
+    Value *src1 = op.src(1);
+    Value *acc = ctx.B.CreateSExt(op.src(2), ctx.i64Ty, "dot4_acc_wide");
+    auto *i8Ty = Type::getInt8Ty(ctx.C);
+
+    auto extendByte = [&](Value *packed, unsigned byteIdx,
+                          bool isSigned) -> Value * {
+      Value *shift = ConstantInt::get(ctx.i32Ty, byteIdx * 8);
+      Value *lo = ctx.B.CreateTrunc(ctx.B.CreateLShr(packed, shift), i8Ty,
+                                    "dot4_byte");
+      return isSigned ? ctx.B.CreateSExt(lo, ctx.i64Ty, "dot4_sext")
+                      : ctx.B.CreateZExt(lo, ctx.i64Ty, "dot4_zext");
+    };
+
+    const bool src0Signed = (op.srcMod(0) & SISrcMods::NEG) != 0;
+    const bool src1Signed = (op.srcMod(1) & SISrcMods::NEG) != 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      Value *a = extendByte(src0, i, src0Signed);
+      Value *b = extendByte(src1, i, src1Signed);
+      acc = ctx.B.CreateAdd(acc, ctx.B.CreateMul(a, b, "dot4_mul"),
+                            "dot4_acc");
+    }
+
+    if (clamp) {
+      Value *lo = ConstantInt::get(ctx.i64Ty, INT32_MIN);
+      Value *hi = ConstantInt::get(ctx.i64Ty, INT32_MAX);
+      acc = ctx.B.CreateSelect(ctx.B.CreateICmpSLT(acc, lo), lo, acc,
+                               "dot4_clamp_lo");
+      acc = ctx.B.CreateSelect(ctx.B.CreateICmpSGT(acc, hi), hi, acc,
+                               "dot4_clamp");
+    }
+
+    ctx.writeReg32(op.dst(), ctx.B.CreateTrunc(acc, ctx.i32Ty, "dot4_i32"));
     hr.handled = true;
     return hr;
   }
