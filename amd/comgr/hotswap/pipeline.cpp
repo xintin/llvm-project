@@ -5,6 +5,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
@@ -189,14 +190,32 @@ struct DumpDir {
 
 } // anonymous namespace
 
+static thread_local bool StrictModeOverrideActive = false;
+static thread_local bool StrictModeOverrideValue = false;
+
+ScopedStrictMode::ScopedStrictMode(bool enabled)
+    : previousActive(StrictModeOverrideActive),
+      previousValue(StrictModeOverrideValue) {
+  StrictModeOverrideActive = true;
+  StrictModeOverrideValue = enabled;
+}
+
+ScopedStrictMode::~ScopedStrictMode() {
+  StrictModeOverrideActive = previousActive;
+  StrictModeOverrideValue = previousValue;
+}
+
 bool isStrictMode() {
+  if (StrictModeOverrideActive)
+    return StrictModeOverrideValue;
+
   // Parsed once on first call. The handler implementations call this on
   // every relevant instruction, so going through the OS allocator
   // (`std::getenv`) repeatedly would be wasteful; the result also cannot
   // change inside a process because the env var is read once at the
   // first transpile and reused for the rest of the process lifetime.
   // Treats any non-empty value as enabled to keep the runner side
-  // (`HSA_HOTSWAP_STRICT=1`) and the pipeline side decoupled — a future
+  // (`HSA_HOTSWAP_STRICT=1`) and the pipeline side decoupled; a future
   // shell that writes `HSA_HOTSWAP_STRICT=true` still works.
   static const bool s_strict = []() {
     const char *v = std::getenv("HSA_HOTSWAP_STRICT");
@@ -221,7 +240,18 @@ static bool raiseAndCompileKernel(const TextSection &text,
                  << "', using empty metadata\n";
   }
 
-  uint64_t kernelOffset = findKernelSymbolOffset(codeObjectData, kernelName);
+  auto kernelOffsetOrErr = findKernelSymbolOffset(codeObjectData, kernelName);
+  if (!kernelOffsetOrErr) {
+    std::string err = llvm::toString(kernelOffsetOrErr.takeError());
+    llvm::errs() << "transpiler: " << err << "\n";
+    result.failKernel = kernelName;
+    result.failMnemonic = "__kernel_offset__";
+    result.failReason = "KernelSymbolOffsetLookupFailed";
+    result.failFormat = "KernelSymbolOffsetLookupFailed";
+    result.failDetail = err;
+    return false;
+  }
+  uint64_t kernelOffset = *kernelOffsetOrErr;
   LLVM_DEBUG(if (kernelOffset > 0)
     llvm::dbgs() << "transpiler: Kernel '" << kernelName
                  << "' at .text offset 0x" << llvm::utohexstr(kernelOffset)

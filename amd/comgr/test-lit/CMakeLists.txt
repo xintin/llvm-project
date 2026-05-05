@@ -8,6 +8,7 @@ endfunction()
 
 canonicalize_cmake_boolean(COMGR_SPIRV_BACKEND_AVAILABLE)
 canonicalize_cmake_boolean(COMGR_SPIRV_TRANSLATOR_AVAILABLE)
+canonicalize_cmake_boolean(COMGR_ENABLE_HOTSWAP_TRANSPILE)
 
 configure_file(lit.site.cfg.py.in lit.site.cfg.py @ONLY)
 
@@ -54,5 +55,8 @@ add_comgr_lit_binary(status-string c)
 add_comgr_lit_binary(data-action c)
 add_comgr_lit_binary(lookup-code-object c)
 add_comgr_lit_binary(hotswap-rewrite c)
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  add_comgr_lit_binary(hotswap-transpile c)
+endif()
 
 add_dependencies(check-comgr test-lit)

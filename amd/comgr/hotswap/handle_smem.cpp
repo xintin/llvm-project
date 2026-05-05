@@ -1,5 +1,6 @@
 #include "handlers.hpp"
 #include "pipeline.hpp" // isStrictMode()
+#include "source_hidden_args.hpp"
 
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
@@ -130,23 +131,51 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
             "hidden-arg block");
         return hr;
       }
-      Function *fnImplicitArgPtr = Intrinsic::getOrInsertDeclaration(
-          &ctx.M, Intrinsic::amdgcn_implicitarg_ptr);
-      Value *implPtr =
-          ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
-      int64_t implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
-      Value *gep =
-          (implOffset == 0)
-              ? implPtr
-              : ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
-                                         ctx.B.getInt64(implOffset),
-                                         "impl_gep");
+      SourceHiddenArgContext HiddenCtx{ctx.C,      ctx.M,      ctx.B,
+                                       ctx.i8Ty,   ctx.i32Ty,  ctx.i64Ty,
+                                       ctx.kernargs.args};
+      SourceHiddenArgValue hiddenBase =
+          emitSourceHiddenDword(HiddenCtx, byteOffset);
+      if (!hiddenBase.Matched) {
+        Function *fnImplicitArgPtr = Intrinsic::getOrInsertDeclaration(
+            &ctx.M, Intrinsic::amdgcn_implicitarg_ptr);
+        Value *implPtr =
+            ctx.B.CreateCall(fnImplicitArgPtr, {}, "implicitarg_ptr");
+        int64_t implOffset = byteOffset - ctx.kernargs.implicitArgsBase;
+        Value *gep =
+            (implOffset == 0)
+                ? implPtr
+                : ctx.B.CreateInBoundsGEP(ctx.i8Ty, implPtr,
+                                           ctx.B.getInt64(implOffset),
+                                           "impl_gep");
+        for (int d = 0; d < loadDwords; d++) {
+          Value *ep = (d == 0) ? gep
+                               : ctx.B.CreateInBoundsGEP(
+                                     ctx.i8Ty, gep, ctx.B.getInt64(d * 4));
+          ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d,
+                               ctx.B.CreateLoad(ctx.i32Ty, ep, "impl_load"));
+        }
+        hr.handled = true;
+        return hr;
+      }
+      if (!hiddenBase.Value) {
+        hr.failure =
+            RaiseFailure::unsupportedShape(di, "SMEM", hiddenBase.FailureDetail);
+        return hr;
+      }
       for (int d = 0; d < loadDwords; d++) {
-        Value *ep = (d == 0) ? gep
-                             : ctx.B.CreateInBoundsGEP(
-                                   ctx.i8Ty, gep, ctx.B.getInt64(d * 4));
-        ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d,
-                             ctx.B.CreateLoad(ctx.i32Ty, ep, "impl_load"));
+        SourceHiddenArgValue dw =
+            d == 0 ? hiddenBase
+                   : emitSourceHiddenDword(HiddenCtx, byteOffset + d * 4);
+        if (!dw.Matched || !dw.Value) {
+          hr.failure = RaiseFailure::unsupportedShape(
+              di, "SMEM",
+              dw.FailureDetail.empty()
+                  ? "source hidden-arg SMEM load spans non-hidden bytes"
+                  : dw.FailureDetail);
+          return hr;
+        }
+        ctx.regs.storeSGPR32(ctx.B, dest.baseIdx + d, dw.Value);
       }
       hr.handled = true;
       return hr;
@@ -237,11 +266,33 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     ParsedReg dest = op.dst();
     ParsedReg base = op.srcReg(0);
 
+    int kernargPtrSgpr = getKernargPtrSgpr(ctx);
+    bool baseIsKernargPair =
+        (base.kind == ParsedReg::SGPR && kernargPtrSgpr >= 0 &&
+         base.baseIdx == kernargPtrSgpr);
     Value *baseAddr = ctx.regs.loadSGPR64(ctx.B, base.baseIdx);
     Value *ptr = ctx.B.CreateIntToPtr(baseAddr, ctx.ptrGlobalTy);
     unsigned offIdx = op.srcIdx(1);
     if (di.isImm(offIdx)) {
       int64_t off = op.srcImm(1);
+      if (baseIsKernargPair && ctx.kernargs.implicitArgsBase > 0 &&
+          off >= ctx.kernargs.implicitArgsBase) {
+        SourceHiddenArgContext HiddenCtx{ctx.C,      ctx.M,      ctx.B,
+                                         ctx.i8Ty,   ctx.i32Ty,  ctx.i64Ty,
+                                         ctx.kernargs.args};
+        SourceHiddenArgValue hidden = emitSourceHiddenInteger(
+            HiddenCtx, static_cast<int>(off), isHalfWord ? 2 : 1, isSigned);
+        if (hidden.Matched) {
+          if (!hidden.Value) {
+            hr.failure =
+                RaiseFailure::unsupportedShape(di, "SMEM", hidden.FailureDetail);
+            return hr;
+          }
+          ctx.regs.storeSGPR32(ctx.B, dest.baseIdx, hidden.Value);
+          hr.handled = true;
+          return hr;
+        }
+      }
       if (off != 0)
         ptr = ctx.B.CreateInBoundsGEP(ctx.i8Ty, ptr, ctx.B.getInt64(off));
     } else {

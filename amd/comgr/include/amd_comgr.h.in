@@ -2699,6 +2699,9 @@ amd_comgr_map_elf_virtual_address_to_code_object_offset(
  * on a different target ISA. This includes both same-family stepping
  * patches (e.g. B0 to A0) and cross-family transpilation.
  * The input ELF is not modified; a new data object is created and returned.
+ * This entry point does not use the HotSwap translation cache. Call
+ * @c amd_comgr_hotswap_transpile_with_options to request cache lookup/write
+ * and structured result metadata.
  *
  * If no patches are needed, the output is a copy of the input.
  *
@@ -2737,6 +2740,220 @@ amd_comgr_hotswap_rewrite(
     const char *source_isa_name,
     const char *target_isa_name,
     amd_comgr_data_t *output) AMD_COMGR_VERSION_3_2;
+
+/**
+ * @brief Transpile a code object from one ISA to another via the hotswap
+ * binary transpiler.
+ *
+ * Where @c amd_comgr_hotswap_rewrite applies a small set of byte-level
+ * stepping patches in place, this entry point hands the entire code object
+ * to the hotswap pipeline: every kernel is disassembled, raised to LLVM IR,
+ * re-lowered through the stock AMDGPU backend for @p target_isa_name, and
+ * relinked into a single merged HSACO. Use this when the source and target
+ * ISAs differ enough that no in-place patch sequence exists (cross-family
+ * translation, wave-size cross-widening, or any other transformation
+ * outside the byte-level rewrite policy's coverage).
+ *
+ * The input ELF is not modified; a new data object is created and returned.
+ *
+ * @param[in] input A data object of kind @p AMD_COMGR_DATA_KIND_EXECUTABLE
+ *   containing the input ELF code object bytes.
+ * @param[in] source_isa_name A null terminated string that is the isa name
+ *   the code object was compiled for. The isa name is defined as the Code
+ *   Object Target Identification string, described at
+ *   https://llvm.org/docs/AMDGPUUsage.html#code-object-target-identification
+ * @param[in] target_isa_name A null terminated string that is the isa name
+ *   of the target GPU. May differ from @p source_isa_name across processor
+ *   families.
+ * @param[out] output A handle to a data object of kind @p
+ *   AMD_COMGR_DATA_KIND_EXECUTABLE containing the transpiled ELF. The
+ *   caller must release this handle using @c amd_comgr_release_data when
+ *   done. @p output is not modified on failure.
+ *
+ * @retval ::AMD_COMGR_STATUS_SUCCESS Transpilation completed successfully.
+ * @retval ::AMD_COMGR_STATUS_ERROR The hotswap pipeline failed for at least
+ *   one kernel (unsupported instruction, raise failure, or backend
+ *   compilation/link failure). Diagnostic detail is logged to stderr.
+ * @retval ::AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT @p input is an invalid
+ *   data object, is not of kind @p AMD_COMGR_DATA_KIND_EXECUTABLE, does not
+ *   contain data bytes, or @p source_isa_name or @p target_isa_name is
+ *   NULL or malformed.
+ * @retval ::AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES Unable to allocate
+ *   the output data object.
+ */
+amd_comgr_status_t AMD_COMGR_API
+amd_comgr_hotswap_transpile(
+    amd_comgr_data_t input,
+    const char *source_isa_name,
+    const char *target_isa_name,
+    amd_comgr_data_t *output) AMD_COMGR_VERSION_3_2;
+
+/**
+ * @brief HotSwap transpilation option flags.
+ */
+typedef enum amd_comgr_hotswap_transpile_option_flags_s {
+  /**
+   * Disable translation cache lookup and writes even when a cache directory is
+   * provided.
+   */
+  AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_DISABLE = 1u << 0,
+  /**
+   * Allow cache lookup but do not write a translated object on cache miss.
+   */
+  AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_READONLY = 1u << 1,
+  /**
+   * Enable HotSwap strict mode for unsafe lowering refusals.
+   */
+  AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_STRICT = 1u << 2,
+} amd_comgr_hotswap_transpile_option_flags_t;
+
+/**
+ * @brief Options for @c amd_comgr_hotswap_transpile_with_options.
+ *
+ * The caller must set @p size to @c sizeof(amd_comgr_hotswap_transpile_options_t).
+ * Pointers are borrowed only for the duration of the call. A NULL or empty
+ * @p cache_directory disables cache lookup and writes.
+ */
+typedef struct amd_comgr_hotswap_transpile_options_s {
+  size_t size;
+  const char *cache_directory;
+  const char *cache_skip_kernels;
+  const char *hotswap_rules_path;
+  uint64_t flags;
+} amd_comgr_hotswap_transpile_options_t;
+
+/**
+ * @brief A handle to structured HotSwap transpilation result metadata.
+ *
+ * A non-zero result returned by @c amd_comgr_hotswap_transpile_with_options
+ * must be destroyed with @c amd_comgr_destroy_hotswap_transpile_result.
+ */
+typedef struct amd_comgr_hotswap_transpile_result_s {
+  uint64_t handle;
+} amd_comgr_hotswap_transpile_result_t;
+
+/**
+ * @brief Translation cache lookup status.
+ */
+typedef enum amd_comgr_hotswap_cache_lookup_status_s {
+  AMD_COMGR_HOTSWAP_CACHE_LOOKUP_DISABLED = 0x0,
+  AMD_COMGR_HOTSWAP_CACHE_LOOKUP_BYPASSED = 0x1,
+  AMD_COMGR_HOTSWAP_CACHE_LOOKUP_MISS = 0x2,
+  AMD_COMGR_HOTSWAP_CACHE_LOOKUP_HIT = 0x3,
+  AMD_COMGR_HOTSWAP_CACHE_LOOKUP_INVALID = 0x4,
+} amd_comgr_hotswap_cache_lookup_status_t;
+
+/**
+ * @brief Translation cache write status.
+ */
+typedef enum amd_comgr_hotswap_cache_write_status_s {
+  AMD_COMGR_HOTSWAP_CACHE_WRITE_NOT_ATTEMPTED = 0x0,
+  AMD_COMGR_HOTSWAP_CACHE_WRITE_SUCCESS = 0x1,
+  AMD_COMGR_HOTSWAP_CACHE_WRITE_FAILED = 0x2,
+} amd_comgr_hotswap_cache_write_status_t;
+
+/**
+ * @brief Fixed-size result fields.
+ */
+typedef enum amd_comgr_hotswap_transpile_result_info_s {
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_SUCCESS = 0x0,       /* bool */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_HIT = 0x1,     /* bool */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_LOOKUP = 0x2,  /* amd_comgr_hotswap_cache_lookup_status_t */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_WRITE = 0x3,   /* amd_comgr_hotswap_cache_write_status_t */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_LIFTED_COUNT = 0x4,  /* int64_t */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TOTAL_COUNT = 0x5,   /* int64_t */
+} amd_comgr_hotswap_transpile_result_info_t;
+
+/**
+ * @brief String result fields.
+ */
+typedef enum amd_comgr_hotswap_transpile_result_string_s {
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_BACKEND = 0x0,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_SOURCE_GFX = 0x1,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TARGET_GFX = 0x2,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_KEY = 0x3,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_DETAIL = 0x4,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_METADATA_PATH = 0x5,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_OBJECT_PATH = 0x6,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_REASON = 0x7,
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_DETAIL = 0x8,
+} amd_comgr_hotswap_transpile_result_string_t;
+
+/**
+ * @brief Transpile a code object using explicit options and return structured
+ * result metadata.
+ *
+ * The translation cache is owned by COMGR's hotswap compiler implementation,
+ * but cache policy is explicit in @p options. On HotSwap pipeline failure,
+ * cache corruption, or cache write failure, this function returns
+ * @c AMD_COMGR_STATUS_ERROR and may still return @p result containing
+ * @c success=false plus failure detail. The caller owns and must destroy any
+ * non-zero returned result handle.
+ *
+ * @param[in] input A data object of kind @p AMD_COMGR_DATA_KIND_EXECUTABLE
+ *   containing the input ELF code object bytes.
+ * @param[in] source_isa_name A null terminated string that is the isa name
+ *   the code object was compiled for.
+ * @param[in] target_isa_name A null terminated string that is the isa name
+ *   of the target GPU.
+ * @param[out] output A handle to a data object of kind @p
+ *   AMD_COMGR_DATA_KIND_EXECUTABLE containing the transpiled ELF. The caller
+ *   must release this handle using @c amd_comgr_release_data when done.
+ *   @p output is not modified on failure.
+ * @param[in] options Optional explicit cache/strict-mode options. If NULL,
+ *   cache lookup and writes are disabled.
+ * @param[out] result Optional structured result metadata. The caller must
+ *   destroy a non-zero returned handle with
+ *   @c amd_comgr_destroy_hotswap_transpile_result.
+ *
+ * @retval ::AMD_COMGR_STATUS_SUCCESS Transpilation completed successfully.
+ * @retval ::AMD_COMGR_STATUS_ERROR The hotswap pipeline failed, the cache
+ *   entry was invalid, or a requested cache write failed.
+ * @retval ::AMD_COMGR_STATUS_ERROR_INVALID_ARGUMENT @p input is an invalid
+ *   data object, is not of kind @p AMD_COMGR_DATA_KIND_EXECUTABLE, does not
+ *   contain data bytes, @p output is NULL, or @p source_isa_name /
+ *   @p target_isa_name is NULL or malformed.
+ * @retval ::AMD_COMGR_STATUS_ERROR_OUT_OF_RESOURCES Unable to allocate a
+ *   returned data object.
+ */
+amd_comgr_status_t AMD_COMGR_API
+amd_comgr_hotswap_transpile_with_options(
+    amd_comgr_data_t input,
+    const char *source_isa_name,
+    const char *target_isa_name,
+    const amd_comgr_hotswap_transpile_options_t *options,
+    amd_comgr_data_t *output,
+    amd_comgr_hotswap_transpile_result_t *result) AMD_COMGR_VERSION_3_2;
+
+/**
+ * @brief Destroy a HotSwap transpilation result handle.
+ */
+amd_comgr_status_t AMD_COMGR_API
+amd_comgr_destroy_hotswap_transpile_result(
+    amd_comgr_hotswap_transpile_result_t result) AMD_COMGR_VERSION_3_2;
+
+/**
+ * @brief Query a fixed-size HotSwap transpilation result field.
+ */
+amd_comgr_status_t AMD_COMGR_API
+amd_comgr_hotswap_transpile_result_get_info(
+    amd_comgr_hotswap_transpile_result_t result,
+    amd_comgr_hotswap_transpile_result_info_t info,
+    void *value) AMD_COMGR_VERSION_3_2;
+
+/**
+ * @brief Query a string HotSwap transpilation result field.
+ *
+ * If @p value is NULL, only @p size is updated with the required buffer size
+ * including the terminating null byte. Otherwise, the field is copied into
+ * @p value if the provided buffer is large enough.
+ */
+amd_comgr_status_t AMD_COMGR_API
+amd_comgr_hotswap_transpile_result_get_string(
+    amd_comgr_hotswap_transpile_result_t result,
+    amd_comgr_hotswap_transpile_result_string_t field,
+    size_t *size,
+    char *value) AMD_COMGR_VERSION_3_2;
 
 /** @} */
 

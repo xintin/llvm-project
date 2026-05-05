@@ -17,6 +17,9 @@ if config.comgr_spirv_backend_available:
 if config.comgr_spirv_translator_available:
     config.available_features.add("comgr-has-spirv-translator")
 
+if config.comgr_enable_hotswap_transpile:
+    config.available_features.add("comgr-hotswap-transpile")
+
 if platform.system() == "Windows":
     config.available_features.add("system-windows")
 elif platform.system() == "Linux":

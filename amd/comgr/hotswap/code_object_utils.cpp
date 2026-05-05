@@ -5,6 +5,7 @@
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/AMDHSAKernelDescriptor.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -409,51 +410,52 @@ KernelMeta extractKernelMeta(llvm::ArrayRef<uint8_t> elfData,
   return meta;
 }
 
-uint64_t findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
-                                llvm::StringRef kernelName) {
+llvm::Expected<uint64_t> findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
+                                                llvm::StringRef kernelName) {
   auto bufOrErr = llvm::MemoryBuffer::getMemBuffer(
       llvm::StringRef(reinterpret_cast<const char *>(elfData.data()),
                       elfData.size()),
       "", false);
   auto objOrErr = llvm::object::ObjectFile::createELFObjectFile(*bufOrErr);
-  if (!objOrErr) {
-    llvm::errs() << "transpiler: findKernelSymbolOffset: Failed to parse ELF: "
-                 << llvm::toString(objOrErr.takeError()) << "\n";
-    return 0;
-  }
+  if (!objOrErr)
+    return llvm::createStringError(
+        llvm::Twine("findKernelSymbolOffset: Failed to parse ELF: ") +
+        llvm::toString(objOrErr.takeError()));
 
   uint64_t textBase = UINT64_MAX;
   for (const auto &sec : (*objOrErr)->sections()) {
     auto nameOrErr = sec.getName();
-    if (nameOrErr && *nameOrErr == ".text") {
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    if (*nameOrErr == ".text") {
       textBase = sec.getAddress();
       break;
     }
   }
-  if (textBase == UINT64_MAX) {
-    llvm::errs() << "transpiler: findKernelSymbolOffset: no .text section found\n";
-    return 0;
-  }
+  if (textBase == UINT64_MAX)
+    return llvm::createStringError(
+        "findKernelSymbolOffset: no .text section found");
 
   for (const auto &sym : (*objOrErr)->symbols()) {
     auto nameOrErr = sym.getName();
-    if (!nameOrErr) { (void)llvm::toString(nameOrErr.takeError()); continue; }
+    if (!nameOrErr)
+      return nameOrErr.takeError();
     if (*nameOrErr == kernelName) {
       auto addrOrErr = sym.getAddress();
-      if (!addrOrErr) { (void)llvm::toString(addrOrErr.takeError()); continue; }
-      if (*addrOrErr < textBase) {
-        llvm::errs() << "transpiler: findKernelSymbolOffset: symbol address 0x"
-                     << llvm::utohexstr(*addrOrErr) << " < .text base 0x"
-                     << llvm::utohexstr(textBase) << "\n";
-        return 0;
-      }
+      if (!addrOrErr)
+        return addrOrErr.takeError();
+      if (*addrOrErr < textBase)
+        return llvm::createStringError(
+            llvm::Twine("findKernelSymbolOffset: symbol address 0x") +
+            llvm::utohexstr(*addrOrErr) + " < .text base 0x" +
+            llvm::utohexstr(textBase));
       return *addrOrErr - textBase;
     }
   }
 
-  llvm::errs() << "transpiler: findKernelSymbolOffset: symbol '" << kernelName
-               << "' not found, defaulting to offset 0\n";
-  return 0;
+  return llvm::createStringError(
+      llvm::Twine("findKernelSymbolOffset: symbol '") + kernelName +
+      "' not found");
 }
 
 std::string detectIsaFromElf(llvm::ArrayRef<uint8_t> elfData) {

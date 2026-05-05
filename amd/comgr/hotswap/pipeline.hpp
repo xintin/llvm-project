@@ -20,7 +20,7 @@ struct PipelineResult {
   std::string failFormat;
   std::string failDetail;
   uint64_t failOffset = 0;
-  // Successful raises can still carry proof-relevant attribution. Today this
+  // Successful raises can still carry proof-relevant attribution.
   bool usesScratchPrivateSegment = false;
   uint32_t sourcePrivateSegmentFixedSize = 0;
   bool targetEnablePrivateSegment = false;
@@ -92,10 +92,23 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
 ///
 /// Parsed once on first call (`std::getenv("HSA_HOTSWAP_STRICT")`); the
 /// callers (handler implementations) read the flag without round-tripping
-/// through the OS allocator on every instruction. The runner sets
-/// `HSA_HOTSWAP_STRICT=1` in its hotswap `ModeSpec`; `compare_correctness`
-/// and the gtest binary do not, so existing GPU tests stay passing.
+/// through the OS allocator on every instruction. The GPT-OSS runner sets
+/// `HSA_HOTSWAP_STRICT=1`; `compare_correctness` and the gtest binary do
+/// not, so existing GPU tests stay passing.
 bool isStrictMode();
+
+class ScopedStrictMode {
+public:
+  explicit ScopedStrictMode(bool enabled);
+  ~ScopedStrictMode();
+
+  ScopedStrictMode(const ScopedStrictMode &) = delete;
+  ScopedStrictMode &operator=(const ScopedStrictMode &) = delete;
+
+private:
+  bool previousActive = false;
+  bool previousValue = false;
+};
 
 } // namespace transpiler
 

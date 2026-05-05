@@ -93,6 +93,25 @@ set(SOURCES
   src/comgr-unbundle-command.cpp
   src/time-stat/time-stat.cpp)
 
+# Hotswap binary transpiler, opt-in. The hotswap project lives under
+# amd/comgr/hotswap as a private COMGR subproject.
+# When enabled, we compile the comgr-hotswap-transpile.cpp entry point and link
+# the hotswap static library into amd_comgr; when disabled, the
+# amd_comgr_hotswap_transpile API is simply not provided.
+option(COMGR_ENABLE_HOTSWAP_TRANSPILE
+  "Build the hotswap-transpiler-backed amd_comgr_hotswap_transpile entry point" OFF)
+set(COMGR_HOTSWAP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hotswap"
+  CACHE PATH "Path to the hotswap-transpiler CMake subproject")
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  if(NOT EXISTS "${COMGR_HOTSWAP_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "COMGR_ENABLE_HOTSWAP_TRANSPILE=ON but no CMakeLists.txt found at "
+      "COMGR_HOTSWAP_DIR='${COMGR_HOTSWAP_DIR}'. Point COMGR_HOTSWAP_DIR at "
+      "the hotswap source tree or set COMGR_ENABLE_HOTSWAP_TRANSPILE=OFF.")
+  endif()
+  list(APPEND SOURCES src/comgr-hotswap-transpile.cpp)
+endif()
+
 # Add Windows resource file for version info
 if(WIN32)
   # Allow users to override the DLL name via -DCOMGR_DLL_NAME
@@ -171,6 +190,16 @@ target_include_directories(amd_comgr
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# The hotswap CMakeLists exposes the hotswap::transpiler target. Its
+# PUBLIC usage requirements carry the hotswap include root needed for
+# `#include "hotswap/pipeline.hpp"`.
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  add_subdirectory("${COMGR_HOTSWAP_DIR}"
+                   "${CMAKE_CURRENT_BINARY_DIR}/hotswap")
+  target_link_libraries(amd_comgr PRIVATE hotswap::transpiler)
+  target_compile_definitions(amd_comgr PRIVATE COMGR_ENABLE_HOTSWAP_TRANSPILE=1)
+endif()
+
 message("")
 message("------------LLVM_DIR: ${LLVM_DIR}")
 message("---LLVM_INCLUDE_DIRS: ${LLVM_INCLUDE_DIRS}")
@@ -179,6 +208,9 @@ message("-----------Clang_DIR: ${Clang_DIR}")
 message("--CLANG_INCLUDE_DIRS: ${CLANG_INCLUDE_DIRS}")
 message("----LLD_INCLUDE_DIRS: ${LLD_INCLUDE_DIRS}")
 message("---AMDDeviceLibs_DIR: ${AMDDeviceLibs_DIR}")
+if(COMGR_ENABLE_HOTSWAP_TRANSPILE)
+  message("----COMGR_HOTSWAP_DIR: ${COMGR_HOTSWAP_DIR}")
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 

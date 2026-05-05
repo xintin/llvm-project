@@ -98,4 +98,9 @@ global: amd_comgr_action_info_set_vfs;
 
 @amd_comgr_NAME@_3.2 {
 global: amd_comgr_hotswap_rewrite;
+        amd_comgr_hotswap_transpile;
+        amd_comgr_hotswap_transpile_with_options;
+        amd_comgr_destroy_hotswap_transpile_result;
+        amd_comgr_hotswap_transpile_result_get_info;
+        amd_comgr_hotswap_transpile_result_get_string;
 } @amd_comgr_NAME@3.1;

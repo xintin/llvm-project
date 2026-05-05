@@ -3,6 +3,7 @@
 
 #include "code_object_utils.hpp"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace transpiler {
 
@@ -24,6 +25,10 @@ struct KernargLayout {
   // separate runtime pointer, so the offset must be rebased to
   // `byteOffset - implicitArgsBase`.
   int implicitArgsBase = 0;
+  // Source metadata argument layout, including hidden_* entries. Used to
+  // synthesize source-ABI hidden values without depending on target-runtime
+  // implicit-arg layout.
+  llvm::ArrayRef<KernelArgMeta> args;
   // Total kernarg segment size in bytes, copied from the kernel
   // descriptor's `.kernarg_segment_size`. Informational; the lifted
   // kernel's `Function` parameter list drives the backend's
@@ -31,19 +36,38 @@ struct KernargLayout {
   int kernargSegmentSize = 0;
 };
 
-enum class PreloadedHiddenKernargDword {
-  NotHidden,
+enum class SourceHiddenArgKind {
+  None,
   HiddenBlockCountX,
   HiddenBlockCountY,
   HiddenBlockCountZ,
+  HiddenGroupSizeX,
+  HiddenGroupSizeY,
+  HiddenGroupSizeZ,
+  HiddenRemainderX,
+  HiddenRemainderY,
+  HiddenRemainderZ,
+  HiddenGridDims,
   UnsupportedHidden,
 };
 
-// Classify a kernarg-preload dword that lands on a hidden metadata slot.
-// Hardware preloads hidden args exactly like user args; treating them as
-// padding would turn runtime-provided values (e.g. Triton's block count for
-// `tl.num_programs`) into undef. Unsupported hidden kinds must refuse loudly.
-PreloadedHiddenKernargDword classifyPreloadedHiddenKernargDword(
+struct SourceHiddenArgByte {
+  SourceHiddenArgKind kind = SourceHiddenArgKind::None;
+  llvm::StringRef valueKind;
+  int argOffset = 0;
+  int byteOffset = 0;
+
+  bool matched() const { return kind != SourceHiddenArgKind::None; }
+  unsigned byteIndexInArg() const {
+    return static_cast<unsigned>(byteOffset - argOffset);
+  }
+};
+
+// Resolve a byte offset in the source ABI's flat kernarg/hidden-arg metadata
+// view.  Known source hidden args are later synthesized from dispatch state;
+// unsupported hidden args must refuse instead of falling back to target
+// implicitarg layout.
+SourceHiddenArgByte classifySourceHiddenArgByte(
     llvm::ArrayRef<KernelArgMeta> args, int byteOffset);
 
 } // namespace transpiler

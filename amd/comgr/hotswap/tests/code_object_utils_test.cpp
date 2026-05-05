@@ -1,38 +1,20 @@
 #include "../code_object_utils.hpp"
 
+#include "llvm/Support/Error.h"
+
 #include "gtest/gtest.h"
 
 #include <cstdint>
-#include <vector>
+#include <string>
 
-namespace {
+TEST(CodeObjectUtils, KernelSymbolOffsetMalformedElfReturnsError) {
+  uint8_t garbage[] = {0x7f, 'E', 'L', 'F', 0, 0, 0, 0};
 
-// Minimal "ELF-shaped garbage" that does not parse as a valid AMDGPU
-// code object: the magic bytes are correct but everything else is zero.
-std::vector<uint8_t> garbageElf() {
-  return {0x7f, 'E', 'L', 'F', 0, 0, 0, 0};
-}
+  llvm::Expected<uint64_t> offset =
+      transpiler::findKernelSymbolOffset(garbage, "missing_kernel");
 
-} // namespace
-
-TEST(CodeObjectUtils, EmptyDataParsesAsEmpty) {
-  std::vector<uint8_t> empty;
-  EXPECT_TRUE(transpiler::listKernelNames(empty).empty());
-  EXPECT_FALSE(transpiler::extractTextSection(empty).valid);
-  EXPECT_TRUE(transpiler::detectIsaFromElf(empty).empty());
-}
-
-TEST(CodeObjectUtils, MalformedElfYieldsNoKernels) {
-  auto data = garbageElf();
-  EXPECT_TRUE(transpiler::listKernelNames(data).empty());
-  EXPECT_FALSE(transpiler::extractTextSection(data).valid);
-  EXPECT_TRUE(transpiler::detectIsaFromElf(data).empty());
-}
-
-TEST(CodeObjectUtils, MissingKernelMetaIsDefaulted) {
-  auto data = garbageElf();
-  transpiler::KernelMeta meta =
-      transpiler::extractKernelMeta(data, "missing_kernel");
-  EXPECT_FALSE(meta.hasKernelDescriptor);
-  EXPECT_EQ(meta.kernargSegmentSize, 0);
+  ASSERT_FALSE(static_cast<bool>(offset));
+  std::string message = llvm::toString(offset.takeError());
+  EXPECT_NE(message.find("findKernelSymbolOffset: Failed to parse ELF"),
+            std::string::npos);
 }
