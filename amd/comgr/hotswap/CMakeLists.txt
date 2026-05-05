@@ -60,6 +60,9 @@ add_library(hotswap-transpiler STATIC
   setpc_analysis.cpp
   handle_sopp.cpp
   handle_sopc.cpp
+  canonical_op_attrs.cpp
+  handle_sop1.cpp
+  handle_sop2.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
