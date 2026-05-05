@@ -1079,13 +1079,20 @@ static RaiseResult raiseToIRImpl(llvm::ArrayRef<uint8_t> textBytes,
   for (size_t instIdx = 0; instIdx < insts.size(); ++instIdx) {
     const DecodedInst &di = insts[instIdx];
 
+    // If a terminator ended the recovered CFG path and the next decoded
+    // instruction is not a known block leader, that instruction is unreachable
+    // fallthrough bytes (often code after an unconditional branch). Do not emit
+    // it into the already-terminated LLVM block.
+    auto bbIt = offsetToBB.find(di.offset);
+    if (B.GetInsertBlock()->hasTerminator() && bbIt == offsetToBB.end())
+      continue;
+
     // Source-BB boundary handling uses `B.GetInsertBlock()` rather than a
     // tracked `currentBB` so that intra-handler CFG splits (emitUnderExec
     // diamonds under SPE) propagate correctly: fall-through must leave
     // from whatever block the builder is currently at — which is the
     // `spe_skip` tail when the last emission was wrapped — not from the
     // block that started the source instruction.
-    auto bbIt = offsetToBB.find(di.offset);
     if (bbIt != offsetToBB.end() && bbIt->second != B.GetInsertBlock()) {
       BasicBlock *insertBB = B.GetInsertBlock();
       if (!insertBB->hasTerminator())
