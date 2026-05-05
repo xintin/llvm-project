@@ -2,22 +2,21 @@
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=v_min3_u32_kernel 2>/dev/null | %FileCheck %s
 ;
 ; Lift test for v_min3_u32. Pins that the VOP3 ternary unsigned
-; min lowers to the canonical 2-step ICmpULT+Select chain.
+; min lowers to the canonical 2-step llvm.umin.i32 intrinsic chain.
 ; This is the unsigned-min sibling of v_max3_u32 and matches the
 ; AMDGPUumin3 semantic in VOP3Instructions.td:
 ;   umin(umin(a, b), c)
 ;
 ; CHECK-LABEL: define amdgpu_kernel void @v_min3_u32_kernel(
 ;
-; The handler emits two icmp/select pairs with names `vmin3_lo`
+; The handler emits two llvm.umin calls with names `vmin3_lo`
 ; (intermediate `umin(a, b)`) and `vmin3` (final `umin(_, c)`).
-; CHECK: icmp ult i32 %{{[^,]+}}, %{{[^ ]+}}
-; CHECK: select i1 %{{[^,]+}}, i32 %{{[^,]+}}, i32 %{{[^ ]+}}
-; CHECK: icmp ult i32 %{{[^,]+}}, %{{[^ ]+}}
-; CHECK: select i1 %{{[^,]+}}, i32 %{{[^,]+}}, i32 %{{[^ ]+}}
+; CHECK: %vmin3_lo{{[0-9]*}} = call i32 @llvm.umin.i32(i32 %{{[^,]+}}, i32 %{{[^)]+}})
+; CHECK: %vmin3{{[0-9]*}} = call i32 @llvm.umin.i32(i32 %vmin3_lo{{[0-9]*}}, i32 %{{[^)]+}})
 ;
 ; Negative checks: must NOT lift via signed compare or the FP minnum family.
 ; CHECK-NOT: icmp slt
+; CHECK-NOT: call {{.*}}@llvm.smin
 ; CHECK-NOT: call {{.*}}@llvm.minnum
 
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"

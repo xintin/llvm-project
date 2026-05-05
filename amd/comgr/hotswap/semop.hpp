@@ -442,8 +442,8 @@ enum class SemOp : uint16_t {
   V_MINMAX_NUM_F32,
   // VOP3 integer 3-way max/min/median. The .td uses
   // AMDGPU{u,s}{max,min,med}3 SDAG nodes which the backend pattern-
-  // matches; we lift them as the natural 2-step ICmp+Select chain
-  // (no LLVM `*3` IR intrinsic exists). gfx11/gfx12 keep these
+  // matches; we lift unsigned min/max as nested `llvm.{u}min/max` calls
+  // because no LLVM `*3` IR intrinsic exists. gfx11/gfx12 keep these
   // (VOP3Instructions.td:1792-1798).
   V_MAX3_U32, V_MIN3_U32,
   // VOP3 signed-integer median-of-three. Hardware semantic
