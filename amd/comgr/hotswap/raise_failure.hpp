@@ -60,7 +60,7 @@ enum class RaiseFailureReason : uint16_t {
                                    // `buildObstructionReport` walk. See
                                    // hotswap/docs/modrep-predicate-chain.md
                                    // §5 (narrow-O1).
-  // `HSA_SALMON_STRICT=1`-only refusal (see `pipeline.hpp::isStrictMode`).
+  // `HSA_HOTSWAP_STRICT=1`-only refusal (see `pipeline.hpp::isStrictMode`).
   // A handler recognised the SemOp and *would* have lifted it under the
   // existing warn-and-continue policy, but strict mode requires the
   // honest "unsupported, may silently miscompile" verdict instead.
@@ -189,7 +189,7 @@ struct RaiseFailure {
   static RaiseFailure crossWaveRewriteOracleDisagreement(
       llvm::StringRef kernelName, const llvm::Twine &detail);
 
-  // `HSA_SALMON_STRICT=1` refusal. `site` is a short stable label
+  // `HSA_HOTSWAP_STRICT=1` refusal. `site` is a short stable label
   // (e.g. `"HWREG_MODE_write"`, `"implicitarg.ptr"`) that callers can
   // bucket on without parsing `detail`; `detail` carries the human-readable
   // explanation of *why*

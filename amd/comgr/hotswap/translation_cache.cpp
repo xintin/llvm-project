@@ -14,8 +14,6 @@
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <cstdlib>
-#include <cstring>
 #include <dlfcn.h>
 #include <optional>
 #include <string>
@@ -56,16 +54,6 @@ struct KeyData {
   std::vector<std::string> kernelNames;
   std::string error;
 };
-
-std::string envString(const char *name) {
-  const char *value = std::getenv(name);
-  return value ? std::string(value) : std::string();
-}
-
-bool envEnabled(const char *name) {
-  const char *value = std::getenv(name);
-  return value && value[0] && std::strcmp(value, "0") != 0;
-}
 
 std::string hexU32(uint32_t value) {
   std::string out;
@@ -254,7 +242,7 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   appendKeyField(material, "enable_writelane_rewrite",
                  request.enableWritelaneRewrite);
   appendKeyField(material, "enable_wave_native", request.enableWaveNative);
-  appendKeyField(material, "salmon_build_identity", data.buildIdentity);
+  appendKeyField(material, "hotswap_build_identity", data.buildIdentity);
   appendKeyField(material, "llc_identity", data.llcIdentity);
   appendKeyField(material, "llvm_mc_identity", data.llvmMcIdentity);
   appendKeyField(material, "lld_identity", data.lldIdentity);
@@ -263,26 +251,31 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   return data;
 }
 
-std::string cacheRoot() { return envString("HSA_SALMON_CACHE_DIR"); }
-
-bool cacheDisabledByEnv() {
-  return envEnabled("HSA_SALMON_CACHE_DISABLE") || cacheRoot().empty();
+std::string cacheRoot(const TranslationCacheRequest &request) {
+  return request.cacheDirectory;
 }
 
-std::string cacheSubdir(llvm::StringRef key) {
-  llvm::SmallString<256> path(cacheRoot());
+bool cacheDisabledByPolicy(const TranslationCacheRequest &request) {
+  return request.cacheDisabled || cacheRoot(request).empty();
+}
+
+std::string cacheSubdir(const TranslationCacheRequest &request,
+                        llvm::StringRef key) {
+  llvm::SmallString<256> path(cacheRoot(request));
   llvm::sys::path::append(path, key.substr(0, 2));
   return std::string(path);
 }
 
-std::string cacheObjectPath(llvm::StringRef key) {
-  llvm::SmallString<256> path(cacheSubdir(key));
+std::string cacheObjectPath(const TranslationCacheRequest &request,
+                            llvm::StringRef key) {
+  llvm::SmallString<256> path(cacheSubdir(request, key));
   llvm::sys::path::append(path, llvm::Twine(key) + ".hsaco");
   return std::string(path);
 }
 
-std::string cacheMetadataPath(llvm::StringRef key) {
-  llvm::SmallString<256> path(cacheSubdir(key));
+std::string cacheMetadataPath(const TranslationCacheRequest &request,
+                              llvm::StringRef key) {
+  llvm::SmallString<256> path(cacheSubdir(request, key));
   llvm::sys::path::append(path, llvm::Twine(key) + ".json");
   return std::string(path);
 }
@@ -452,7 +445,7 @@ llvm::json::Object metadataObject(const TranslationCacheRequest &request,
       {"strict_mode", request.strictMode},
       {"enable_writelane_rewrite", request.enableWritelaneRewrite},
       {"enable_wave_native", request.enableWaveNative},
-      {"salmon_build_identity", keyData.buildIdentity},
+      {"hotswap_build_identity", keyData.buildIdentity},
       {"llc_identity", keyData.llcIdentity},
       {"llvm_mc_identity", keyData.llvmMcIdentity},
       {"lld_identity", keyData.lldIdentity},
@@ -498,7 +491,7 @@ bool validateMetadata(const TranslationCacheRequest &request,
                         request.enableWritelaneRewrite, reason) ||
       !requireEqualBool(obj, "enable_wave_native", request.enableWaveNative,
                         reason) ||
-      !requireEqualString(obj, "salmon_build_identity",
+      !requireEqualString(obj, "hotswap_build_identity",
                           keyData.buildIdentity, reason) ||
       !requireEqualString(obj, "llc_identity", keyData.llcIdentity, reason) ||
       !requireEqualString(obj, "llvm_mc_identity", keyData.llvmMcIdentity,
@@ -548,6 +541,8 @@ const char *translationCacheStatusString(TranslationCacheStatus status) {
   switch (status) {
   case TranslationCacheStatus::Disabled:
     return "disabled";
+  case TranslationCacheStatus::Bypassed:
+    return "bypassed";
   case TranslationCacheStatus::Miss:
     return "miss";
   case TranslationCacheStatus::Hit:
@@ -574,7 +569,7 @@ std::string sha256Hex(llvm::ArrayRef<uint8_t> data) {
 TranslationCacheLookup lookupTranslationCache(
     const TranslationCacheRequest &request) {
   TranslationCacheLookup lookup;
-  if (cacheDisabledByEnv())
+  if (cacheDisabledByPolicy(request))
     return lookup;
 
   KeyData keyData = buildKeyData(request);
@@ -584,8 +579,8 @@ TranslationCacheLookup lookupTranslationCache(
     lookup.reason = keyData.error;
     return lookup;
   }
-  lookup.metadataPath = cacheMetadataPath(keyData.key);
-  lookup.objectPath = cacheObjectPath(keyData.key);
+  lookup.metadataPath = cacheMetadataPath(request, keyData.key);
+  lookup.objectPath = cacheObjectPath(request, keyData.key);
 
   const bool metadataExists = exists(lookup.metadataPath);
   const bool objectExists = exists(lookup.objectPath);
@@ -651,7 +646,7 @@ TranslationCacheLookup lookupTranslationCache(
 TranslationCacheWrite writeTranslationCache(
     const TranslationCacheRequest &request, const PipelineResult &result) {
   TranslationCacheWrite write;
-  if (cacheDisabledByEnv() || envEnabled("HSA_SALMON_CACHE_READONLY"))
+  if (cacheDisabledByPolicy(request) || request.cacheReadonly)
     return write;
 
   KeyData keyData = buildKeyData(request);
@@ -661,8 +656,8 @@ TranslationCacheWrite writeTranslationCache(
     write.reason = keyData.error;
     return write;
   }
-  write.metadataPath = cacheMetadataPath(keyData.key);
-  write.objectPath = cacheObjectPath(keyData.key);
+  write.metadataPath = cacheMetadataPath(request, keyData.key);
+  write.objectPath = cacheObjectPath(request, keyData.key);
 
   if (!result.success || result.hsaco.empty()) {
     write.status = TranslationCacheStatus::WriteFailed;
@@ -670,7 +665,7 @@ TranslationCacheWrite writeTranslationCache(
     return write;
   }
 
-  std::string dir = cacheSubdir(keyData.key);
+  std::string dir = cacheSubdir(request, keyData.key);
   if (auto ec = llvm::sys::fs::create_directories(dir)) {
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = "failed to create cache directory '" + dir + "': " +
@@ -703,12 +698,11 @@ TranslationCacheWrite writeTranslationCache(
 }
 
 std::string skippedKernelForTranslationCache(
-    llvm::ArrayRef<std::string> kernelNames) {
-  const char *skipEnv = std::getenv("HSA_SALMON_CACHE_SKIP_KERNELS");
-  if (!skipEnv || !skipEnv[0])
+    llvm::ArrayRef<std::string> kernelNames, llvm::StringRef skipList) {
+  if (skipList.empty())
     return "";
 
-  llvm::StringRef remaining(skipEnv);
+  llvm::StringRef remaining(skipList);
   while (!remaining.empty()) {
     auto split = remaining.split(',');
     llvm::StringRef requested = split.first.trim();

@@ -95,13 +95,13 @@ std::string makeSafeBasename(llvm::StringRef kernelName,
 int toolTimeoutSeconds() {
   static const int timeout = [] {
     constexpr int kDefaultTimeoutSeconds = 300;
-    const char *env = std::getenv("HSA_SALMON_TOOL_TIMEOUT_S");
+    const char *env = std::getenv("HSA_HOTSWAP_TOOL_TIMEOUT_S");
     if (!env || !env[0])
       return kDefaultTimeoutSeconds;
     char *end = nullptr;
     long parsed = std::strtol(env, &end, 10);
     if (*end != '\0' || parsed <= 0) {
-      llvm::errs() << "transpiler: invalid HSA_SALMON_TOOL_TIMEOUT_S='"
+      llvm::errs() << "transpiler: invalid HSA_HOTSWAP_TOOL_TIMEOUT_S='"
                    << env << "'; using default " << kDefaultTimeoutSeconds
                    << " seconds\n";
       return kDefaultTimeoutSeconds;
@@ -141,7 +141,7 @@ struct DumpDir {
   bool persistent = false;
 
   DumpDir() {
-    static const char *envDir = std::getenv("HSA_SALMON_DUMP_DIR");
+    static const char *envDir = std::getenv("HSA_HOTSWAP_DUMP_DIR");
     if (envDir && envDir[0]) {
       persistent = true;
       path = envDir;
@@ -189,17 +189,35 @@ struct DumpDir {
 
 } // anonymous namespace
 
+static thread_local bool StrictModeOverrideActive = false;
+static thread_local bool StrictModeOverrideValue = false;
+
+ScopedStrictMode::ScopedStrictMode(bool enabled)
+    : previousActive(StrictModeOverrideActive),
+      previousValue(StrictModeOverrideValue) {
+  StrictModeOverrideActive = true;
+  StrictModeOverrideValue = enabled;
+}
+
+ScopedStrictMode::~ScopedStrictMode() {
+  StrictModeOverrideActive = previousActive;
+  StrictModeOverrideValue = previousValue;
+}
+
 bool isStrictMode() {
+  if (StrictModeOverrideActive)
+    return StrictModeOverrideValue;
+
   // Parsed once on first call. The handler implementations call this on
   // every relevant instruction, so going through the OS allocator
   // (`std::getenv`) repeatedly would be wasteful; the result also cannot
   // change inside a process because the env var is read once at the
   // first transpile and reused for the rest of the process lifetime.
   // Treats any non-empty value as enabled to keep the runner side
-  // (`HSA_SALMON_STRICT=1`) and the pipeline side decoupled — a future
-  // shell that writes `HSA_SALMON_STRICT=true` still works.
+  // (`HSA_HOTSWAP_STRICT=1`) and the pipeline side decoupled; a future
+  // shell that writes `HSA_HOTSWAP_STRICT=true` still works.
   static const bool s_strict = []() {
-    const char *v = std::getenv("HSA_SALMON_STRICT");
+    const char *v = std::getenv("HSA_HOTSWAP_STRICT");
     return v && v[0] != '\0';
   }();
   return s_strict;
@@ -280,7 +298,7 @@ static bool raiseAndCompileKernel(const TextSection &text,
   if (!writeFile(irPath, raised.irText))
     return false;
 
-  static const char *s_dumpInput = std::getenv("HSA_SALMON_DUMP_INPUT");
+  static const char *s_dumpInput = std::getenv("HSA_HOTSWAP_DUMP_INPUT");
   if (s_dumpInput && s_dumpInput[0] == '1' && !raised.disasmText.empty())
     writeFile(tmpDir.filePath(fileStem + ".dis"), raised.disasmText);
 
@@ -366,7 +384,7 @@ PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
     return result;
 
   {
-    static const char *s_dumpInput = std::getenv("HSA_SALMON_DUMP_INPUT");
+    static const char *s_dumpInput = std::getenv("HSA_HOTSWAP_DUMP_INPUT");
     if (s_dumpInput && s_dumpInput[0] == '1')
       writeFile(tmpDir.filePath("input.co"), codeObjectData);
   }
@@ -423,7 +441,7 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
   if (!tmpDir.valid)
     return result;
 
-  static const char *s_dumpInput = std::getenv("HSA_SALMON_DUMP_INPUT");
+  static const char *s_dumpInput = std::getenv("HSA_HOTSWAP_DUMP_INPUT");
   if (s_dumpInput && s_dumpInput[0] == '1')
     writeFile(tmpDir.filePath("input.co"), codeObjectData);
 

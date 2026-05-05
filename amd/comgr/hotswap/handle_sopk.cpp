@@ -425,7 +425,7 @@ HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
       return hr;
     }
     if (policy.write == HwregWrite::WarnDrop) {
-      // Strict mode (`HSA_SALMON_STRICT=1`, see pipeline.hpp) refuses
+      // Strict mode (`HSA_HOTSWAP_STRICT=1`, see pipeline.hpp) refuses
       // these writes structurally instead of warn-and-continue. The
       // refusal is the honest answer for any caller (e.g. the corpus
       // runner) that wants UNSUPPORTED verdicts in place of latent
@@ -436,7 +436,7 @@ HandlerResult handleSOPK(RaiseContext &ctx, const DecodedInst &di,
         errs() << "transpiler: " << di.mnemonic
                << " writes HWREG id=" << hwregId
                << " (MODE / FP-state-bearing register) — refusing under "
-                  "HSA_SALMON_STRICT. Dropping the write would silently "
+                  "HSA_HOTSWAP_STRICT. Dropping the write would silently "
                   "change FP rounding / denormal / IEEE / FTZ semantics if "
                   "downstream compute consumes those bits.\n";
         hr.failure = RaiseFailure::strictUnsafeLowering(

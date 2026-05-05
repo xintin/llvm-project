@@ -1,6 +1,6 @@
 ; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
 ; RUN:   && %raise_cli %t.hsaco --target-isa=gfx942 --emit-ir=scratch_private_segment_kernel 2>&1 | %FileCheck %s --check-prefix=IR
-; RUN: rm -rf %t.dump && HSA_SALMON_DUMP_DIR=%t.dump %raise_cli %t.hsaco --target-isa=gfx942 --write-hsaco=%t.out --kernel=scratch_private_segment_kernel 2>&1 | %FileCheck %s --check-prefix=PIPE
+; RUN: rm -rf %t.dump && HSA_HOTSWAP_DUMP_DIR=%t.dump %raise_cli %t.hsaco --target-isa=gfx942 --write-hsaco=%t.out --kernel=scratch_private_segment_kernel 2>&1 | %FileCheck %s --check-prefix=PIPE
 ; RUN: %FileCheck %s --check-prefix=ASM < %t.dump/salmon-*/scratch_private_segment_kernel.s
 ;
 ; Focused positive fixture for FLAT scratch/private-memory translation.

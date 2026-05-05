@@ -19,14 +19,19 @@ struct TranslationCacheRequest {
   std::string targetIsa;
   std::string codeIsa;
   std::string hotswapRulesPath;
+  std::string cacheDirectory;
+  std::string cacheSkipKernels;
   int origMach = -1;
   bool enableWritelaneRewrite = true;
   bool enableWaveNative = true;
   bool strictMode = false;
+  bool cacheDisabled = true;
+  bool cacheReadonly = false;
 };
 
 enum class TranslationCacheStatus {
   Disabled,
+  Bypassed,
   Miss,
   Hit,
   Invalid,
@@ -60,7 +65,7 @@ TranslationCacheWrite writeTranslationCache(
     const TranslationCacheRequest &request, const PipelineResult &result);
 
 std::string skippedKernelForTranslationCache(
-    llvm::ArrayRef<std::string> kernelNames);
+    llvm::ArrayRef<std::string> kernelNames, llvm::StringRef skipList);
 
 std::string sha256Hex(llvm::ArrayRef<uint8_t> data);
 

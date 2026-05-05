@@ -23,7 +23,7 @@ struct PipelineResult {
   // Successful raises can still carry proof-relevant attribution. Today this
   // records C5 predicate-chain sites accepted under a projection-specific
   // proof (for example single-source-wave MODREP with no active replica
-  // lanes); loader proof logs surface these fields on `salmon_result`.
+  // lanes); loader proof logs surface these fields on `hotswap_result`.
   int c5SuppressedCount = 0;
   std::string c5SuppressionReason;
   bool usesScratchPrivateSegment = false;
@@ -99,8 +99,8 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      bool enableWaveNative = true);
 
 /// Process-global "strict mode" toggle, controlled by the
-/// `HSA_SALMON_STRICT` environment variable. When set to a non-empty
-/// value the salmon transpiler promotes known silent-miscompile sites
+/// `HSA_HOTSWAP_STRICT` environment variable. When set to a non-empty
+/// value the hotswap transpiler promotes known silent-miscompile sites
 /// to honest refusals instead of warning-and-continue. Today this
 /// covers two sites flagged by the corpus runner's `INTEGRATION_GAP.md`
 /// investigation:
@@ -116,12 +116,25 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
 ///     layout produces wrong values for `hidden_block_count_*`,
 ///     `hidden_grid_dims`, etc.
 ///
-/// Parsed once on first call (`std::getenv("HSA_SALMON_STRICT")`); the
+/// Parsed once on first call (`std::getenv("HSA_HOTSWAP_STRICT")`); the
 /// callers (handler implementations) read the flag without round-tripping
-/// through the OS allocator on every instruction. The runner sets
-/// `HSA_SALMON_STRICT=1` in its salmon `ModeSpec`; `compare_correctness`
-/// and the gtest binary do not, so existing GPU tests stay passing.
+/// through the OS allocator on every instruction. The GPT-OSS runner sets
+/// `HSA_HOTSWAP_STRICT=1`; `compare_correctness` and the gtest binary do
+/// not, so existing GPU tests stay passing.
 bool isStrictMode();
+
+class ScopedStrictMode {
+public:
+  explicit ScopedStrictMode(bool enabled);
+  ~ScopedStrictMode();
+
+  ScopedStrictMode(const ScopedStrictMode &) = delete;
+  ScopedStrictMode &operator=(const ScopedStrictMode &) = delete;
+
+private:
+  bool previousActive = false;
+  bool previousValue = false;
+};
 
 } // namespace transpiler
 

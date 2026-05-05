@@ -103,7 +103,7 @@ HandlerResult handleSMEM(RaiseContext &ctx, const DecodedInst &di,
     // lifted kernel must materialise those bytes via the implicit-arg
     // pointer with the offset rebased to `off - implicitArgsBase`.
     //
-    // Strict-mode refusal: in `HSA_SALMON_STRICT=1` the cross-arch
+    // Strict-mode refusal: in `HSA_HOTSWAP_STRICT=1` the cross-arch
     // implicit-arg layout is not yet proven equivalent for every
     // `(source ISA, target ISA)` pair we lift between, so the
     // pipeline refuses to silently substitute a target-ABI implicit

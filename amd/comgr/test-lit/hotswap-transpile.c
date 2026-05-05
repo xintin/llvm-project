@@ -85,3 +85,23 @@
 // RUN: %llvm-objdump --syms %t.gfx942.co \
 // RUN:   | %FileCheck --check-prefix=TGTSYM %s
 // TGTSYM: vecadd
+
+// COM: Focused warm-cache smoke: first run misses and writes, second run hits
+// COM: the same caller-provided cache directory.
+// RUN: rm -rf %t.cache
+// RUN: env HSA_HOTSWAP_CACHE_DIR=%t.cache hotswap-transpile \
+// RUN:                   %S/../hotswap/tests/vecadd_gfx950.co \
+// RUN:                   amdgcn-amd-amdhsa--gfx950 \
+// RUN:                   amdgcn-amd-amdhsa--gfx942 \
+// RUN:   | %FileCheck --check-prefix=CACHEMISS %s
+// CACHEMISS-DAG: cache_hit=0
+// CACHEMISS-DAG: cache_lookup=miss
+// CACHEMISS-DAG: cache_write=success
+// RUN: env HSA_HOTSWAP_CACHE_DIR=%t.cache hotswap-transpile \
+// RUN:                   %S/../hotswap/tests/vecadd_gfx950.co \
+// RUN:                   amdgcn-amd-amdhsa--gfx950 \
+// RUN:                   amdgcn-amd-amdhsa--gfx942 \
+// RUN:   | %FileCheck --check-prefix=CACHEHIT %s
+// CACHEHIT-DAG: cache_hit=1
+// CACHEHIT-DAG: cache_lookup=hit
+// CACHEHIT-DAG: cache_write=not_attempted
