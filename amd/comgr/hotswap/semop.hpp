@@ -519,6 +519,11 @@ enum class SemOp : uint16_t {
 
   // -- VOP2/VOP3 FP64 --
   V_ADD_F64, V_MUL_F64, V_FMA_F64, V_FMAC_F64,
+  // gfx12+ IEEE-754 maximumNumber/minimumNumber f64. LLVM names the pseudos
+  // `V_{MAX,MIN}_NUM_F64`; assembler mnemonics are `v_{max,min}_f64` on
+  // gfx12/gfx1250. Semantics prefer a numeric operand over NaN, matching
+  // LLVM's `maxnum` / `minnum` intrinsic contract.
+  V_MAX_NUM_F64, V_MIN_NUM_F64,
   // VOP1 FP64. v_rcp_f64 is a TRANS-class transcendental (see
   // VOP1Instructions.td: `let TRANS = 1, SchedRW = [WriteTrans64]`),
   // not a true reciprocal — hardware returns a ~26-bit accurate

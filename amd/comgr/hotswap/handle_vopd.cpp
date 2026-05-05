@@ -3,6 +3,7 @@
 #include "semop.hpp"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -23,6 +24,11 @@ using namespace llvm;
 namespace transpiler {
 
 namespace {
+
+struct PendingVopdWrite {
+  ParsedReg dst;
+  Value *value = nullptr;
+};
 
 ParsedReg applyVopdVGPRMsb(const RaiseContext &ctx, ParsedReg pr,
                            unsigned slot) {
@@ -54,14 +60,19 @@ Value *applyVopdSourceModifiers(RaiseContext &ctx, Value *v,
   if (modifiers == 0)
     return v;
   bool isI32 = v->getType() == ctx.i32Ty;
+  bool isI64 = v->getType() == ctx.i64Ty;
   if (isI32)
     v = ctx.B.CreateBitCast(v, ctx.f32Ty);
+  if (isI64)
+    v = ctx.B.CreateBitCast(v, Type::getDoubleTy(ctx.C));
   if (modifiers & 2)
     v = ctx.B.CreateUnaryIntrinsic(Intrinsic::fabs, v, nullptr, "vopd_abs");
   if (modifiers & 1)
     v = ctx.B.CreateFNeg(v, "vopd_neg");
   if (isI32)
     v = ctx.B.CreateBitCast(v, ctx.i32Ty);
+  if (isI64)
+    v = ctx.B.CreateBitCast(v, ctx.i64Ty);
   return v;
 }
 
@@ -115,6 +126,42 @@ Value *readVopdSource(RaiseContext &ctx, const DecodedInst::VopdSource &src,
   return applyVopdSourceModifiers(ctx, v, src.modifiers);
 }
 
+Value *readVopdSource64(RaiseContext &ctx, const DecodedInst::VopdSource &src,
+                        unsigned srcSlot, const DecodedInst &di,
+                        HandlerResult &hr) {
+  Value *v = nullptr;
+  auto parsed = [&](ParsedReg::Kind kind) {
+    ParsedReg pr;
+    pr.kind = kind;
+    pr.baseIdx = src.baseIdx;
+    pr.width = src.width;
+    return applyVopdVGPRMsb(ctx, pr, srcSlot);
+  };
+
+  switch (src.kind) {
+  case DecodedInst::VopdSource::Kind::None:
+    return nullptr;
+  case DecodedInst::VopdSource::Kind::Imm:
+    v = ConstantInt::get(ctx.i64Ty, static_cast<uint64_t>(src.imm));
+    break;
+  case DecodedInst::VopdSource::Kind::VGPR:
+    v = ctx.regs.readReg64(ctx.B, parsed(ParsedReg::VGPR));
+    break;
+  case DecodedInst::VopdSource::Kind::AGPR:
+    v = ctx.regs.readReg64(ctx.B, parsed(ParsedReg::AGPR));
+    break;
+  case DecodedInst::VopdSource::Kind::SGPR:
+    v = ctx.regs.loadSGPR64(ctx.B, src.baseIdx);
+    break;
+  default:
+    hr.failure = RaiseFailure::unsupportedShape(
+        di, "VOPD", "VOPD f64 component source is not a 64-bit scalar/vector source");
+    return nullptr;
+  }
+
+  return applyVopdSourceModifiers(ctx, v, src.modifiers);
+}
+
 Value *readVopdCond(RaiseContext &ctx, const DecodedInst &di,
                     const DecodedInst::VopdSource &src, HandlerResult &hr) {
   if (src.kind != DecodedInst::VopdSource::Kind::VCC &&
@@ -152,15 +199,30 @@ bool requireVopdSources(const DecodedInst::VopdHalf &half, unsigned n,
   return false;
 }
 
+bool requireVopdRegWidth(const DecodedInst &di, const char *what,
+                         unsigned width, unsigned minWidth,
+                         HandlerResult &hr) {
+  if (width >= minWidth)
+    return true;
+  hr.failure = RaiseFailure::unsupportedShape(
+      di, "VOPD", (Twine("VOPD ") + what + " is narrower than " +
+                   Twine(minWidth) + " dwords")
+                      .str());
+  return false;
+}
+
 bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
                    const DecodedInst::VopdHalf &half,
-                   SmallVectorImpl<std::pair<ParsedReg, Value *>> &writes,
+                   SmallVectorImpl<PendingVopdWrite> &writes,
                    HandlerResult &hr) {
   ParsedReg dst = applyVopdVGPRMsb(
       ctx, ctx.parseReg(half.dstReg, /*mciOpIdx=*/-1),
       /*slot=*/3);
   auto queue = [&](Value *v) {
-    writes.emplace_back(dst, v);
+    // VOPD destination operands name the low VGPR slot even for 64-bit
+    // components. A 64-bit commit writes [baseIdx, baseIdx+1] through the
+    // register file helper below, so dst.width is not a reliable arity check.
+    writes.push_back(PendingVopdWrite{dst, v});
     return true;
   };
   auto lowerBitOp3 = [&]() {
@@ -256,6 +318,51 @@ bool lowerVopdHalf(RaiseContext &ctx, const DecodedInst &di,
                                           {ctx.f32Ty});
     return queue(ctx.B.CreateBitCast(
         ctx.B.CreateCall(fma, {s0, s1, s2}, "vopd_fma"), ctx.i32Ty));
+  }
+  case SemOp::V_MUL_F64:
+  case SemOp::V_ADD_F64:
+  case SemOp::V_MAX_NUM_F64:
+  case SemOp::V_MIN_NUM_F64:
+  case SemOp::V_FMA_F64: {
+    unsigned numSrcs = half.semOp == SemOp::V_FMA_F64 ? 3 : 2;
+    if (!requireVopdSources(half, numSrcs, di, hr)) return false;
+    for (unsigned i = 0; i < numSrcs; ++i) {
+      if (half.src[i].kind != DecodedInst::VopdSource::Kind::Imm &&
+          !requireVopdRegWidth(di, "f64 source", half.src[i].width, 2, hr))
+        return false;
+    }
+    auto *f64Ty = Type::getDoubleTy(ctx.C);
+    Value *s0 = readVopdSource64(ctx, half.src[0], 0, di, hr);
+    if (!s0) return false;
+    Value *s1 = readVopdSource64(ctx, half.src[1], 1, di, hr);
+    if (!s1) return false;
+    s0 = ctx.B.CreateBitCast(s0, f64Ty);
+    s1 = ctx.B.CreateBitCast(s1, f64Ty);
+
+    Value *res = nullptr;
+    if (half.semOp == SemOp::V_MUL_F64) {
+      res = ctx.B.CreateFMul(s0, s1, "vopd_fmul_f64");
+    } else if (half.semOp == SemOp::V_ADD_F64) {
+      res = ctx.B.CreateFAdd(s0, s1, "vopd_fadd_f64");
+    } else if (half.semOp == SemOp::V_MAX_NUM_F64 ||
+               half.semOp == SemOp::V_MIN_NUM_F64) {
+      Intrinsic::ID id = half.semOp == SemOp::V_MAX_NUM_F64
+                             ? Intrinsic::maxnum
+                             : Intrinsic::minnum;
+      Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, id, {f64Ty});
+      const char *name = half.semOp == SemOp::V_MAX_NUM_F64
+                             ? "vopd_fmaxnum_f64"
+                             : "vopd_fminnum_f64";
+      res = ctx.B.CreateCall(fn, {s0, s1}, name);
+    } else {
+      Value *s2 = readVopdSource64(ctx, half.src[2], 2, di, hr);
+      if (!s2) return false;
+      s2 = ctx.B.CreateBitCast(s2, f64Ty);
+      Function *fma = Intrinsic::getOrInsertDeclaration(&ctx.M, Intrinsic::fma,
+                                                        {f64Ty});
+      res = ctx.B.CreateCall(fma, {s0, s1, s2}, "vopd_fma_f64");
+    }
+    return queue(ctx.B.CreateBitCast(res, ctx.i64Ty));
   }
   case SemOp::V_FMAMK_F32:
   case SemOp::V_FMAAK_F32: {
@@ -365,7 +472,7 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
     return hr;
   }
 
-  SmallVector<std::pair<ParsedReg, Value *>, 4> pendingVGPRWrites;
+  SmallVector<PendingVopdWrite, 4> pendingVGPRWrites;
   bool xOk = lowerVopdHalf(ctx, di, di.vopd[AMDGPU::VOPD::ComponentIndex::X],
                            pendingVGPRWrites, hr);
   bool yOk = xOk && lowerVopdHalf(
@@ -376,8 +483,12 @@ HandlerResult handleVOPD(RaiseContext &ctx, const DecodedInst &di,
 
   // VOPD executes as a paired issue packet: both halves read pre-instruction
   // register state. Commit writes only after both halves are decoded/lifted.
-  for (const auto &w : pendingVGPRWrites)
-    ctx.writeReg32(w.first, w.second);
+  for (const auto &w : pendingVGPRWrites) {
+    if (w.value->getType()->getPrimitiveSizeInBits() == 64)
+      ctx.writeReg64(w.dst, w.value);
+    else
+      ctx.writeReg32(w.dst, w.value);
+  }
   hr.handled = true;
   return hr;
 }
