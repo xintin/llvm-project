@@ -125,3 +125,20 @@ TEST(OpcodeMap, Gfx1250CvtScalef32Pk8Fp8F32RealOpcodeMapsToCanonicalOp) {
   EXPECT_EQ(map.lookup(llvm::AMDGPU::V_CVT_SCALEF32_PK8_FP8_F32_e64_gfx1250),
             transpiler::CanonicalOp::V_CVT_SCALEF32_PK8_FP8_F32);
 }
+
+TEST(OpcodeMap, Gfx1250Maximum3Minimum3F32RealOpcodesMapToCanonicalOps) {
+  ensureAMDGPURegistered();
+
+  transpiler::MCState state;
+  ASSERT_TRUE(transpiler::initMCState(state, "gfx1250"));
+
+  transpiler::OpcodeMap map;
+  map.build(*state.instrInfo);
+
+  // V_MAXIMUM3_F32 / V_MINIMUM3_F32: gfx11+/gfx12 ternary IEEE-754
+  // NaN-propagating max/min.  HasMinimum3Maximum3F32 in AMDGPU.td:194.
+  EXPECT_EQ(map.lookup(llvm::AMDGPU::V_MAXIMUM3_F32_e64_gfx12),
+            transpiler::CanonicalOp::V_MAXIMUM3_F32);
+  EXPECT_EQ(map.lookup(llvm::AMDGPU::V_MINIMUM3_F32_e64_gfx12),
+            transpiler::CanonicalOp::V_MINIMUM3_F32);
+}

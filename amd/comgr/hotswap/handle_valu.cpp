@@ -1739,6 +1739,30 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // IEEE-754 2019 ternary maximum: NaN-propagating 3-source reduction.
+  // Same shape as V_MAX3_F32 above but uses Intrinsic::maximum (NaN-
+  // propagating) instead of Intrinsic::maxnum (NaN-pruning), matching
+  // the gfx12 v_maximum3_f32 / v_minimum3_f32 hardware semantics.
+  if (sop == CanonicalOp::V_MAXIMUM3_F32 ||
+      sop == CanonicalOp::V_MINIMUM3_F32) {
+    Value *s0 = op.srcF(0), *s1 = op.srcF(1), *s2 = op.srcF(2);
+    if (s0->getType() != ctx.f32Ty) s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty);
+    if (s1->getType() != ctx.f32Ty) s1 = ctx.B.CreateBitCast(s1, ctx.f32Ty);
+    if (s2->getType() != ctx.f32Ty) s2 = ctx.B.CreateBitCast(s2, ctx.f32Ty);
+    Intrinsic::ID intrId = (sop == CanonicalOp::V_MAXIMUM3_F32)
+                               ? Intrinsic::maximum
+                               : Intrinsic::minimum;
+    const char *outName =
+        (sop == CanonicalOp::V_MAXIMUM3_F32) ? "fmaximum3" : "fminimum3";
+    Function *fn = Intrinsic::getOrInsertDeclaration(&ctx.M, intrId,
+                                                     {ctx.f32Ty});
+    Value *r01 = ctx.B.CreateCall(fn, {s0, s1});
+    ctx.writeReg32(op.dst(), ctx.B.CreateBitCast(
+                                  ctx.B.CreateCall(fn, {r01, s2}, outName),
+                                  ctx.i32Ty));
+    hr.handled = true;
+    return hr;
+  }
   // VOP3 v_minmax_num_f32: dst = maxnum(minnum(s0, s1), s2).
   // gfx11 emitted this as v_minmax_f32; gfx12 renamed it to
   // v_minmax_num_f32 once the IEEE-2019 NaN-propagating

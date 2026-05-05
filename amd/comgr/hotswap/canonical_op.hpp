@@ -462,6 +462,14 @@ enum class CanonicalOp : uint16_t {
   V_MAX_NUM_F32, V_MIN_NUM_F32,
   // IEEE-754 2019 maximum/minimum: propagate NaN (distinct from maxnum/minnum).
   V_MAXIMUM_F32, V_MINIMUM_F32,
+  // IEEE-754 2019 ternary maximum/minimum: NaN-propagating 3-source
+  // reduction.  gfx11+/gfx12 (`HasMinimum3Maximum3F32` feature in
+  // AMDGPU.td:194; VOP3 opcodes 0x22e/0x22f).  Lowered to chained
+  // `llvm.maximum`/`llvm.minimum` calls -- llc on gfx950 selects
+  // `v_max3_f32`/`v_min3_f32` (the maxnum/minnum ternaries) when no
+  // NaN propagation is required, or expands to two 2-source IEEE
+  // calls when it is.
+  V_MAXIMUM3_F32, V_MINIMUM3_F32,
   V_DIV_FIXUP_F32, V_DIV_FMAS_F32, V_DIV_SCALE_F32,
   // Mixed-precision FMA, VOP3P (VOP3PInstructions.td:109). Both
   // variants take three sources and reduce to

@@ -403,6 +403,13 @@ static const Entry kCanonTable[] = {
     // while maxnum/minnum return the non-NaN operand.
     E(V_MAXIMUM_F32_e64, V_MAXIMUM_F32),
     E(V_MINIMUM_F32_e64, V_MINIMUM_F32),
+    // IEEE-754 2019 ternary NaN-propagating max/min (gfx11+/gfx12 only,
+    // gated by `HasMinimum3Maximum3F32` in AMDGPU.td:194).  Lowered as a
+    // chain of two 2-source `llvm.maximum`/`llvm.minimum` calls in
+    // handle_valu.cpp; llc on gfx950 selects v_max3/v_min3 when NaN
+    // propagation isn't material, or two 2-source ops otherwise.
+    E(V_MAXIMUM3_F32_e64, V_MAXIMUM3_F32),
+    E(V_MINIMUM3_F32_e64, V_MINIMUM3_F32),
     E(V_DIV_FIXUP_F32_e64, V_DIV_FIXUP_F32),
     E(V_DIV_FMAS_F32_e64, V_DIV_FMAS_F32),
     E(V_DIV_SCALE_F32_e64, V_DIV_SCALE_F32),

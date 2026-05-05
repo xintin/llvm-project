@@ -227,6 +227,18 @@ bool isIntrinsicVGPRSafePropagator(Intrinsic::ID id) {
   case Intrinsic::sqrt:
   case Intrinsic::maxnum:
   case Intrinsic::minnum:
+  // IEEE-754 2019 NaN-propagating max/min.  Same per-lane VGPR-only
+  // operand shape as maxnum/minnum (the only semantic delta is NaN
+  // propagation, which is handled inside the VALU expansion on every
+  // arch we lower to -- gfx9 family expands to a v_max + NaN-fixup
+  // VALU sequence, gfx12 has native v_maximum/v_minimum).  No
+  // SGPR-forced operand in any codegen path; safe to whitelist as a
+  // VGPRSafePropagator pass-through, identical to maxnum/minnum.
+  // Used by the v_maximum3_f32 / v_minimum3_f32 handlers in
+  // handle_valu.cpp (gfx12 ternary IEEE max/min lowered as chained
+  // 2-source maximum/minimum).
+  case Intrinsic::maximum:
+  case Intrinsic::minimum:
   case Intrinsic::fabs:
   case Intrinsic::exp2:
   case Intrinsic::log2:
