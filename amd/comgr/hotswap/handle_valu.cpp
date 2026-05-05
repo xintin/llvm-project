@@ -780,10 +780,80 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  if (sop == SemOp::V_MAD_I32_I24) {
+    // Signed 24-bit MAD: multiply sign-extended low-24 src0/src1 and add the
+    // full i32 src2. The unclamped form intentionally stays in i32 IR so it
+    // preserves the hardware's low-32-bit wraparound. The clamped form widens
+    // only to detect overflow before saturating to signed i32 bounds.
+    // V_MAD_U32_U24 clamp is a separate sibling contract; add it when a corpus
+    // kernel actually surfaces that shape.
+    Value *a = ctx.B.CreateAShr(ctx.B.CreateShl(op.src(0), 8), 8);
+    Value *b = ctx.B.CreateAShr(ctx.B.CreateShl(op.src(1), 8), 8);
+    bool clamp = false;
+    int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                              AMDGPU::OpName::clamp);
+    if (clampIdx >= 0) {
+      if (!di.isImm(static_cast<unsigned>(clampIdx))) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3", "v_mad_i32_i24 clamp operand is not an immediate");
+        return hr;
+      }
+      clamp = di.getImm(static_cast<unsigned>(clampIdx)) != 0;
+    }
+    Value *acc = nullptr;
+    if (clamp) {
+      Value *wideA = ctx.B.CreateSExt(a, ctx.i64Ty, "mad_i24_a_wide");
+      Value *wideB = ctx.B.CreateSExt(b, ctx.i64Ty, "mad_i24_b_wide");
+      Value *wideC = ctx.B.CreateSExt(op.src(2), ctx.i64Ty, "mad_i24_c_wide");
+      Value *wide = ctx.B.CreateAdd(
+          ctx.B.CreateMul(wideA, wideB, "mad_i24_mul_wide"), wideC,
+          "mad_i24_wide");
+      Value *lo = ConstantInt::get(ctx.i64Ty, INT32_MIN);
+      Value *hi = ConstantInt::get(ctx.i64Ty, INT32_MAX);
+      wide = ctx.B.CreateSelect(ctx.B.CreateICmpSLT(wide, lo), lo, wide,
+                                "mad_i24_clamp_lo");
+      wide = ctx.B.CreateSelect(ctx.B.CreateICmpSGT(wide, hi), hi, wide,
+                                "mad_i24_clamp");
+      acc = ctx.B.CreateTrunc(wide, ctx.i32Ty, "mad_i24_clamp_i32");
+    } else {
+      acc = ctx.B.CreateAdd(ctx.B.CreateMul(a, b, "mad_i24_mul"), op.src(2),
+                            "mad_i24");
+    }
+    ctx.writeReg32(op.dst(), acc);
+    hr.handled = true;
+    return hr;
+  }
   if (sop == SemOp::V_MAD_U32_U24) {
     Value *a = ctx.B.CreateAnd(op.src(0), ConstantInt::get(ctx.i32Ty, 0xFFFFFF));
     Value *b = ctx.B.CreateAnd(op.src(1), ConstantInt::get(ctx.i32Ty, 0xFFFFFF));
-    ctx.writeReg32(op.dst(), ctx.B.CreateAdd(ctx.B.CreateMul(a, b), op.src(2), "mad24"));
+    bool clamp = false;
+    int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                              AMDGPU::OpName::clamp);
+    if (clampIdx >= 0) {
+      if (!di.isImm(static_cast<unsigned>(clampIdx))) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3", "v_mad_u32_u24 clamp operand is not an immediate");
+        return hr;
+      }
+      clamp = di.getImm(static_cast<unsigned>(clampIdx)) != 0;
+    }
+    Value *res = nullptr;
+    if (clamp) {
+      Value *wideA = ctx.B.CreateZExt(a, ctx.i64Ty, "mad_u24_a_wide");
+      Value *wideB = ctx.B.CreateZExt(b, ctx.i64Ty, "mad_u24_b_wide");
+      Value *wideC = ctx.B.CreateZExt(op.src(2), ctx.i64Ty, "mad_u24_c_wide");
+      Value *wide = ctx.B.CreateAdd(
+          ctx.B.CreateMul(wideA, wideB, "mad_u24_mul_wide"), wideC,
+          "mad_u24_wide");
+      Value *hi = ConstantInt::get(ctx.i64Ty, UINT32_MAX);
+      wide = ctx.B.CreateSelect(ctx.B.CreateICmpUGT(wide, hi), hi, wide,
+                                "mad_u24_clamp");
+      res = ctx.B.CreateTrunc(wide, ctx.i32Ty, "mad_u24_clamp_i32");
+    } else {
+      res = ctx.B.CreateAdd(ctx.B.CreateMul(a, b, "mad24_mul"), op.src(2),
+                            "mad24");
+    }
+    ctx.writeReg32(op.dst(), res);
     hr.handled = true;
     return hr;
   }
