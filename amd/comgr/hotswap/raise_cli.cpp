@@ -97,6 +97,7 @@
 // main() needs the complete types.
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/Error.h"
 
 #include <cctype>
 #include <cstdio>
@@ -320,8 +321,14 @@ int main(int argc, char **argv) {
       }
     }
     auto meta = transpiler::extractKernelMeta(coData, target);
-    uint64_t kernelOffset =
-        transpiler::findKernelSymbolOffset(coData, target);
+    auto kernelOffsetOrErr = transpiler::findKernelSymbolOffset(coData, target);
+    if (!kernelOffsetOrErr) {
+      std::string err = llvm::toString(kernelOffsetOrErr.takeError());
+      std::fprintf(stderr, "raise_cli: kernel '%s' offset lookup failed: %s\n",
+                   target.c_str(), err.c_str());
+      return 1;
+    }
+    uint64_t kernelOffset = *kernelOffsetOrErr;
     auto raised = transpiler::raiseToIR(text.bytes, isa, target, meta,
                                         kernelOffset, targetIsa,
                                         enableWritelaneRewrite,
@@ -432,6 +439,20 @@ int main(int argc, char **argv) {
     }
     std::memset(shm, 0, sizeof(KernelRaiseStats));
 
+    auto kernelOffsetOrErr = transpiler::findKernelSymbolOffset(coData, kName);
+    if (!kernelOffsetOrErr) {
+      std::string err = llvm::toString(kernelOffsetOrErr.takeError());
+      std::fprintf(stderr, "raise_cli: kernel '%s' offset lookup failed: %s\n",
+                   kName.c_str(), err.c_str());
+      ++failKernels;
+      std::printf("FAIL %s -> __kernel_offset__ "
+                  "[KernelSymbolOffsetLookupFailed]\n",
+                  kName.c_str());
+      munmap(shm, sizeof(KernelRaiseStats));
+      continue;
+    }
+    uint64_t kernelOffset = *kernelOffsetOrErr;
+
     pid_t pid = fork();
     if (pid == 0) {
       // Silence the child's stderr: LLVM chatters a lot, and kerneldex
@@ -444,7 +465,7 @@ int main(int argc, char **argv) {
       }
       auto meta = transpiler::extractKernelMeta(coData, kName);
       auto raised = transpiler::raiseToIR(text.bytes, isa, kName, meta,
-                                          /*kernelOffset=*/0, targetIsa,
+                                          kernelOffset, targetIsa,
                                           enableWritelaneRewrite,
                                           enableWaveNative);
       shm->done = true;

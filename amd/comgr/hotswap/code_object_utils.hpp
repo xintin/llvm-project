@@ -3,6 +3,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 
 #include <cstdint>
 #include <string>
@@ -95,8 +96,8 @@ TextSection extractTextSection(llvm::ArrayRef<uint8_t> elfData);
 std::vector<std::string> listKernelNames(llvm::ArrayRef<uint8_t> elfData);
 KernelMeta extractKernelMeta(llvm::ArrayRef<uint8_t> elfData,
                              llvm::StringRef kernelName);
-uint64_t findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
-                                llvm::StringRef kernelName);
+llvm::Expected<uint64_t> findKernelSymbolOffset(llvm::ArrayRef<uint8_t> elfData,
+                                                llvm::StringRef kernelName);
 
 // Read the AMDGPU target ISA name (e.g. "gfx1250", "gfx942") encoded in
 // the ELF e_flags MACH field per

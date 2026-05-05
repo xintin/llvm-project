@@ -5,6 +5,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
@@ -241,7 +242,18 @@ static bool raiseAndCompileKernel(const TextSection &text,
                  << "', using empty metadata\n";
   }
 
-  uint64_t kernelOffset = findKernelSymbolOffset(codeObjectData, kernelName);
+  auto kernelOffsetOrErr = findKernelSymbolOffset(codeObjectData, kernelName);
+  if (!kernelOffsetOrErr) {
+    std::string err = llvm::toString(kernelOffsetOrErr.takeError());
+    llvm::errs() << "transpiler: " << err << "\n";
+    result.failKernel = kernelName;
+    result.failMnemonic = "__kernel_offset__";
+    result.failReason = "KernelSymbolOffsetLookupFailed";
+    result.failFormat = "KernelSymbolOffsetLookupFailed";
+    result.failDetail = err;
+    return false;
+  }
+  uint64_t kernelOffset = *kernelOffsetOrErr;
   LLVM_DEBUG(if (kernelOffset > 0)
     llvm::dbgs() << "transpiler: Kernel '" << kernelName
                  << "' at .text offset 0x" << llvm::utohexstr(kernelOffset)
