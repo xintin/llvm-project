@@ -14,6 +14,8 @@
 #include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <climits>
+
 using namespace llvm;
 
 namespace transpiler {
@@ -128,6 +130,109 @@ HandlerResult handleVALU_VOP3P(RaiseContext &ctx, const DecodedInst &di,
   // Handle op_sel_hi, neg_lo, neg_hi modifiers.
   case SemOp::V_PK_MOV_B32: {
     ctx.writeReg64(op.dst(), op.src64(0));
+    hr.handled = true;
+    return hr;
+  }
+  case SemOp::V_PK_FMA_F16: {
+    if (op.nSrcs() < 3) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P", "v_pk_fma_f16 requires three source operands");
+      return hr;
+    }
+
+    constexpr unsigned KnownPkF16Mods =
+        SISrcMods::NEG | SISrcMods::NEG_HI | SISrcMods::OP_SEL_0 |
+        SISrcMods::OP_SEL_1;
+    unsigned mods[3] = {};
+    for (unsigned i = 0; i < 3; ++i) {
+      unsigned modIdx = di.modMap[i];
+      if (modIdx == UINT_MAX || !di.isImm(modIdx)) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3P",
+            "v_pk_fma_f16 missing immediate srcN_modifiers operand");
+        return hr;
+      }
+      mods[i] = static_cast<unsigned>(di.getImm(modIdx));
+      if ((mods[i] & ~KnownPkF16Mods) != 0) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3P",
+            "v_pk_fma_f16 has unsupported srcN_modifiers bits");
+        return hr;
+      }
+    }
+
+    int clampIdx = AMDGPU::getNamedOperandIdx(di.inst.getOpcode(),
+                                              AMDGPU::OpName::clamp);
+    if (clampIdx < 0 || !di.isImm(static_cast<unsigned>(clampIdx))) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P", "v_pk_fma_f16 missing immediate clamp operand");
+      return hr;
+    }
+    int64_t clampImm = di.getImm(static_cast<unsigned>(clampIdx));
+    if (clampImm != 0 && clampImm != 1) {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3P", "v_pk_fma_f16 clamp operand is not 0 or 1");
+      return hr;
+    }
+
+    for (unsigned i = 0; i < 3; ++i) {
+      unsigned srcIdx = op.srcIdx(i);
+      if (!di.isReg(srcIdx) && !di.isImm(srcIdx)) {
+        hr.failure = RaiseFailure::unsupportedShape(
+            di, "VOP3P",
+            "v_pk_fma_f16 source is neither a register nor an immediate");
+        return hr;
+      }
+    }
+
+    auto *v2f16 = FixedVectorType::get(ctx.f16Ty, 2);
+    auto readPkF16Src = [&](unsigned i) -> Value * {
+      Value *raw = op.src(i);
+      // VSrc_v2f16 immediates are decoded by LLVM MC as the raw 32-bit
+      // packed source bits. Scalar f16 inline constants occupy the low
+      // half; OP_SEL_1 controls whether the high result lane also reads
+      // that low half, matching LLVM's own v_pk_fma_f16 patterns.
+      Value *vec = ctx.B.CreateBitCast(raw, v2f16, "pk_f16_src");
+      Value *natLo = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(0));
+      Value *natHi = ctx.B.CreateExtractElement(vec, static_cast<uint64_t>(1));
+      Value *lo = (mods[i] & SISrcMods::OP_SEL_0) ? natHi : natLo;
+      Value *hi = (mods[i] & SISrcMods::OP_SEL_1) ? natHi : natLo;
+
+      if (mods[i] & SISrcMods::NEG)
+        lo = ctx.B.CreateFNeg(lo, "pk_fma_f16_neg_lo");
+      if (mods[i] & SISrcMods::NEG_HI)
+        hi = ctx.B.CreateFNeg(hi, "pk_fma_f16_neg_hi");
+
+      Value *r = UndefValue::get(v2f16);
+      r = ctx.B.CreateInsertElement(r, lo, static_cast<uint64_t>(0));
+      r = ctx.B.CreateInsertElement(r, hi, static_cast<uint64_t>(1));
+      return r;
+    };
+
+    Value *s0 = readPkF16Src(0);
+    Value *s1 = readPkF16Src(1);
+    Value *s2 = readPkF16Src(2);
+    Function *fmaFn = Intrinsic::getOrInsertDeclaration(
+        &ctx.M, Intrinsic::fma, {v2f16});
+    Value *res = ctx.B.CreateCall(fmaFn, {s0, s1, s2}, "pk_fma_f16");
+
+    if (clampImm != 0) {
+      Function *maxFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::maxnum, {v2f16});
+      Function *minFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::minnum, {v2f16});
+      // AMDGPU clamp is [0, 1] after the arithmetic result; maxnum/minnum
+      // gives the target-independent IR shape used elsewhere in Salmon.
+      Value *zero = ConstantVector::getSplat(
+          ElementCount::getFixed(2), ConstantFP::get(ctx.f16Ty, 0.0));
+      Value *one = ConstantVector::getSplat(
+          ElementCount::getFixed(2), ConstantFP::get(ctx.f16Ty, 1.0));
+      res = ctx.B.CreateCall(maxFn, {res, zero}, "pk_fma_f16_clamp_lo");
+      res = ctx.B.CreateCall(minFn, {res, one}, "pk_fma_f16_clamp");
+    }
+
+    ctx.writeReg32(op.dst(),
+                   ctx.B.CreateBitCast(res, ctx.i32Ty, "pk_fma_f16_pack"));
     hr.handled = true;
     return hr;
   }

@@ -592,6 +592,7 @@ static const Entry kCanonTable[] = {
     E(V_PK_ADD_F32, V_PK_ADD_F32),
     E(V_PK_MUL_F32, V_PK_MUL_F32),
     E(V_PK_FMA_F32, V_PK_FMA_F32),
+    E(V_PK_FMA_F16, V_PK_FMA_F16),
     // LLVM has no `V_PK_MAX_F32`/`V_PK_MIN_F32` pseudo (only F16 variants);
     // leave the matching SemOps unmapped until one appears.
     E(V_PK_MOV_B32, V_PK_MOV_B32),

@@ -82,6 +82,19 @@ TEST(OpcodeMap, Gfx1250Dot4I32IU8RealOpcodeMapsToSemOp) {
             transpiler::SemOp::V_DOT4_I32_IU8);
 }
 
+TEST(OpcodeMap, Gfx1250PkFmaF16RealOpcodeMapsToSemOp) {
+  ensureAMDGPURegistered();
+
+  transpiler::MCState state;
+  ASSERT_TRUE(transpiler::initMCState(state, "gfx1250"));
+
+  transpiler::OpcodeMap map;
+  map.build(*state.instrInfo);
+
+  EXPECT_EQ(map.lookup(llvm::AMDGPU::V_PK_FMA_F16_gfx12),
+            transpiler::SemOp::V_PK_FMA_F16);
+}
+
 TEST(OpcodeMap, Gfx1250MadI32I24RealOpcodeMapsToSemOp) {
   ensureAMDGPURegistered();
 

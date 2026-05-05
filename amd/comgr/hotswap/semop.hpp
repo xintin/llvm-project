@@ -547,6 +547,16 @@ enum class SemOp : uint16_t {
   // -- VOP3P --
   V_PK_ADD_F32, V_PK_MUL_F32, V_PK_FMA_F32,
   V_PK_MAX_F32, V_PK_MIN_F32, V_PK_MOV_B32,
+  // VOP3P packed fused FMA (VOP3PInstructions.td
+  // `V_PK_FMA_F16`, profile VOP_V2F16_V2F16_V2F16_V2F16):
+  //   dst = fma(src0_lane, src1_lane, src2_lane) per `<2 x half>` lane.
+  // The source lane for each output lane is selected by the packed
+  // `srcN_modifiers` bits: OP_SEL_0 selects the source high half for the
+  // low output lane, OP_SEL_1 selects the source high half for the high
+  // output lane, and NEG / NEG_HI negate the low / high source values before
+  // the fused operation. The VOP3P clamp bit clamps the packed f16 result to
+  // [0, 1] after the fused operation.
+  V_PK_FMA_F16,
 
   // VOP3P packed-pair `<2 x i16>` int ops (gfx9+, available on both
   // gfx942 and gfx1250 — same MC encoding family). Operand profile is
