@@ -2,6 +2,7 @@
 #define HOTSWAP_TRANSPILER_RAISE_FAILURE_HPP
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 
 #include <cstdint>
 #include <string>
@@ -17,6 +18,9 @@ struct DecodedInst;
 enum class RaiseFailureReason : uint16_t {
   None = 0,
   UnsupportedOpcode,
+  // A handler matched on CanonicalOp but the specific operand shape /
+  // encoding variant it saw is not yet modelled.
+  UnsupportedShape,
 };
 
 const char *reasonString(RaiseFailureReason r);
@@ -42,6 +46,12 @@ struct RaiseFailure {
   // offset; `format` is the human-readable encoding label.
   static RaiseFailure unsupportedOpcode(const DecodedInst &di,
                                         llvm::StringRef format);
+
+  // Handler recognised the CanonicalOp but refused the specific operand
+  // shape. `di` supplies the mnemonic and source offset.
+  static RaiseFailure unsupportedShape(const DecodedInst &di,
+                                       llvm::StringRef format,
+                                       const llvm::Twine &detail = {});
 };
 
 } // namespace transpiler

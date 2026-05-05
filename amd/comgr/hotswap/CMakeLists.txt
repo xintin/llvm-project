@@ -52,6 +52,12 @@ add_library(hotswap-transpiler STATIC
   canonical_op.cpp
   opcode_map.cpp
   decode.cpp
+  raise_context.cpp
+  reg_file.cpp
+  kernarg_layout.cpp
+  user_sgpr_layout.cpp
+  wave_projection.cpp
+  setpc_analysis.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
@@ -109,6 +115,8 @@ if(HOTSWAP_TRANSPILER_BUILD_TOOLS)
     tests/code_object_utils_test.cpp
     tests/mc_context_inline_srcmgr_test.cpp
     tests/opcode_map_test.cpp
+    tests/kernarg_layout_test.cpp
+    tests/wave_projection_test.cpp
   )
   llvm_update_compile_flags(transpiler_tests)
   target_link_libraries(transpiler_tests

@@ -100,7 +100,7 @@ static const Entry kCanonTable[] = {
     //   * `handle_sopp.cpp`'s generic SOPP no-op arm explicitly
     //     covers them.
     // See the `S_WAIT_ASYNCCNT` / `S_WAIT_TENSORCNT` CanonicalOp doc
-    // block in `semop.hpp` for the cross-target correctness
+    // block in `canonical_op.hpp` for the cross-target correctness
     // argument (IR dataflow carries happens-before after the
     // synchronous `load`+`store` emulation completes).
     E(S_WAIT_ASYNCCNT, S_WAIT_ASYNCCNT),
@@ -215,7 +215,7 @@ static const Entry kCanonTable[] = {
     // CanonicalOp::S_SET_PC_I64 so the handler dispatches uniformly across
     // gfx versions; the new name is the CanonicalOp because that is how the
     // corpus surfaces it (gfx1250 disasm) and what the CanonicalOp enum
-    // comment in semop.hpp documents.
+    // comment in canonical_op.hpp documents.
     E(S_SETPC_B64, S_SET_PC_I64),
     // gfx1250 asm renames `S_SWAPPC_B64` to `s_swap_pc_i64`
     // (SOPInstructions.td:336 declares the SOP1_64 with isCall=1;
@@ -225,7 +225,7 @@ static const Entry kCanonTable[] = {
     // onto CanonicalOp::S_SWAP_PC_I64 so the handler dispatches uniformly
     // across gfx versions; the new name is the CanonicalOp because that
     // is how the corpus surfaces it (gfx1250 disasm) and what the
-    // CanonicalOp enum comment in semop.hpp documents.
+    // CanonicalOp enum comment in canonical_op.hpp documents.
     E(S_SWAPPC_B64, S_SWAP_PC_I64),
     E(S_ABS_I32, S_ABS_I32),
     E(S_SET_VGPR_MSB, S_SET_VGPR_MSB),
@@ -637,7 +637,7 @@ static const Entry kCanonTable[] = {
     // encodings 0x2fa / 0x2fb).  Unlike the older `V_MAD_U64_U32` /
     // `V_MAD_I64_I32` family, these pseudos don't have an `_e64` suffix
     // variant with a carry/overflow sink, so one MCOpcode ↔ one CanonicalOp;
-    // see the `V_MAD_NC_*` block in `semop.hpp` for the semantics
+    // see the `V_MAD_NC_*` block in `canonical_op.hpp` for the semantics
     // description and `handle_valu.cpp`'s handler arm for how the
     // canonical `add(mul(sext/zext s0, sext/zext s1), s2_i64)` lowering
     // re-enters the backend's `SelectMad64_32` pattern matcher on both

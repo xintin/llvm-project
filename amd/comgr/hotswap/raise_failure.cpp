@@ -10,6 +10,8 @@ const char *reasonString(RaiseFailureReason r) {
     return "None";
   case RaiseFailureReason::UnsupportedOpcode:
     return "UnsupportedOpcode";
+  case RaiseFailureReason::UnsupportedShape:
+    return "UnsupportedShape";
   }
   return "UnknownRaiseFailureReason";
 }
@@ -21,6 +23,18 @@ RaiseFailure RaiseFailure::unsupportedOpcode(const DecodedInst &di,
   f.mnemonic = di.mnemonic;
   f.format = format.str();
   f.offset = di.offset;
+  return f;
+}
+
+RaiseFailure RaiseFailure::unsupportedShape(const DecodedInst &di,
+                                            llvm::StringRef format,
+                                            const llvm::Twine &detail) {
+  RaiseFailure f;
+  f.reason = RaiseFailureReason::UnsupportedShape;
+  f.mnemonic = di.mnemonic;
+  f.format = format.str();
+  f.offset = di.offset;
+  f.detail = detail.str();
   return f;
 }
 
