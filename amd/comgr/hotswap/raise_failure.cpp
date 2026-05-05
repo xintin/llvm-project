@@ -12,6 +12,8 @@ const char *reasonString(RaiseFailureReason r) {
     return "UnsupportedOpcode";
   case RaiseFailureReason::UnsupportedShape:
     return "UnsupportedShape";
+  case RaiseFailureReason::StrictUnsafeLowering:
+    return "strict-unsafe-lowering";
   }
   return "UnknownRaiseFailureReason";
 }
@@ -33,6 +35,18 @@ RaiseFailure RaiseFailure::unsupportedShape(const DecodedInst &di,
   f.reason = RaiseFailureReason::UnsupportedShape;
   f.mnemonic = di.mnemonic;
   f.format = format.str();
+  f.offset = di.offset;
+  f.detail = detail.str();
+  return f;
+}
+
+RaiseFailure RaiseFailure::strictUnsafeLowering(const DecodedInst &di,
+                                                llvm::StringRef site,
+                                                const llvm::Twine &detail) {
+  RaiseFailure f;
+  f.reason = RaiseFailureReason::StrictUnsafeLowering;
+  f.mnemonic = di.mnemonic;
+  f.format = site.str();
   f.offset = di.offset;
   f.detail = detail.str();
   return f;

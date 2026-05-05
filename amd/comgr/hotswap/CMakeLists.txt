@@ -63,6 +63,8 @@ add_library(hotswap-transpiler STATIC
   canonical_op_attrs.cpp
   handle_sop1.cpp
   handle_sop2.cpp
+  pipeline.cpp
+  translation_cache.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
@@ -87,6 +89,15 @@ target_include_directories(hotswap-transpiler PRIVATE
 # Public include root so consumers can `#include "hotswap/raiser.hpp"`.
 target_include_directories(hotswap-transpiler PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
+)
+
+# `llc`, `llvm-mc`, `ld.lld` etc. live in the build tree's bin/. The
+# pipeline driver (pipeline.cpp) shells out to them via the
+# `LLVM_TOOLS_DIR` macro at runtime.
+set(HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR "${LLVM_TOOLS_BINARY_DIR}" CACHE PATH
+  "Directory containing llc, llvm-mc, ld.lld, llvm-objdump used by Hotswap")
+target_compile_definitions(hotswap-transpiler PRIVATE
+  LLVM_TOOLS_DIR="${HOTSWAP_TRANSPILER_LLVM_TOOLS_DIR}"
 )
 
 target_link_libraries(hotswap-transpiler
@@ -122,6 +133,8 @@ if(HOTSWAP_TRANSPILER_BUILD_TOOLS)
     tests/opcode_map_test.cpp
     tests/kernarg_layout_test.cpp
     tests/wave_projection_test.cpp
+  
+    tests/translation_cache_test.cpp
   )
   llvm_update_compile_flags(transpiler_tests)
   target_link_libraries(transpiler_tests
