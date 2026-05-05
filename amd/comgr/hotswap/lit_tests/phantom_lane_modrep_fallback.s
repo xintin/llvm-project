@@ -1,0 +1,163 @@
+; RUN: %llvm_mc -mcpu=gfx1250 %s -o %t.o && %ld_lld -shared %t.o -o %t.hsaco \
+; RUN:   && %raise_cli %t.hsaco \
+; RUN:     --target-isa=gfx942 \
+; RUN:     --emit-ir=phantom_lane_modrep_fallback_kernel 2>&1 \
+; RUN:   | %FileCheck %s
+;
+; Regression fence for the phantom-lane → MODREP fallback added in
+; `raiser.cpp`.  The kernel's `__launch_bounds__(32)` drives
+; `max_flat_workgroup_size` to 32 in the gfx1250 HSACO's
+; amdhsa metadata; under the gfx942 (wave64) target the fallback
+; triggers because 32 < 64.  With the fallback in place, raise_cli
+; exits 0, stderr carries the "falling back to
+; ModuloReplicationProjection" diagnostic, and the raised IR
+; contains no `@llvm.amdgcn.init.whole.wave` call (that intrinsic
+; is only emitted by `WaveNativeProjection::emitInitialExec`;
+; MODREP's default `emitInitialExec` returns source-width -1 with
+; no intrinsic call).  See the paired `wmma_phantom_lane_refuse/`
+; fixture for the COMPLEMENT: same launch_bounds but with a WMMA
+; op that DOES trigger the refusal gate in `handle_valu_vop3p.cpp`.
+;
+; Three independent signals the fallback is working correctly:
+
+; 1. The fallback log message names the kernel, the offending
+;    workgroup size, and the target wavefront width.  A regression
+;    that silently drops the fallback would skip this log, and the
+;    downstream signals (#2 + #3) would also change — this check
+;    gives an early, attribution-friendly fence.  The CHECK-SAME
+;    ordering below matches the actual `errs()` emission order
+;    in `raiser.cpp` (kernel-name -> phantom-lane-regime banner ->
+;    max_flat_workgroup_size -> target wavefront width -> falling
+;    back message) so a future reordering is caught, not silently
+;    rewritten.
+; CHECK: phantom-lane regime
+; CHECK-SAME: max_flat_workgroup_size=32
+; CHECK-SAME: target wavefront width=64
+; CHECK-SAME: falling back to ModuloReplicationProjection
+
+; 2. Raise completes cleanly (no refusal, no lift failure).  The
+;    IR-LABEL below catches that — if raise_cli refused, the IR
+;    wouldn't be emitted and the CHECK wouldn't match.
+; CHECK-LABEL: define amdgpu_kernel void @phantom_lane_modrep_fallback_kernel(
+
+; 3. The raised IR must NOT contain `init.whole.wave` — that call
+;    is the WaveNativeProjection's `emitInitialExec` entry-block
+;    side effect, and its absence confirms the projection is MODREP
+;    for this kernel.  A regression that flips the fallback back to
+;    WaveNative would re-introduce the call and this CHECK-NOT
+;    would fire.
+; CHECK-NOT: call i1 @llvm.amdgcn.init.whole.wave
+; CHECK-NOT: call {{.*}} @llvm.amdgcn.init_whole_wave
+
+	.amdgcn_target "amdgcn-amd-amdhsa--gfx1250"
+	.amdhsa_code_object_version 6
+	.text
+	.globl	phantom_lane_modrep_fallback_kernel
+	.p2align	8
+	.type	phantom_lane_modrep_fallback_kernel,@function
+phantom_lane_modrep_fallback_kernel:    ; @phantom_lane_modrep_fallback_kernel
+; %bb.0:
+	s_clause 0x1
+	s_load_b32 s2, s[0:1], 0x1c
+	s_load_b128 s[4:7], s[0:1], 0x0
+	s_wait_xcnt 0x0
+	s_bfe_u32 s0, ttmp6, 0x4000c
+	s_and_b32 s1, ttmp6, 15
+	s_add_co_i32 s0, s0, 1
+	s_getreg_b32 s3, hwreg(HW_REG_IB_STS2, 6, 4)
+	s_mul_i32 s0, ttmp9, s0
+	s_delay_alu instid0(SALU_CYCLE_1) | instskip(SKIP_4) | instid1(SALU_CYCLE_1)
+	s_add_co_i32 s1, s1, s0
+	s_wait_kmcnt 0x0
+	s_and_b32 s2, s2, 0xffff
+	s_cmp_eq_u32 s3, 0
+	s_cselect_b32 s0, ttmp9, s1
+	v_mad_u32 v1, s0, s2, v0
+	global_load_b32 v2, v1, s[4:5] scale_offset
+	s_wait_loadcnt 0x0
+	v_add_nc_u32_e32 v0, v2, v0
+	global_store_b32 v1, v0, s[6:7] scale_offset
+	s_endpgm
+	.section	.rodata,"a",@progbits
+	.p2align	6, 0x0
+	.amdhsa_kernel phantom_lane_modrep_fallback_kernel
+		.amdhsa_kernarg_size 272
+		.amdhsa_user_sgpr_count 2
+		.amdhsa_user_sgpr_kernarg_segment_ptr 1
+		.amdhsa_wavefront_size32 1
+		.amdhsa_system_sgpr_workgroup_id_x 1
+		.amdhsa_next_free_vgpr 3
+		.amdhsa_next_free_sgpr 8
+		.amdhsa_float_denorm_mode_32 3
+		.amdhsa_inst_pref_size 1
+	.end_amdhsa_kernel
+	.text
+	.p2alignl 7, 3214868480
+	.fill 96, 4, 3214868480
+	.text
+	.amdgpu_metadata
+---
+amdhsa.kernels:
+  - .args:
+      - .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         20
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         24
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         28
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         30
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         32
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         34
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         36
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         38
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         56
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         64
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         72
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         80
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 272
+    .max_flat_workgroup_size: 32
+    .name:           phantom_lane_modrep_fallback_kernel
+    .private_segment_fixed_size: 0
+    .sgpr_count:     8
+    .symbol:         phantom_lane_modrep_fallback_kernel.kd
+    .vgpr_count:     3
+    .wavefront_size: 32
+amdhsa.target:   amdgcn-amd-amdhsa--gfx1250
+amdhsa.version: [1, 2]
+...
+
+	.end_amdgpu_metadata

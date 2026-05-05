@@ -404,7 +404,7 @@ enum class CanonicalOp : uint16_t {
   V_CNDMASK_B32,
   V_MUL_LO_U32, V_MUL_HI_U32, V_MUL_HI_I32,
   V_MUL_I32_I24, V_MUL_U32_U24, V_MUL_HI_U32_U24, V_MUL_HI_I32_I24,
-  V_MAD_U32_U24, V_MAD_U32,
+  V_MAD_I32_I24, V_MAD_U32_U24, V_MAD_U32,
   V_ADD3_U32, V_LSHL_ADD_U32, V_ADD_LSHL_U32, V_LSHL_OR_B32, V_AND_OR_B32, V_OR3_B32, V_XAD_U32,
   // VOP3 funnel-shift right: dst = ((src0:src1) >> src2[4:0])[31:0].
   // .td uses the SDAG `fshr` node directly (VOP3Instructions.td:222),
@@ -424,6 +424,11 @@ enum class CanonicalOp : uint16_t {
   // dst op_sel is set so the preserved half survives the
   // read-modify-write.
   V_ADD_NC_U16,
+  // gfx1250 VOP3 add-then-min: umin(uaddsat(src0, src1), src2).
+  // The hardware opcode also carries a VOP3 clamp bit, which is semantically
+  // redundant for this unsigned operation because the result is already in the
+  // U32 representable range.
+  V_ADD_MIN_U32,
   V_BFE_U32, V_BFE_I32, V_BFI_B32, V_PERM_B32,
   V_MBCNT_LO_U32_B32, V_MBCNT_HI_U32_B32,
   V_READLANE_B32, V_WRITELANE_B32,
@@ -437,10 +442,10 @@ enum class CanonicalOp : uint16_t {
   V_MINMAX_NUM_F32,
   // VOP3 integer 3-way max/min/median. The .td uses
   // AMDGPU{u,s}{max,min,med}3 SDAG nodes which the backend pattern-
-  // matches; we lift them as the natural 2-step ICmp+Select chain
-  // (no LLVM `*3` IR intrinsic exists). gfx11/gfx12 keep these
+  // matches; we lift unsigned min/max as nested `llvm.{u}min/max` calls
+  // because no LLVM `*3` IR intrinsic exists. gfx11/gfx12 keep these
   // (VOP3Instructions.td:1792-1798).
-  V_MAX3_U32,
+  V_MAX3_U32, V_MIN3_U32,
   // VOP3 signed-integer median-of-three. Hardware semantic
   // (VOP3Instructions.td:1796 via AMDGPUsmed3 SDAG node):
   //   med3_i32(a, b, c) = smax(smin(a, b), smin(smax(a, b), c))
@@ -504,6 +509,7 @@ enum class CanonicalOp : uint16_t {
   // 16 bits of the multiply, naturally produced by `mul i16`.
   V_ADD_U16, V_SUB_U16, V_SUBREV_U16, V_MUL_LO_U16,
   V_DOT2C_I32_I16, V_DOT4C_I32_I8, V_DOT8C_I32_I4,
+  V_DOT4_I32_IU8,
   V_PK_FMAC_F16,
   V_PACK_B32_F16,
   V_CVT_PK_BF16_F32, V_CVT_PK_BF8_F32, V_CVT_PK_FP8_F32,
@@ -541,6 +547,16 @@ enum class CanonicalOp : uint16_t {
   // -- VOP3P --
   V_PK_ADD_F32, V_PK_MUL_F32, V_PK_FMA_F32,
   V_PK_MAX_F32, V_PK_MIN_F32, V_PK_MOV_B32,
+  // VOP3P packed fused FMA (VOP3PInstructions.td
+  // `V_PK_FMA_F16`, profile VOP_V2F16_V2F16_V2F16_V2F16):
+  //   dst = fma(src0_lane, src1_lane, src2_lane) per `<2 x half>` lane.
+  // The source lane for each output lane is selected by the packed
+  // `srcN_modifiers` bits: OP_SEL_0 selects the source high half for the
+  // low output lane, OP_SEL_1 selects the source high half for the high
+  // output lane, and NEG / NEG_HI negate the low / high source values before
+  // the fused operation. The VOP3P clamp bit clamps the packed f16 result to
+  // [0, 1] after the fused operation.
+  V_PK_FMA_F16,
 
   // VOP3P packed-pair `<2 x i16>` int ops (gfx9+, available on both
   // gfx942 and gfx1250 — same MC encoding family). Operand profile is

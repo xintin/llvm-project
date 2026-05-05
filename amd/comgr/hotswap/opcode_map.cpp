@@ -436,6 +436,9 @@ static const Entry kCanonTable[] = {
     E(V_MUL_U32_U24_e64, V_MUL_U32_U24),
     E(V_MUL_HI_U32_U24_e64, V_MUL_HI_U32_U24),
     E(V_MUL_HI_I32_I24_e64, V_MUL_HI_I32_I24),
+    E(V_MAD_I32_I24_e64, V_MAD_I32_I24),
+    E(V_MAD_I32_I24_e64_gfx11, V_MAD_I32_I24),
+    E(V_MAD_I32_I24_e64_gfx12, V_MAD_I32_I24),
     E(V_MAD_U32_U24_e64, V_MAD_U32_U24),
     E(V_MAD_U32_e64, V_MAD_U32),
     E(V_ADD3_U32_e64, V_ADD3_U32),
@@ -461,6 +464,9 @@ static const Entry kCanonTable[] = {
     // V_ADD_NC_U16_t16_e64 and V_ADD_NC_U16_fake16_e64 onto this
     // base entry automatically, so a single mapping suffices.
     E(V_ADD_NC_U16_e64, V_ADD_NC_U16),
+    // gfx1250 add-then-min VOP3. The real subtarget opcodes canonicalize
+    // through this pseudo via AMDGPU::getMCOpcode-derived tables.
+    E(V_ADD_MIN_U32_e64, V_ADD_MIN_U32),
     E(V_BFE_U32_e64, V_BFE_U32),
     E(V_BFE_I32_e64, V_BFE_I32),
     // gfx6+ VOP3 bit-field insert. Ternary, e64-only (no VOP1/VOP2
@@ -485,10 +491,11 @@ static const Entry kCanonTable[] = {
     // maxnum semantics; both LLVM pseudos canonicalize onto
     // V_MINMAX_F32_e64 so a single mapping suffices.
     E(V_MINMAX_F32_e64, V_MINMAX_NUM_F32),
-    // gfx11/gfx12 VOP3 integer 3-way max (opcode 0x21e, see
-    // VOP3Instructions.td:1795). LLVM only emits the e64 form for
-    // VOP3 ternaries; no DPP variant exists for v_max3_*.
+    // gfx11/gfx12 VOP3 integer 3-way unsigned min/max. DPP/DPP8 modifier
+    // variants canonicalize through the same opcode-map stripping path used by
+    // the other VOP3+DPP entries, so a base e64 row is the semantic key.
     E(V_MAX3_U32_e64, V_MAX3_U32),
+    E(V_MIN3_U32_e64, V_MIN3_U32),
     E(V_MED3_I32_e64, V_MED3_I32),
     // LLVM does not yet expose a `V_MAX3_MAXIMUM_F32` pseudo; leave the
     // `V_MAX3_NUM_F32` CanonicalOp unmapped until it does.
@@ -522,6 +529,9 @@ static const Entry kCanonTable[] = {
     E(V_DOT2C_I32_I16_e64, V_DOT2C_I32_I16),
     E(V_DOT4C_I32_I8_e64, V_DOT4C_I32_I8),
     E(V_DOT8C_I32_I4_e64, V_DOT8C_I32_I4),
+    E(V_DOT4_I32_IU8, V_DOT4_I32_IU8),
+    E(V_DOT4_I32_IU8_gfx11, V_DOT4_I32_IU8),
+    E(V_DOT4_I32_IU8_gfx12, V_DOT4_I32_IU8),
     E(V_PK_FMAC_F16_e64, V_PK_FMAC_F16),
     E(V_MAX_U16_e64, V_MAX_U16),
     E(V_MIN_U16_e64, V_MIN_U16),
@@ -582,6 +592,7 @@ static const Entry kCanonTable[] = {
     E(V_PK_ADD_F32, V_PK_ADD_F32),
     E(V_PK_MUL_F32, V_PK_MUL_F32),
     E(V_PK_FMA_F32, V_PK_FMA_F32),
+    E(V_PK_FMA_F16, V_PK_FMA_F16),
     // LLVM has no `V_PK_MAX_F32`/`V_PK_MIN_F32` pseudo (only F16 variants);
     // leave the matching CanonicalOps unmapped until one appears.
     E(V_PK_MOV_B32, V_PK_MOV_B32),
