@@ -1602,6 +1602,19 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // VOP3 v_min3_u32: 3-way unsigned min, ternary. Symmetric sibling of
+  // V_MAX3_U32 above; the .td pattern is `AMDGPUumin3` =
+  // `umin(umin(a,b), c)`.
+  if (sop == SemOp::V_MIN3_U32) {
+    Value *s0 = op.src(0), *s1 = op.src(1), *s2 = op.src(2);
+    Value *m01 =
+        ctx.B.CreateSelect(ctx.B.CreateICmpULT(s0, s1), s0, s1, "vmin3_lo");
+    ctx.writeReg32(
+        op.dst(),
+        ctx.B.CreateSelect(ctx.B.CreateICmpULT(m01, s2), m01, s2, "vmin3"));
+    hr.handled = true;
+    return hr;
+  }
   // VOP3 v_med3_i32: signed-integer median-of-three.
   // Hardware semantic (VOP3Instructions.td:1796 via AMDGPUsmed3
   // SDAG node) is the standard sort-and-pick-middle for three i32

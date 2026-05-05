@@ -488,10 +488,11 @@ static const Entry kCanonTable[] = {
     // maxnum semantics; both LLVM pseudos canonicalize onto
     // V_MINMAX_F32_e64 so a single mapping suffices.
     E(V_MINMAX_F32_e64, V_MINMAX_NUM_F32),
-    // gfx11/gfx12 VOP3 integer 3-way max (opcode 0x21e, see
-    // VOP3Instructions.td:1795). LLVM only emits the e64 form for
-    // VOP3 ternaries; no DPP variant exists for v_max3_*.
+    // gfx11/gfx12 VOP3 integer 3-way unsigned min/max. DPP/DPP8 modifier
+    // variants canonicalize through the same opcode-map stripping path used by
+    // the other VOP3+DPP entries, so a base e64 row is the semantic key.
     E(V_MAX3_U32_e64, V_MAX3_U32),
+    E(V_MIN3_U32_e64, V_MIN3_U32),
     E(V_MED3_I32_e64, V_MED3_I32),
     // LLVM does not yet expose a `V_MAX3_MAXIMUM_F32` pseudo; leave the
     // `V_MAX3_NUM_F32` SemOp unmapped until it does.

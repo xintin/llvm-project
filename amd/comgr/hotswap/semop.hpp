@@ -445,7 +445,7 @@ enum class SemOp : uint16_t {
   // matches; we lift them as the natural 2-step ICmp+Select chain
   // (no LLVM `*3` IR intrinsic exists). gfx11/gfx12 keep these
   // (VOP3Instructions.td:1792-1798).
-  V_MAX3_U32,
+  V_MAX3_U32, V_MIN3_U32,
   // VOP3 signed-integer median-of-three. Hardware semantic
   // (VOP3Instructions.td:1796 via AMDGPUsmed3 SDAG node):
   //   med3_i32(a, b, c) = smax(smin(a, b), smin(smax(a, b), c))
