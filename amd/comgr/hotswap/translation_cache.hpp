@@ -22,6 +22,8 @@ struct TranslationCacheRequest {
   std::string cacheDirectory;
   std::string cacheSkipKernels;
   int origMach = -1;
+  bool enableWritelaneRewrite = true;
+  bool enableWaveNative = true;
   bool strictMode = false;
   bool cacheDisabled = true;
   bool cacheReadonly = false;

@@ -67,15 +67,23 @@ struct PipelineResult {
 PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
                            llvm::StringRef sourceISA,
                            llvm::StringRef targetISA,
-                           llvm::StringRef kernelName);
+                           llvm::StringRef kernelName,
+                           bool enableWritelaneRewrite = true,
+                           bool enableWaveNative = true);
 
 /// Raise and lower ALL kernels in a code object, producing a single merged
 /// HSACO containing every kernel.  Returns success only if every kernel was
 /// raised and compiled. On raise failure, the `fail*` fields carry the
 /// structured `RaiseFailure` details for proof logs and corpus summaries.
+///
+/// `enableWritelaneRewrite` / `enableWaveNative` plumb through to the
+/// per-kernel `raiseToIR` calls; see `raiser.hpp` for the contract and
+/// the in-tree-debug-only caveat.
 PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      llvm::StringRef sourceISA,
-                                     llvm::StringRef targetISA);
+                                     llvm::StringRef targetISA,
+                                     bool enableWritelaneRewrite = true,
+                                     bool enableWaveNative = true);
 
 /// Process-global "strict mode" toggle, controlled by the
 /// `HSA_HOTSWAP_STRICT` environment variable. When set to a non-empty

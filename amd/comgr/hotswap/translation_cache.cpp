@@ -239,6 +239,9 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   appendKeyField(material, "rules_path", request.hotswapRulesPath);
   appendKeyField(material, "rules_sha256", data.rulesSha256);
   appendKeyField(material, "strict", request.strictMode);
+  appendKeyField(material, "enable_writelane_rewrite",
+                 request.enableWritelaneRewrite);
+  appendKeyField(material, "enable_wave_native", request.enableWaveNative);
   appendKeyField(material, "hotswap_build_identity", data.buildIdentity);
   appendKeyField(material, "llc_identity", data.llcIdentity);
   appendKeyField(material, "llvm_mc_identity", data.llvmMcIdentity);
@@ -440,6 +443,8 @@ llvm::json::Object metadataObject(const TranslationCacheRequest &request,
       {"hotswap_rules_path", request.hotswapRulesPath},
       {"hotswap_rules_sha256", keyData.rulesSha256},
       {"strict_mode", request.strictMode},
+      {"enable_writelane_rewrite", request.enableWritelaneRewrite},
+      {"enable_wave_native", request.enableWaveNative},
       {"hotswap_build_identity", keyData.buildIdentity},
       {"llc_identity", keyData.llcIdentity},
       {"llvm_mc_identity", keyData.llvmMcIdentity},
@@ -482,6 +487,10 @@ bool validateMetadata(const TranslationCacheRequest &request,
       !requireEqualString(obj, "hotswap_rules_sha256", keyData.rulesSha256,
                           reason) ||
       !requireEqualBool(obj, "strict_mode", request.strictMode, reason) ||
+      !requireEqualBool(obj, "enable_writelane_rewrite",
+                        request.enableWritelaneRewrite, reason) ||
+      !requireEqualBool(obj, "enable_wave_native", request.enableWaveNative,
+                        reason) ||
       !requireEqualString(obj, "hotswap_build_identity",
                           keyData.buildIdentity, reason) ||
       !requireEqualString(obj, "llc_identity", keyData.llcIdentity, reason) ||

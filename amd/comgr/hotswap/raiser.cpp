@@ -1550,11 +1550,12 @@ RaiseResult raiseToIR(llvm::ArrayRef<uint8_t> textBytes,
                       llvm::StringRef kernelName,
                       const KernelMeta &meta,
                       uint64_t kernelOffset,
-                      llvm::StringRef compilationTargetISA) {
+                      llvm::StringRef compilationTargetISA,
+                      bool enableWritelaneRewrite,
+                      bool enableWaveNative) {
   return raiseToIRImpl(textBytes, sourceISA, kernelName, meta, kernelOffset,
-                       compilationTargetISA,
-                       /*enableWritelaneRewrite=*/true,
-                       /*enableWaveNative=*/true,
+                       compilationTargetISA, enableWritelaneRewrite,
+                       enableWaveNative,
                        /*forceThreadLoopProjection=*/false,
                        /*suppressC5ForThreadLoopRoute=*/false);
 }

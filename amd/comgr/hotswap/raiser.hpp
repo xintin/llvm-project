@@ -45,7 +45,9 @@ RaiseResult raiseToIR(llvm::ArrayRef<uint8_t> textBytes,
                       llvm::StringRef kernelName,
                       const KernelMeta &meta,
                       uint64_t kernelOffset = 0,
-                      llvm::StringRef compilationTargetISA = "");
+                      llvm::StringRef compilationTargetISA = "",
+                      bool enableWritelaneRewrite = true,
+                      bool enableWaveNative = true);
 
 } // namespace transpiler
 

@@ -102,6 +102,8 @@ transpiler::TranslationCacheRequest makeRequest(
   request.cacheDirectory = llvm::sys::path::parent_path(rulesPath).str();
   request.cacheDisabled = false;
   request.origMach = 0x49;
+  request.enableWritelaneRewrite = true;
+  request.enableWaveNative = true;
   request.strictMode = true;
   return request;
 }

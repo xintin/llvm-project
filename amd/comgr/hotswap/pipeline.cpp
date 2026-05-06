@@ -233,7 +233,9 @@ static bool raiseAndCompileKernel(const TextSection &text,
                                   llvm::StringRef targetISA,
                                   const DumpDir &tmpDir,
                                   llvm::StringRef objPath,
-                                  PipelineResult &result) {
+                                  PipelineResult &result,
+                                  bool enableWritelaneRewrite,
+                                  bool enableWaveNative) {
   auto meta = extractKernelMeta(codeObjectData, kernelName);
   if (meta.args.empty()) {
     llvm::errs() << "transpiler: WARNING: No metadata found for '" << kernelName
@@ -258,7 +260,8 @@ static bool raiseAndCompileKernel(const TextSection &text,
                  << "\n");
 
   auto raised = raiseToIR(text.bytes, sourceISA, kernelName, meta, kernelOffset,
-                           targetISA);
+                           targetISA, enableWritelaneRewrite,
+                           enableWaveNative);
   if (!raised.success) {
     llvm::errs() << "transpiler: Raising '" << kernelName << "' to LLVM IR failed";
     result.failKernel = kernelName;
@@ -377,7 +380,9 @@ void collectTargetPrivateSegmentMetadata(PipelineResult &result,
 PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
                            llvm::StringRef sourceISA,
                            llvm::StringRef targetISA,
-                           llvm::StringRef kernelName) {
+                           llvm::StringRef kernelName,
+                           bool enableWritelaneRewrite,
+                           bool enableWaveNative) {
   PipelineResult result;
 
   auto text = extractTextSection(codeObjectData);
@@ -400,7 +405,8 @@ PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
   std::string hsacoPath = tmpDir.filePath("kernel.hsaco");
 
   if (!raiseAndCompileKernel(text, codeObjectData, kernelName,
-                             sourceISA, targetISA, tmpDir, objPath, result))
+                             sourceISA, targetISA, tmpDir, objPath, result,
+                             enableWritelaneRewrite, enableWaveNative))
     return result;
 
   if (!linkObjects({objPath}, hsacoPath))
@@ -422,7 +428,9 @@ PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
 
 PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      llvm::StringRef sourceISA,
-                                     llvm::StringRef targetISA) {
+                                     llvm::StringRef targetISA,
+                                     bool enableWritelaneRewrite,
+                                     bool enableWaveNative) {
   PipelineResult result;
 
   auto kernelNames = listKernelNames(codeObjectData);
@@ -458,7 +466,8 @@ PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                             << kernelNames.size() << "] " << kName << " ... ");
 
     if (!raiseAndCompileKernel(text, codeObjectData, kName,
-                               sourceISA, targetISA, tmpDir, objPath, result)) {
+                               sourceISA, targetISA, tmpDir, objPath, result,
+                               enableWritelaneRewrite, enableWaveNative)) {
       LLVM_DEBUG(llvm::dbgs() << "FAILED\n");
       result.success = false;
       return result;

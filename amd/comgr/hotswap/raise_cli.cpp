@@ -194,6 +194,8 @@ int main(int argc, char **argv) {
   // `--disable-writelane-rewrite` flag (parsed below) forces the
   // pre-rewrite path for the lit fixtures that pin the
   // REFUSE / UNCHANGED sibling contracts.
+  bool enableWritelaneRewrite = true;
+  bool enableWaveNative = true;
   std::string emitIrKernel;
   std::string writeHsacoPath;
   std::string writeHsacoKernel;
@@ -220,6 +222,26 @@ int main(int argc, char **argv) {
       writeHsacoPath = a.substr(14);
     } else if (a.rfind("--kernel=", 0) == 0) {
       writeHsacoKernel = a.substr(9);
+    } else if (a == "--enable-writelane-rewrite") {
+      enableWritelaneRewrite = true;
+    } else if (a == "--disable-writelane-rewrite") {
+      // Later-wins on the command line: the last occurrence of an
+      // --enable- / --disable- pair decides the effective value.  This
+      // matches the behaviour every lit fixture's REFUSE / REWRITE RUN
+      // lines implicitly rely on (one flag per RUN line).
+      enableWritelaneRewrite = false;
+    } else if (a == "--enable-wave-native") {
+      enableWaveNative = true;
+    } else if (a == "--disable-wave-native") {
+      // Later-wins on the command line, symmetric with
+      // --enable-/--disable-writelane-rewrite. Post-graduation the
+      // default is on; --disable-wave-native is the opt-out path for
+      // lit fixtures that pin MODREP-specific IR shapes (the
+      // `cross_wave_warn` warn-only contract, the narrow-O1 C5
+      // refusal siblings) and for producer flows that want MODREP's
+      // "independent halves" throughput on pointwise kernels. See
+      // this file's top-of-file comment.
+      enableWaveNative = false;
     } else if (!a.empty() && a[0] == '-') {
       std::fprintf(stderr, "raise_cli: unknown flag: %s\n", a.c_str());
       return usage();
@@ -308,7 +330,9 @@ int main(int argc, char **argv) {
     }
     uint64_t kernelOffset = *kernelOffsetOrErr;
     auto raised = transpiler::raiseToIR(text.bytes, isa, target, meta,
-                                        kernelOffset, targetIsa);
+                                        kernelOffset, targetIsa,
+                                        enableWritelaneRewrite,
+                                        enableWaveNative);
     if (!raised.success) {
       // Contract: raiseToIR only populates RaiseResult::irText on the
       // success path (the last write before setting `success = true`),
@@ -369,7 +393,8 @@ int main(int argc, char **argv) {
     }
     std::string effectiveTargetIsa = targetIsa.empty() ? isa : targetIsa;
     auto pipe = transpiler::runPipeline(coData, isa, effectiveTargetIsa,
-                                        target);
+                                        target, enableWritelaneRewrite,
+                                        enableWaveNative);
     if (!pipe.success) {
       std::fprintf(stderr,
                    "raise_cli: pipeline failed for kernel '%s' (lifted=%d/%d, "
@@ -440,7 +465,9 @@ int main(int argc, char **argv) {
       }
       auto meta = transpiler::extractKernelMeta(coData, kName);
       auto raised = transpiler::raiseToIR(text.bytes, isa, kName, meta,
-                                          kernelOffset, targetIsa);
+                                          kernelOffset, targetIsa,
+                                          enableWritelaneRewrite,
+                                          enableWaveNative);
       shm->done = true;
       shm->success = raised.success;
       shm->lifted = raised.liftedCount;
