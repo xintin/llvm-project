@@ -20,7 +20,12 @@ struct PipelineResult {
   std::string failFormat;
   std::string failDetail;
   uint64_t failOffset = 0;
-  // Successful raises can still carry proof-relevant attribution.
+  // Successful raises can still carry proof-relevant attribution. Today this
+  // records C5 predicate-chain sites accepted under a projection-specific
+  // proof (for example single-source-wave MODREP with no active replica
+  // lanes); loader proof logs surface these fields on `hotswap_result`.
+  int c5SuppressedCount = 0;
+  std::string c5SuppressionReason;
   bool usesScratchPrivateSegment = false;
   uint32_t sourcePrivateSegmentFixedSize = 0;
   bool targetEnablePrivateSegment = false;

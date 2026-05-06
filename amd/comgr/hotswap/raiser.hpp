@@ -25,6 +25,13 @@ struct RaiseResult {
   int totalCount = 0;
   std::string irText;
   std::string disasmText;
+  // Predicate-chain classifier observations that the cross-widening
+  // analysis accepted (rather than refused) for this kernel. Surfaced
+  // for diagnostic attribution; counters are zero on a clean lift.
+  // TODO(naming): the `c5*` identifier is prototype-era jargon and
+  // should be replaced with a domain-meaningful name before this lands.
+  int c5SuppressedCount = 0;
+  std::string c5SuppressionReason;
   // Structured failure description. `failure.reason == None` iff `success`.
   RaiseFailure failure;
   bool usesScratchPrivateSegment = false;
