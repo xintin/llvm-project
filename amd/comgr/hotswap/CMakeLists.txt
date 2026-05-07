@@ -17,10 +17,26 @@ if(NOT DEFINED HOTSWAP_TRANSPILER_BUILD_TOOLS)
 endif()
 
 # --- LLVM ---------------------------------------------------------------------
-if(NOT TARGET LLVMSupport)
+# The MC stack uses AMDGPU target-private headers (SIDefines.h, SIInstrInfo.h,
+# AMDGPUBaseInfo.h) which transitively include TableGen-generated
+# AMDGPUGen*.inc files. Those .inc files are produced by llvm-tblgen during
+# the LLVM build and are not copied by `ninja install`, so we require an
+# LLVM *build tree* rather than an install tree.
+if(TARGET LLVMSupport AND DEFINED LLVM_MAIN_SRC_DIR)
+  set(LLVM_BUILD_MAIN_SRC_DIR "${LLVM_MAIN_SRC_DIR}")
+else()
   find_package(LLVM REQUIRED CONFIG)
   list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
   include(AddLLVM)
+endif()
+
+if(NOT DEFINED LLVM_BUILD_MAIN_SRC_DIR OR NOT LLVM_BUILD_MAIN_SRC_DIR OR
+   NOT DEFINED LLVM_BINARY_DIR OR NOT LLVM_BINARY_DIR)
+  message(FATAL_ERROR
+    "hotswap-transpiler requires an LLVM build tree (not an install tree). "
+    "The install tree does not expose AMDGPU target-private headers "
+    "(SIDefines.h, AMDGPUBaseInfo.h, AMDGPUGen*.inc). "
+    "Pass -DLLVM_DIR=<llvm-build>/lib/cmake/llvm.")
 endif()
 
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -32,6 +48,7 @@ add_library(hotswap-transpiler STATIC
   raiser.cpp
   raise_failure.cpp
   code_object_utils.cpp
+  mc_state.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
@@ -46,6 +63,13 @@ llvm_update_compile_flags(hotswap-transpiler)
 
 set_target_properties(hotswap-transpiler PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# AMDGPU target-private headers (not installed by `ninja install`).
+target_include_directories(hotswap-transpiler PRIVATE
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/AMDGPU"
+  "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/AMDGPU/Utils"
+  "${LLVM_BINARY_DIR}/lib/Target/AMDGPU"
+)
+
 # Public include root so consumers can `#include "hotswap/raiser.hpp"`.
 target_include_directories(hotswap-transpiler PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>
@@ -58,6 +82,16 @@ target_link_libraries(hotswap-transpiler
     LLVMTargetParser
     LLVMObject
     LLVMBinaryFormat
+    LLVMMC
+    LLVMMCDisassembler
+    LLVMMCParser
+    LLVMTarget
+    LLVMAMDGPUDisassembler
+    LLVMAMDGPUCodeGen
+    LLVMAMDGPUAsmParser
+    LLVMAMDGPUDesc
+    LLVMAMDGPUInfo
+    LLVMAMDGPUUtils
 )
 
 # --- Tests --------------------------------------------------------------------
@@ -70,12 +104,20 @@ if(HOTSWAP_TRANSPILER_BUILD_TOOLS)
     tests/test_main.cpp
     tests/raiser_empty_module_test.cpp
     tests/code_object_utils_test.cpp
+    tests/mc_context_inline_srcmgr_test.cpp
   )
   llvm_update_compile_flags(transpiler_tests)
   target_link_libraries(transpiler_tests
     PRIVATE
       hotswap-transpiler
       GTest::GTest
+  )
+  # Tests that include transpiler internals need the same AMDGPU
+  # target-private include paths the library uses.
+  target_include_directories(transpiler_tests PRIVATE
+    "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/AMDGPU"
+    "${LLVM_BUILD_MAIN_SRC_DIR}/lib/Target/AMDGPU/Utils"
+    "${LLVM_BINARY_DIR}/lib/Target/AMDGPU"
   )
   gtest_discover_tests(transpiler_tests
     PROPERTIES TIMEOUT 60 LABELS "transpiler"
