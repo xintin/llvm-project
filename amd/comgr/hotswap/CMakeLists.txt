@@ -50,6 +50,7 @@ add_library(hotswap-transpiler STATIC
   code_object_utils.cpp
   mc_state.cpp
   canonical_op.cpp
+  opcode_map.cpp
 )
 
 if(NOT TARGET hotswap::transpiler)
@@ -106,6 +107,7 @@ if(HOTSWAP_TRANSPILER_BUILD_TOOLS)
     tests/raiser_empty_module_test.cpp
     tests/code_object_utils_test.cpp
     tests/mc_context_inline_srcmgr_test.cpp
+    tests/opcode_map_test.cpp
   )
   llvm_update_compile_flags(transpiler_tests)
   target_link_libraries(transpiler_tests
