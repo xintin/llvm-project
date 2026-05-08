@@ -37,6 +37,20 @@ struct ISAProfile {
   // the cross-target loud refusal: the gfx942 and earlier ISAs have
   // no equivalent hardware unit, so cross-target lifts must refuse.
   bool hasTensorOps = false;
+  // True iff the subtarget exposes gfx950's MAI extensions on top of the
+  // shared gfx9-family `MAIInsts` feature.  Distinct from `hasMFMA`, which
+  // is set on every gfx9-family target with MAI (gfx940 / gfx942 / gfx950).
+  // The discriminator is needed for cross-target lowerings whose target
+  // intrinsic exists only on gfx950 -- notably the scaled F8F6F4 MFMA
+  // family (`int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4`,
+  // IntrinsicsAMDGPU.td:3694), which is the gfx950 cross-target for
+  // `v_wmma_scale_f32_16x16x128_f8f6f4`.  gfx942 has `hasMFMA == true` but
+  // no scaled F8F6F4 hardware, so the WMMA-scale handler in
+  // `handle_valu_vop3p.cpp` must gate on `hasGfx950Insts` rather than
+  // `hasMFMA` to avoid a silent miscompile (the `hasMFMA` predicate would
+  // emit `int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` on gfx942, where the
+  // intrinsic has no codegen pattern and llc would crash at lowering).
+  bool hasGfx950Insts = false;
   // gfx125 widens compute_pgm_rsrc2.USER_SGPR_COUNT from the older 5-bit
   // GFX6-GFX120 field to a 6-bit field. Keep this as an ABI property rather
   // than deriving it from a string at each use site.
@@ -56,6 +70,7 @@ struct ISAProfile {
     p.hasWMMA12 = STI.hasFeature(llvm::AMDGPU::FeatureWMMA128bInsts) ||
                   STI.hasFeature(llvm::AMDGPU::FeatureWMMA256bInsts);
     p.hasTensorOps = STI.hasFeature(llvm::AMDGPU::FeatureGFX1250Insts);
+    p.hasGfx950Insts = STI.hasFeature(llvm::AMDGPU::FeatureGFX950Insts);
     p.hasGfx125UserSgprCountField = llvm::AMDGPU::isGFX1250Plus(STI);
     return p;
   }
