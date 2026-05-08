@@ -15,6 +15,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <dlfcn.h>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <sys/stat.h>
@@ -27,6 +28,21 @@
 
 namespace transpiler {
 namespace {
+
+using TimingClock = std::chrono::steady_clock;
+
+double secondsBetween(TimingClock::time_point start,
+                      TimingClock::time_point end) {
+  return std::chrono::duration<double>(end - start).count();
+}
+
+TimingClock::time_point timingStart(bool collectTimings) {
+  return collectTimings ? TimingClock::now() : TimingClock::time_point{};
+}
+
+double timingElapsed(bool collectTimings, TimingClock::time_point start) {
+  return collectTimings ? secondsBetween(start, TimingClock::now()) : 0.0;
+}
 
 constexpr int kCacheSchemaVersion = 1;
 
@@ -53,6 +69,7 @@ struct KeyData {
   std::string elfFlagsHex;
   std::vector<std::string> kernelNames;
   std::string error;
+  TranslationCacheKeyBuildTimings timings;
 };
 
 std::string hexU32(uint32_t value) {
@@ -177,7 +194,8 @@ const FileIdentity &lldIdentity() {
   return identity;
 }
 
-KeyData buildKeyData(const TranslationCacheRequest &request) {
+KeyData buildKeyData(const TranslationCacheRequest &request,
+                     bool collectTimings) {
   KeyData data;
   if (request.sourceObject.empty()) {
     data.error = "empty source code object";
@@ -188,19 +206,30 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
     return data;
   }
 
+  auto sourceHashStart = timingStart(collectTimings);
   data.sourceSha256 = sha256Hex(request.sourceObject);
+  data.timings.sourceHashSeconds =
+      timingElapsed(collectTimings, sourceHashStart);
   uint16_t machine = 0;
   uint32_t flags = 0;
+  auto elfHeaderStart = timingStart(collectTimings);
   if (readElfHeaderFields(request.sourceObject, machine, flags)) {
+    data.timings.elfHeaderSeconds =
+        timingElapsed(collectTimings, elfHeaderStart);
     data.elfMachineHex = hexU32(machine);
     data.elfFlagsHex = hexU32(flags);
   } else {
+    data.timings.elfHeaderSeconds =
+        timingElapsed(collectTimings, elfHeaderStart);
     data.error = "source code object is not a 64-bit little-endian ELF";
     return data;
   }
 
   if (!request.hotswapRulesPath.empty()) {
+    auto rulesHashStart = timingStart(collectTimings);
     data.rulesSha256 = hashFile(request.hotswapRulesPath, data.rulesError);
+    data.timings.rulesHashSeconds =
+        timingElapsed(collectTimings, rulesHashStart);
     if (!data.rulesError.empty()) {
       data.error = "failed to hash HSA_HOTSWAP_RULES '" +
                    request.hotswapRulesPath + "': " + data.rulesError;
@@ -209,9 +238,12 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   }
 
   const std::string toolsDir = LLVM_TOOLS_DIR;
+  auto llvmToolIdentityStart = timingStart(collectTimings);
   const FileIdentity &llc = llcIdentity();
   const FileIdentity &llvmMc = llvmMcIdentity();
   const FileIdentity &lld = lldIdentity();
+  data.timings.llvmToolIdentitySeconds =
+      timingElapsed(collectTimings, llvmToolIdentityStart);
   if (!llc.present || !llvmMc.present || !lld.present || !llc.error.empty() ||
       !llvmMc.error.empty() || !lld.error.empty()) {
     data.error = "LLVM tool identity is incomplete under " + toolsDir;
@@ -220,11 +252,18 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   data.llcIdentity = identityString(llc);
   data.llvmMcIdentity = identityString(llvmMc);
   data.lldIdentity = identityString(lld);
+  auto loadedImageIdentityStart = timingStart(collectTimings);
   data.buildIdentity = loadedImageIdentity();
+  data.timings.loadedImageIdentitySeconds =
+      timingElapsed(collectTimings, loadedImageIdentityStart);
+  auto kernelNamesStart = timingStart(collectTimings);
   data.kernelNames = listKernelNames(
       std::vector<uint8_t>(request.sourceObject.begin(),
                            request.sourceObject.end()));
+  data.timings.kernelNamesSeconds =
+      timingElapsed(collectTimings, kernelNamesStart);
 
+  auto materialBuildStart = timingStart(collectTimings);
   std::string material;
   appendKeyField(material, "schema", std::to_string(kCacheSchemaVersion));
   appendKeyField(material, "source_sha256", data.sourceSha256);
@@ -246,8 +285,13 @@ KeyData buildKeyData(const TranslationCacheRequest &request) {
   appendKeyField(material, "llc_identity", data.llcIdentity);
   appendKeyField(material, "llvm_mc_identity", data.llvmMcIdentity);
   appendKeyField(material, "lld_identity", data.lldIdentity);
+  data.timings.materialBuildSeconds =
+      timingElapsed(collectTimings, materialBuildStart);
+  auto keyHashStart = timingStart(collectTimings);
   data.key = sha256Hex(llvm::ArrayRef<uint8_t>(
       reinterpret_cast<const uint8_t *>(material.data()), material.size()));
+  data.timings.keyHashSeconds =
+      timingElapsed(collectTimings, keyHashStart);
   return data;
 }
 
@@ -568,71 +612,101 @@ std::string sha256Hex(llvm::ArrayRef<uint8_t> data) {
 
 TranslationCacheLookup lookupTranslationCache(
     const TranslationCacheRequest &request) {
+  auto totalStart = timingStart(request.collectTimings);
   TranslationCacheLookup lookup;
-  if (cacheDisabledByPolicy(request))
+  auto finish = [&]() {
+    lookup.timings.totalSeconds =
+        timingElapsed(request.collectTimings, totalStart);
     return lookup;
+  };
+  if (cacheDisabledByPolicy(request))
+    return finish();
 
-  KeyData keyData = buildKeyData(request);
+  auto keyBuildStart = timingStart(request.collectTimings);
+  KeyData keyData = buildKeyData(request, request.collectTimings);
+  lookup.timings.keyBuildSeconds =
+      timingElapsed(request.collectTimings, keyBuildStart);
+  lookup.timings.keyBuild = keyData.timings;
   lookup.key = keyData.key;
   if (!keyData.error.empty()) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = keyData.error;
-    return lookup;
+    return finish();
   }
   lookup.metadataPath = cacheMetadataPath(request, keyData.key);
   lookup.objectPath = cacheObjectPath(request, keyData.key);
 
+  auto metadataObjectStatStart = timingStart(request.collectTimings);
   const bool metadataExists = exists(lookup.metadataPath);
   const bool objectExists = exists(lookup.objectPath);
+  lookup.timings.metadataObjectStatSeconds =
+      timingElapsed(request.collectTimings, metadataObjectStatStart);
   if (!metadataExists && !objectExists) {
     lookup.status = TranslationCacheStatus::Miss;
     lookup.reason = "entry not present";
-    return lookup;
+    return finish();
   }
   if (metadataExists != objectExists) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = metadataExists ? "metadata exists without object"
                                    : "object exists without metadata";
-    return lookup;
+    return finish();
   }
 
+  auto objectReadStart = timingStart(request.collectTimings);
   auto objectBuffer = llvm::MemoryBuffer::getFile(lookup.objectPath);
+  lookup.timings.objectReadSeconds =
+      timingElapsed(request.collectTimings, objectReadStart);
   if (!objectBuffer) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = "failed to read cached object: " +
                     objectBuffer.getError().message();
-    return lookup;
+    return finish();
   }
   llvm::StringRef objectBytes = (*objectBuffer)->getBuffer();
+  auto objectHashStart = timingStart(request.collectTimings);
   std::string objectSha = sha256Hex(llvm::ArrayRef<uint8_t>(
       reinterpret_cast<const uint8_t *>(objectBytes.data()),
       objectBytes.size()));
+  lookup.timings.objectHashSeconds =
+      timingElapsed(request.collectTimings, objectHashStart);
 
+  auto metadataReadStart = timingStart(request.collectTimings);
   auto metadataBuffer = llvm::MemoryBuffer::getFile(lookup.metadataPath);
+  lookup.timings.metadataReadSeconds =
+      timingElapsed(request.collectTimings, metadataReadStart);
   if (!metadataBuffer) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = "failed to read cache metadata: " +
                     metadataBuffer.getError().message();
-    return lookup;
+    return finish();
   }
+  auto metadataParseStart = timingStart(request.collectTimings);
   auto parsed = llvm::json::parse((*metadataBuffer)->getBuffer());
+  lookup.timings.metadataParseSeconds =
+      timingElapsed(request.collectTimings, metadataParseStart);
   if (!parsed) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = "failed to parse cache metadata: " +
                     llvm::toString(parsed.takeError());
-    return lookup;
+    return finish();
   }
   const llvm::json::Object *obj = parsed->getAsObject();
   if (!obj) {
     lookup.status = TranslationCacheStatus::Invalid;
     lookup.reason = "cache metadata is not a JSON object";
-    return lookup;
+    return finish();
   }
+  auto metadataValidateStart = timingStart(request.collectTimings);
   if (!validateMetadata(request, keyData, *obj, objectSha, objectBytes.size(),
                         lookup.result, lookup.reason)) {
+    lookup.timings.metadataValidateSeconds =
+        timingElapsed(request.collectTimings, metadataValidateStart);
     lookup.status = TranslationCacheStatus::Invalid;
-    return lookup;
+    return finish();
   }
+  lookup.timings.metadataValidateSeconds =
+      timingElapsed(request.collectTimings, metadataValidateStart);
 
   lookup.result.hsaco.assign(
       reinterpret_cast<const uint8_t *>(objectBytes.data()),
@@ -640,21 +714,31 @@ TranslationCacheLookup lookupTranslationCache(
           objectBytes.size());
   lookup.status = TranslationCacheStatus::Hit;
   lookup.reason = "ok";
-  return lookup;
+  return finish();
 }
 
 TranslationCacheWrite writeTranslationCache(
     const TranslationCacheRequest &request, const PipelineResult &result) {
+  auto totalStart = timingStart(request.collectTimings);
   TranslationCacheWrite write;
-  if (cacheDisabledByPolicy(request) || request.cacheReadonly)
+  auto finish = [&]() {
+    write.timings.totalSeconds =
+        timingElapsed(request.collectTimings, totalStart);
     return write;
+  };
+  if (cacheDisabledByPolicy(request) || request.cacheReadonly)
+    return finish();
 
-  KeyData keyData = buildKeyData(request);
+  auto keyBuildStart = timingStart(request.collectTimings);
+  KeyData keyData = buildKeyData(request, request.collectTimings);
+  write.timings.keyBuildSeconds =
+      timingElapsed(request.collectTimings, keyBuildStart);
+  write.timings.keyBuild = keyData.timings;
   write.key = keyData.key;
   if (!keyData.error.empty()) {
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = keyData.error;
-    return write;
+    return finish();
   }
   write.metadataPath = cacheMetadataPath(request, keyData.key);
   write.objectPath = cacheObjectPath(request, keyData.key);
@@ -662,39 +746,60 @@ TranslationCacheWrite writeTranslationCache(
   if (!result.success || result.hsaco.empty()) {
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = "refusing to cache unsuccessful or empty translation";
-    return write;
+    return finish();
   }
 
   std::string dir = cacheSubdir(request, keyData.key);
+  auto createDirectoryStart = timingStart(request.collectTimings);
   if (auto ec = llvm::sys::fs::create_directories(dir)) {
+    write.timings.createDirectorySeconds =
+        timingElapsed(request.collectTimings, createDirectoryStart);
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = "failed to create cache directory '" + dir + "': " +
                    ec.message();
-    return write;
+    return finish();
   }
+  write.timings.createDirectorySeconds =
+      timingElapsed(request.collectTimings, createDirectoryStart);
 
+  auto objectHashStart = timingStart(request.collectTimings);
   std::string objectSha = sha256Hex(result.hsaco);
+  write.timings.objectHashSeconds =
+      timingElapsed(request.collectTimings, objectHashStart);
   std::string error;
+  auto objectWriteStart = timingStart(request.collectTimings);
   if (!writeFileAtomic(write.objectPath, result.hsaco, error)) {
+    write.timings.objectWriteSeconds =
+        timingElapsed(request.collectTimings, objectWriteStart);
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = "failed to write cached object: " + error;
-    return write;
+    return finish();
   }
+  write.timings.objectWriteSeconds =
+      timingElapsed(request.collectTimings, objectWriteStart);
 
+  auto metadataBuildStart = timingStart(request.collectTimings);
   llvm::json::Object meta =
       metadataObject(request, keyData, result, objectSha);
+  write.timings.metadataBuildSeconds =
+      timingElapsed(request.collectTimings, metadataBuildStart);
+  auto metadataWriteStart = timingStart(request.collectTimings);
   if (!writeFileAtomic(write.metadataPath,
                        jsonToString(llvm::json::Value(std::move(meta))),
                        error)) {
+    write.timings.metadataWriteSeconds =
+        timingElapsed(request.collectTimings, metadataWriteStart);
     llvm::sys::fs::remove(write.objectPath);
     write.status = TranslationCacheStatus::WriteFailed;
     write.reason = "failed to write cache metadata: " + error;
-    return write;
+    return finish();
   }
+  write.timings.metadataWriteSeconds =
+      timingElapsed(request.collectTimings, metadataWriteStart);
 
   write.status = TranslationCacheStatus::WriteSuccess;
   write.reason = "ok";
-  return write;
+  return finish();
 }
 
 std::string skippedKernelForTranslationCache(

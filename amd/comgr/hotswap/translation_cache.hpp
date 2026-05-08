@@ -11,6 +11,40 @@
 
 namespace transpiler {
 
+struct TranslationCacheKeyBuildTimings {
+  double sourceHashSeconds = 0.0;
+  double elfHeaderSeconds = 0.0;
+  double rulesHashSeconds = 0.0;
+  double loadedImageIdentitySeconds = 0.0;
+  double llvmToolIdentitySeconds = 0.0;
+  double kernelNamesSeconds = 0.0;
+  double materialBuildSeconds = 0.0;
+  double keyHashSeconds = 0.0;
+};
+
+struct TranslationCacheLookupTimings {
+  double totalSeconds = 0.0;
+  double keyBuildSeconds = 0.0;
+  TranslationCacheKeyBuildTimings keyBuild;
+  double metadataObjectStatSeconds = 0.0;
+  double objectReadSeconds = 0.0;
+  double objectHashSeconds = 0.0;
+  double metadataReadSeconds = 0.0;
+  double metadataParseSeconds = 0.0;
+  double metadataValidateSeconds = 0.0;
+};
+
+struct TranslationCacheWriteTimings {
+  double totalSeconds = 0.0;
+  double keyBuildSeconds = 0.0;
+  TranslationCacheKeyBuildTimings keyBuild;
+  double createDirectorySeconds = 0.0;
+  double objectHashSeconds = 0.0;
+  double objectWriteSeconds = 0.0;
+  double metadataBuildSeconds = 0.0;
+  double metadataWriteSeconds = 0.0;
+};
+
 struct TranslationCacheRequest {
   llvm::ArrayRef<uint8_t> sourceObject;
   std::string sourceGfx;
@@ -27,6 +61,7 @@ struct TranslationCacheRequest {
   bool strictMode = false;
   bool cacheDisabled = true;
   bool cacheReadonly = false;
+  bool collectTimings = false;
 };
 
 enum class TranslationCacheStatus {
@@ -45,6 +80,7 @@ struct TranslationCacheLookup {
   std::string metadataPath;
   std::string objectPath;
   std::string reason;
+  TranslationCacheLookupTimings timings;
   PipelineResult result;
 };
 
@@ -54,6 +90,7 @@ struct TranslationCacheWrite {
   std::string metadataPath;
   std::string objectPath;
   std::string reason;
+  TranslationCacheWriteTimings timings;
 };
 
 const char *translationCacheStatusString(TranslationCacheStatus status);

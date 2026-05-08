@@ -392,9 +392,11 @@ int main(int argc, char **argv) {
       }
     }
     std::string effectiveTargetIsa = targetIsa.empty() ? isa : targetIsa;
+    transpiler::PipelineOptions pipelineOptions;
+    pipelineOptions.enableWritelaneRewrite = enableWritelaneRewrite;
+    pipelineOptions.enableWaveNative = enableWaveNative;
     auto pipe = transpiler::runPipeline(coData, isa, effectiveTargetIsa,
-                                        target, enableWritelaneRewrite,
-                                        enableWaveNative);
+                                        target, pipelineOptions);
     if (!pipe.success) {
       std::fprintf(stderr,
                    "raise_cli: pipeline failed for kernel '%s' (lifted=%d/%d, "

@@ -10,10 +10,32 @@
 
 namespace transpiler {
 
+struct PipelineTimings {
+  double totalSeconds = 0.0;
+  double listKernelsSeconds = 0.0;
+  double extractTextSeconds = 0.0;
+  double createTempDirSeconds = 0.0;
+  double raiseSeconds = 0.0;
+  double writeIrSeconds = 0.0;
+  double llcSeconds = 0.0;
+  double readAsmSeconds = 0.0;
+  double llvmMcSeconds = 0.0;
+  double linkSeconds = 0.0;
+  double readHsacoSeconds = 0.0;
+  double collectMetadataSeconds = 0.0;
+};
+
+struct PipelineOptions {
+  bool enableWritelaneRewrite = true;
+  bool enableWaveNative = true;
+  bool collectTimings = false;
+};
+
 struct PipelineResult {
   std::vector<uint8_t> hsaco;
   std::string irText;
   std::string asmText;
+  PipelineTimings timings;
   std::string failMnemonic;
   std::string failKernel;
   std::string failReason;
@@ -68,8 +90,7 @@ PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
                            llvm::StringRef sourceISA,
                            llvm::StringRef targetISA,
                            llvm::StringRef kernelName,
-                           bool enableWritelaneRewrite = true,
-                           bool enableWaveNative = true);
+                           PipelineOptions options = {});
 
 /// Raise and lower ALL kernels in a code object, producing a single merged
 /// HSACO containing every kernel.  Returns success only if every kernel was
@@ -82,8 +103,7 @@ PipelineResult runPipeline(llvm::ArrayRef<uint8_t> codeObjectData,
 PipelineResult runPipelineAllKernels(llvm::ArrayRef<uint8_t> codeObjectData,
                                      llvm::StringRef sourceISA,
                                      llvm::StringRef targetISA,
-                                     bool enableWritelaneRewrite = true,
-                                     bool enableWaveNative = true);
+                                     PipelineOptions options = {});
 
 /// Process-global "strict mode" toggle, controlled by the
 /// `HSA_HOTSWAP_STRICT` environment variable. When set to a non-empty

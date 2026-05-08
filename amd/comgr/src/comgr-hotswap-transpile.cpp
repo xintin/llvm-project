@@ -30,6 +30,11 @@
 #include "hotswap/pipeline.hpp"
 #include "hotswap/translation_cache.hpp"
 
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -40,6 +45,214 @@
 using namespace COMGR;
 
 namespace {
+
+using TimingClock = std::chrono::steady_clock;
+
+double secondsBetween(TimingClock::time_point start, TimingClock::time_point end) {
+  return std::chrono::duration<double>(end - start).count();
+}
+
+TimingClock::time_point timingStart(bool collectTimings) {
+  return collectTimings ? TimingClock::now() : TimingClock::time_point{};
+}
+
+double timingElapsed(bool collectTimings, TimingClock::time_point start) {
+  return collectTimings ? secondsBetween(start, TimingClock::now()) : 0.0;
+}
+
+bool HotSwapTimingEnabled() {
+  const char *value = std::getenv("HSA_HOTSWAP_TIMING");
+  return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+struct HotswapComgrTimings {
+  double totalSeconds = 0.0;
+  double inputCopySeconds = 0.0;
+  double listKernelsSeconds = 0.0;
+  double cacheLookupTotalSeconds = 0.0;
+  double cacheLookupKeyBuildSeconds = 0.0;
+  double cacheLookupKeySourceHashSeconds = 0.0;
+  double cacheLookupKeyElfHeaderSeconds = 0.0;
+  double cacheLookupKeyRulesHashSeconds = 0.0;
+  double cacheLookupKeyLoadedImageIdentitySeconds = 0.0;
+  double cacheLookupKeyLlvmToolIdentitySeconds = 0.0;
+  double cacheLookupKeyKernelNamesSeconds = 0.0;
+  double cacheLookupKeyMaterialBuildSeconds = 0.0;
+  double cacheLookupKeyHashSeconds = 0.0;
+  double cacheLookupStatSeconds = 0.0;
+  double cacheLookupObjectReadSeconds = 0.0;
+  double cacheLookupObjectHashSeconds = 0.0;
+  double cacheLookupMetadataReadSeconds = 0.0;
+  double cacheLookupMetadataParseSeconds = 0.0;
+  double cacheLookupMetadataValidateSeconds = 0.0;
+  double pipelineTotalSeconds = 0.0;
+  double pipelineListKernelsSeconds = 0.0;
+  double pipelineExtractTextSeconds = 0.0;
+  double pipelineCreateTempDirSeconds = 0.0;
+  double pipelineRaiseSeconds = 0.0;
+  double pipelineWriteIrSeconds = 0.0;
+  double pipelineLlcSeconds = 0.0;
+  double pipelineReadAsmSeconds = 0.0;
+  double pipelineLlvmMcSeconds = 0.0;
+  double pipelineLinkSeconds = 0.0;
+  double pipelineReadHsacoSeconds = 0.0;
+  double pipelineCollectMetadataSeconds = 0.0;
+  double cacheWriteTotalSeconds = 0.0;
+  double cacheWriteKeyBuildSeconds = 0.0;
+  double cacheWriteKeySourceHashSeconds = 0.0;
+  double cacheWriteKeyElfHeaderSeconds = 0.0;
+  double cacheWriteKeyRulesHashSeconds = 0.0;
+  double cacheWriteKeyLoadedImageIdentitySeconds = 0.0;
+  double cacheWriteKeyLlvmToolIdentitySeconds = 0.0;
+  double cacheWriteKeyKernelNamesSeconds = 0.0;
+  double cacheWriteKeyMaterialBuildSeconds = 0.0;
+  double cacheWriteKeyHashSeconds = 0.0;
+  double cacheWriteCreateDirectorySeconds = 0.0;
+  double cacheWriteObjectHashSeconds = 0.0;
+  double cacheWriteObjectWriteSeconds = 0.0;
+  double cacheWriteMetadataBuildSeconds = 0.0;
+  double cacheWriteMetadataWriteSeconds = 0.0;
+  double createOutputDataSeconds = 0.0;
+};
+
+std::string timingJson(const HotswapComgrTimings &timings) {
+  llvm::json::Object object{
+      {"total_seconds", timings.totalSeconds},
+      {"input_copy_seconds", timings.inputCopySeconds},
+      {"list_kernels_seconds", timings.listKernelsSeconds},
+      {"cache_lookup_total_seconds", timings.cacheLookupTotalSeconds},
+      {"cache_lookup_key_build_seconds", timings.cacheLookupKeyBuildSeconds},
+      {"cache_lookup_key_source_hash_seconds",
+       timings.cacheLookupKeySourceHashSeconds},
+      {"cache_lookup_key_elf_header_seconds",
+       timings.cacheLookupKeyElfHeaderSeconds},
+      {"cache_lookup_key_rules_hash_seconds",
+       timings.cacheLookupKeyRulesHashSeconds},
+      {"cache_lookup_key_loaded_image_identity_seconds",
+       timings.cacheLookupKeyLoadedImageIdentitySeconds},
+      {"cache_lookup_key_llvm_tool_identity_seconds",
+       timings.cacheLookupKeyLlvmToolIdentitySeconds},
+      {"cache_lookup_key_kernel_names_seconds",
+       timings.cacheLookupKeyKernelNamesSeconds},
+      {"cache_lookup_key_material_build_seconds",
+       timings.cacheLookupKeyMaterialBuildSeconds},
+      {"cache_lookup_key_hash_seconds", timings.cacheLookupKeyHashSeconds},
+      {"cache_lookup_stat_seconds", timings.cacheLookupStatSeconds},
+      {"cache_lookup_object_read_seconds", timings.cacheLookupObjectReadSeconds},
+      {"cache_lookup_object_hash_seconds", timings.cacheLookupObjectHashSeconds},
+      {"cache_lookup_metadata_read_seconds",
+       timings.cacheLookupMetadataReadSeconds},
+      {"cache_lookup_metadata_parse_seconds",
+       timings.cacheLookupMetadataParseSeconds},
+      {"cache_lookup_metadata_validate_seconds",
+       timings.cacheLookupMetadataValidateSeconds},
+      {"pipeline_total_seconds", timings.pipelineTotalSeconds},
+      {"pipeline_list_kernels_seconds", timings.pipelineListKernelsSeconds},
+      {"pipeline_extract_text_seconds", timings.pipelineExtractTextSeconds},
+      {"pipeline_create_temp_dir_seconds", timings.pipelineCreateTempDirSeconds},
+      {"pipeline_raise_seconds", timings.pipelineRaiseSeconds},
+      {"pipeline_write_ir_seconds", timings.pipelineWriteIrSeconds},
+      {"pipeline_llc_seconds", timings.pipelineLlcSeconds},
+      {"pipeline_read_asm_seconds", timings.pipelineReadAsmSeconds},
+      {"pipeline_llvm_mc_seconds", timings.pipelineLlvmMcSeconds},
+      {"pipeline_link_seconds", timings.pipelineLinkSeconds},
+      {"pipeline_read_hsaco_seconds", timings.pipelineReadHsacoSeconds},
+      {"pipeline_collect_metadata_seconds",
+       timings.pipelineCollectMetadataSeconds},
+      {"cache_write_total_seconds", timings.cacheWriteTotalSeconds},
+      {"cache_write_key_build_seconds", timings.cacheWriteKeyBuildSeconds},
+      {"cache_write_key_source_hash_seconds",
+       timings.cacheWriteKeySourceHashSeconds},
+      {"cache_write_key_elf_header_seconds",
+       timings.cacheWriteKeyElfHeaderSeconds},
+      {"cache_write_key_rules_hash_seconds",
+       timings.cacheWriteKeyRulesHashSeconds},
+      {"cache_write_key_loaded_image_identity_seconds",
+       timings.cacheWriteKeyLoadedImageIdentitySeconds},
+      {"cache_write_key_llvm_tool_identity_seconds",
+       timings.cacheWriteKeyLlvmToolIdentitySeconds},
+      {"cache_write_key_kernel_names_seconds",
+       timings.cacheWriteKeyKernelNamesSeconds},
+      {"cache_write_key_material_build_seconds",
+       timings.cacheWriteKeyMaterialBuildSeconds},
+      {"cache_write_key_hash_seconds", timings.cacheWriteKeyHashSeconds},
+      {"cache_write_create_directory_seconds",
+       timings.cacheWriteCreateDirectorySeconds},
+      {"cache_write_object_hash_seconds", timings.cacheWriteObjectHashSeconds},
+      {"cache_write_object_write_seconds", timings.cacheWriteObjectWriteSeconds},
+      {"cache_write_metadata_build_seconds",
+       timings.cacheWriteMetadataBuildSeconds},
+      {"cache_write_metadata_write_seconds",
+       timings.cacheWriteMetadataWriteSeconds},
+      {"create_output_data_seconds", timings.createOutputDataSeconds},
+  };
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  llvm::json::Value(std::move(object)).print(os);
+  return out;
+}
+
+void addLookupTimings(HotswapComgrTimings &timings,
+                      const transpiler::TranslationCacheLookupTimings &lookup) {
+  timings.cacheLookupTotalSeconds += lookup.totalSeconds;
+  timings.cacheLookupKeyBuildSeconds += lookup.keyBuildSeconds;
+  timings.cacheLookupKeySourceHashSeconds += lookup.keyBuild.sourceHashSeconds;
+  timings.cacheLookupKeyElfHeaderSeconds += lookup.keyBuild.elfHeaderSeconds;
+  timings.cacheLookupKeyRulesHashSeconds += lookup.keyBuild.rulesHashSeconds;
+  timings.cacheLookupKeyLoadedImageIdentitySeconds +=
+      lookup.keyBuild.loadedImageIdentitySeconds;
+  timings.cacheLookupKeyLlvmToolIdentitySeconds +=
+      lookup.keyBuild.llvmToolIdentitySeconds;
+  timings.cacheLookupKeyKernelNamesSeconds +=
+      lookup.keyBuild.kernelNamesSeconds;
+  timings.cacheLookupKeyMaterialBuildSeconds +=
+      lookup.keyBuild.materialBuildSeconds;
+  timings.cacheLookupKeyHashSeconds += lookup.keyBuild.keyHashSeconds;
+  timings.cacheLookupStatSeconds += lookup.metadataObjectStatSeconds;
+  timings.cacheLookupObjectReadSeconds += lookup.objectReadSeconds;
+  timings.cacheLookupObjectHashSeconds += lookup.objectHashSeconds;
+  timings.cacheLookupMetadataReadSeconds += lookup.metadataReadSeconds;
+  timings.cacheLookupMetadataParseSeconds += lookup.metadataParseSeconds;
+  timings.cacheLookupMetadataValidateSeconds += lookup.metadataValidateSeconds;
+}
+
+void addPipelineTimings(HotswapComgrTimings &timings,
+                        const transpiler::PipelineTimings &pipeline) {
+  timings.pipelineTotalSeconds += pipeline.totalSeconds;
+  timings.pipelineListKernelsSeconds += pipeline.listKernelsSeconds;
+  timings.pipelineExtractTextSeconds += pipeline.extractTextSeconds;
+  timings.pipelineCreateTempDirSeconds += pipeline.createTempDirSeconds;
+  timings.pipelineRaiseSeconds += pipeline.raiseSeconds;
+  timings.pipelineWriteIrSeconds += pipeline.writeIrSeconds;
+  timings.pipelineLlcSeconds += pipeline.llcSeconds;
+  timings.pipelineReadAsmSeconds += pipeline.readAsmSeconds;
+  timings.pipelineLlvmMcSeconds += pipeline.llvmMcSeconds;
+  timings.pipelineLinkSeconds += pipeline.linkSeconds;
+  timings.pipelineReadHsacoSeconds += pipeline.readHsacoSeconds;
+  timings.pipelineCollectMetadataSeconds += pipeline.collectMetadataSeconds;
+}
+
+void addWriteTimings(HotswapComgrTimings &timings,
+                     const transpiler::TranslationCacheWriteTimings &write) {
+  timings.cacheWriteTotalSeconds += write.totalSeconds;
+  timings.cacheWriteKeyBuildSeconds += write.keyBuildSeconds;
+  timings.cacheWriteKeySourceHashSeconds += write.keyBuild.sourceHashSeconds;
+  timings.cacheWriteKeyElfHeaderSeconds += write.keyBuild.elfHeaderSeconds;
+  timings.cacheWriteKeyRulesHashSeconds += write.keyBuild.rulesHashSeconds;
+  timings.cacheWriteKeyLoadedImageIdentitySeconds +=
+      write.keyBuild.loadedImageIdentitySeconds;
+  timings.cacheWriteKeyLlvmToolIdentitySeconds +=
+      write.keyBuild.llvmToolIdentitySeconds;
+  timings.cacheWriteKeyKernelNamesSeconds += write.keyBuild.kernelNamesSeconds;
+  timings.cacheWriteKeyMaterialBuildSeconds +=
+      write.keyBuild.materialBuildSeconds;
+  timings.cacheWriteKeyHashSeconds += write.keyBuild.keyHashSeconds;
+  timings.cacheWriteCreateDirectorySeconds += write.createDirectorySeconds;
+  timings.cacheWriteObjectHashSeconds += write.objectHashSeconds;
+  timings.cacheWriteObjectWriteSeconds += write.objectWriteSeconds;
+  timings.cacheWriteMetadataBuildSeconds += write.metadataBuildSeconds;
+  timings.cacheWriteMetadataWriteSeconds += write.metadataWriteSeconds;
+}
 
 struct HotswapTranspileResult {
   bool success = false;
@@ -59,6 +272,7 @@ struct HotswapTranspileResult {
   std::string cacheObjectPath;
   std::string failReason;
   std::string failDetail;
+  std::string timingJson;
 
   static HotswapTranspileResult *convert(
       amd_comgr_hotswap_transpile_result_t result) {
@@ -169,7 +383,8 @@ void fillResult(HotswapTranspileResult &result, llvm::StringRef sourceGfx,
                 llvm::StringRef cacheMetadataPath = "",
                 llvm::StringRef cacheObjectPath = "",
                 llvm::StringRef failReason = "",
-                llvm::StringRef failDetail = "") {
+                llvm::StringRef failDetail = "",
+                llvm::StringRef timingJson = "") {
   result.sourceGfx = sourceGfx.str();
   result.targetGfx = targetGfx.str();
   result.success = success;
@@ -182,6 +397,7 @@ void fillResult(HotswapTranspileResult &result, llvm::StringRef sourceGfx,
   result.cacheObjectPath = cacheObjectPath.str();
   result.failReason = failReason.str();
   result.failDetail = failDetail.str();
+  result.timingJson = timingJson.str();
   if (pipeline) {
     result.liftedCount = pipeline->liftedCount;
     result.totalCount = pipeline->totalCount;
@@ -208,6 +424,15 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
     const amd_comgr_hotswap_transpile_options_t *options,
     amd_comgr_data_t *output,
     amd_comgr_hotswap_transpile_result_t *result) {
+  const bool CollectTimings = HotSwapTimingEnabled();
+  auto totalStart = timingStart(CollectTimings);
+  HotswapComgrTimings Timings;
+  auto finalTimingJson = [&]() {
+    if (!CollectTimings)
+      return std::string();
+    Timings.totalSeconds = timingElapsed(CollectTimings, totalStart);
+    return timingJson(Timings);
+  };
   DataObject *InputP = DataObject::convert(input);
   if (!InputP || !InputP->Data ||
       InputP->DataKind != AMD_COMGR_DATA_KIND_EXECUTABLE || !source_isa_name ||
@@ -233,8 +458,11 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
   // into the hotswap-shaped container rather than reinterpret-casting the
   // pointer, since the pipeline reads through this buffer many times across
   // kernels and the temporary lifetime needs to be unambiguous.
+  auto inputCopyStart = timingStart(CollectTimings);
   const auto *InputBegin = reinterpret_cast<const uint8_t *>(InputP->Data);
   std::vector<uint8_t> InputBytes(InputBegin, InputBegin + InputP->Size);
+  Timings.inputCopySeconds =
+      timingElapsed(CollectTimings, inputCopyStart);
 
   transpiler::TranslationCacheRequest CacheRequest;
   CacheRequest.sourceObject = llvm::ArrayRef<uint8_t>(InputBytes);
@@ -257,9 +485,13 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
       CacheRequest.cacheDirectory.empty();
   CacheRequest.cacheReadonly =
       hasFlag(options, AMD_COMGR_HOTSWAP_TRANSPILE_OPTIONS_CACHE_READONLY);
+  CacheRequest.collectTimings = CollectTimings;
 
+  auto listKernelsStart = timingStart(CollectTimings);
   const std::vector<std::string> KernelNames =
       transpiler::listKernelNames(InputBytes);
+  Timings.listKernelsSeconds =
+      timingElapsed(CollectTimings, listKernelsStart);
   const std::string SkippedKernel =
       transpiler::skippedKernelForTranslationCache(
           KernelNames, CacheRequest.cacheSkipKernels);
@@ -280,6 +512,7 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
   } else {
     transpiler::TranslationCacheLookup Lookup =
         transpiler::lookupTranslationCache(CacheRequest);
+    addLookupTimings(Timings, Lookup.timings);
     CacheStatus = Lookup.status;
     CacheDetail = Lookup.reason;
     CacheKey = Lookup.key;
@@ -292,7 +525,7 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
                  false, lookupStatusFromCacheStatus(Lookup.status),
                  AMD_COMGR_HOTSWAP_CACHE_WRITE_NOT_ATTEMPTED, Lookup.reason,
                  nullptr, Lookup.key, Lookup.metadataPath, Lookup.objectPath,
-                 "cache_invalid", Lookup.reason);
+                 "cache_invalid", Lookup.reason, finalTimingJson());
       if (amd_comgr_status_t ResultStatus =
               returnResult(std::move(Result), result))
         return ResultStatus;
@@ -315,9 +548,16 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
   // separate options struct rather than overloading this entry point.
   if (!CacheHit) {
     transpiler::ScopedStrictMode StrictMode(CacheRequest.strictMode);
+    transpiler::PipelineOptions PipelineOptions;
+    PipelineOptions.enableWritelaneRewrite =
+        CacheRequest.enableWritelaneRewrite;
+    PipelineOptions.enableWaveNative = CacheRequest.enableWaveNative;
+    PipelineOptions.collectTimings = CollectTimings;
     Pipeline = transpiler::runPipelineAllKernels(InputBytes,
                                                  SourceIdent.Processor.str(),
-                                                 TargetIdent.Processor.str());
+                                                 TargetIdent.Processor.str(),
+                                                 PipelineOptions);
+    addPipelineTimings(Timings, Pipeline.timings);
   }
 
   if (!Pipeline.success || Pipeline.hsaco.empty()) {
@@ -326,7 +566,8 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
                CacheHit, lookupStatusFromCacheStatus(CacheStatus),
                AMD_COMGR_HOTSWAP_CACHE_WRITE_NOT_ATTEMPTED, CacheDetail,
                &Pipeline, CacheKey, CacheMetadataPath, CacheObjectPath,
-               pipelineFailReason(Pipeline), pipelineFailDetail(Pipeline));
+               pipelineFailReason(Pipeline), pipelineFailDetail(Pipeline),
+               finalTimingJson());
     if (amd_comgr_status_t ResultStatus =
             returnResult(std::move(Result), result))
       return ResultStatus;
@@ -338,6 +579,7 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
   if (!CacheHit && CacheStatus == transpiler::TranslationCacheStatus::Miss) {
     transpiler::TranslationCacheWrite Write =
         transpiler::writeTranslationCache(CacheRequest, Pipeline);
+    addWriteTimings(Timings, Write.timings);
     CacheWriteStatus = writeStatusFromCacheStatus(Write.status);
     if (!Write.key.empty())
       CacheKey = Write.key;
@@ -353,7 +595,7 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
                  false, lookupStatusFromCacheStatus(CacheStatus),
                  CacheWriteStatus, Write.reason, &Pipeline, Write.key,
                  Write.metadataPath, Write.objectPath, "cache_write_failed",
-                 Write.reason);
+                 Write.reason, finalTimingJson());
       if (amd_comgr_status_t ResultStatus =
               returnResult(std::move(Result), result))
         return ResultStatus;
@@ -362,14 +604,17 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_with_options(
   }
 
   amd_comgr_data_t OutputData = {0};
+  auto createOutputDataStart = timingStart(CollectTimings);
   if (auto Status = createExecutableData(Pipeline.hsaco, &OutputData))
     return Status;
+  Timings.createOutputDataSeconds =
+      timingElapsed(CollectTimings, createOutputDataStart);
 
   HotswapTranspileResult Result;
   fillResult(Result, CacheRequest.sourceGfx, CacheRequest.targetGfx, true,
              CacheHit, lookupStatusFromCacheStatus(CacheStatus),
              CacheWriteStatus, CacheDetail, &Pipeline, CacheKey,
-             CacheMetadataPath, CacheObjectPath);
+             CacheMetadataPath, CacheObjectPath, "", "", finalTimingJson());
   if (amd_comgr_status_t ResultStatus =
           returnResult(std::move(Result), result)) {
     amd_comgr_release_data(OutputData);
@@ -464,6 +709,9 @@ amd_comgr_status_t AMD_COMGR_API amd_comgr_hotswap_transpile_result_get_string(
     break;
   case AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_DETAIL:
     Field = &Result->failDetail;
+    break;
+  case AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TIMING_JSON:
+    Field = &Result->timingJson;
     break;
   }
   if (!Field)

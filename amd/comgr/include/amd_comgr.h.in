@@ -2877,6 +2877,12 @@ typedef enum amd_comgr_hotswap_transpile_result_string_s {
   AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_CACHE_OBJECT_PATH = 0x6,
   AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_REASON = 0x7,
   AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_FAIL_DETAIL = 0x8,
+  /**
+   * Optional diagnostic JSON object with HotSwap timing fields. Present only
+   * when @c HSA_HOTSWAP_TIMING is enabled; callers must treat field names as
+   * best-effort diagnostics rather than semantic ABI.
+   */
+  AMD_COMGR_HOTSWAP_TRANSPILE_RESULT_TIMING_JSON = 0x9,
 } amd_comgr_hotswap_transpile_result_string_t;
 
 /**
