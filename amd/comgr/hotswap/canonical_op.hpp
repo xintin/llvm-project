@@ -517,8 +517,9 @@ enum class CanonicalOp : uint16_t {
   V_CVT_SCALEF32_PK_FP4_F32,
   // gfx1250 packed-8 scaled FP8 conversion: 8x f32 in a Wave32 vector ->
   // 8x packed FP8 (2 dwords) with a scalar f32 scale multiplier.
-  // Cross-target lowering (gfx950) uses 4 chained `cvt_pk_fp8_f32` calls
-  // after a vector multiply by the broadcast scale.
+  // Cross-target lowering uses 4 chained `cvt_pk_fp8_f32` calls after a
+  // vector multiply by the broadcast scale on targets with FP8 conversion
+  // support.
   V_CVT_SCALEF32_PK8_FP8_F32,
   V_BFM_B32,
 

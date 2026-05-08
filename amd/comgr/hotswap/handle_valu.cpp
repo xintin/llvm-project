@@ -1935,17 +1935,18 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
   // The intrinsic semantics: each output FP8[i] = cvt_fp8(src0[i] * src1).
   //
   // Same-target gfx1250: emit `int_amdgcn_cvt_scalef32_pk8_fp8_f32` directly.
-  // Cross-target gfx950: software-emulate via:
+  // Cross-target targets with FP8 conversion support: software-emulate via:
   //    scaled = src0 * splat(src1)
   //    dword0 = pk_fp8(scaled[0..1]) | (pk_fp8(scaled[2..3]) << 16)
   //    dword1 = pk_fp8(scaled[4..5]) | (pk_fp8(scaled[6..7]) << 16)
-  // using `int_amdgcn_cvt_pk_fp8_f32`, which gfx950 has natively.  The
-  // numeric differences vs the gfx1250 hardware path: pk_fp8 uses the same
+  // using `int_amdgcn_cvt_pk_fp8_f32`. The numeric differences vs the
+  // gfx1250 hardware path: pk_fp8 uses the same
   // round-to-nearest-even mantissa rounding and same exponent saturation,
-  // so the only structural delta is the scale-fmt path (the gfx1250 hw
-  // accepts a non-default scale_fmt; here we always treat src1 as a plain
-  // f32 multiplier, which matches the default scale_fmt used by every
-  // MXFP attention kernel in our corpus).
+  // so the structural delta is that the gfx1250 op fuses the f32 scale
+  // multiply with the pack while this expansion materialises the multiply
+  // explicitly before packing. This opcode profile exposes src1 as the f32
+  // scale operand; scale-format variants use different opcodes/profiles and
+  // should get their own lowering/refusal rather than sharing this path.
   if (sop == CanonicalOp::V_CVT_SCALEF32_PK8_FP8_F32) {
     ParsedReg srcReg0 = op.srcReg(0);
     Value *scale = op.srcF(1);
@@ -1960,8 +1961,8 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       Function *cvtFn = Intrinsic::getOrInsertDeclaration(
           &ctx.M, Intrinsic::amdgcn_cvt_scalef32_pk8_fp8_f32);
       result = ctx.B.CreateCall(cvtFn, {src8, scale}, "cvt_scalef32_pk8_fp8");
-    } else if (ctx.targetIsa.hasMFMA) {
-      // gfx950 emulation.
+    } else if (ctx.targetIsa.hasFP8ConversionInsts) {
+      // FP8 conversion emulation for targets such as gfx942/gfx950.
       Value *scaleSplat = ctx.B.CreateVectorSplat(8, scale, "scale_splat");
       Value *scaled = ctx.B.CreateFMul(src8, scaleSplat, "scaled");
       Value *zeroI32 = ConstantInt::get(ctx.i32Ty, 0);
@@ -1999,8 +2000,8 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
       hr.failure = RaiseFailure::unsupportedShape(
           di, "VOP3",
           "v_cvt_scalef32_pk8_fp8_f32 requires either hasTensorOps "
-          "(gfx1250 native) or hasMFMA (gfx9 family with FP8 conversion "
-          "intrinsic int_amdgcn_cvt_pk_fp8_f32); this target has neither.");
+          "(gfx1250 native) or hasFP8ConversionInsts "
+          "(int_amdgcn_cvt_pk_fp8_f32); this target has neither.");
       return hr;
     }
     ctx.writeRegVec(op.dst(), result);

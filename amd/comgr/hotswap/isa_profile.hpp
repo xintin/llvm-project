@@ -51,6 +51,11 @@ struct ISAProfile {
   // emit `int_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` on gfx942, where the
   // intrinsic has no codegen pattern and llc would crash at lowering).
   bool hasGfx950Insts = false;
+  // True iff the target backend can lower the generic FP8 conversion
+  // intrinsics such as `int_amdgcn_cvt_pk_fp8_f32`. gfx942 and gfx950 both
+  // expose this feature, so use it instead of the broader `hasMFMA` whenever
+  // a cross-target expansion depends specifically on FP8 conversion support.
+  bool hasFP8ConversionInsts = false;
   // gfx125 widens compute_pgm_rsrc2.USER_SGPR_COUNT from the older 5-bit
   // GFX6-GFX120 field to a 6-bit field. Keep this as an ABI property rather
   // than deriving it from a string at each use site.
@@ -71,6 +76,8 @@ struct ISAProfile {
                   STI.hasFeature(llvm::AMDGPU::FeatureWMMA256bInsts);
     p.hasTensorOps = STI.hasFeature(llvm::AMDGPU::FeatureGFX1250Insts);
     p.hasGfx950Insts = STI.hasFeature(llvm::AMDGPU::FeatureGFX950Insts);
+    p.hasFP8ConversionInsts =
+        STI.hasFeature(llvm::AMDGPU::FeatureFP8ConversionInsts);
     p.hasGfx125UserSgprCountField = llvm::AMDGPU::isGFX1250Plus(STI);
     return p;
   }

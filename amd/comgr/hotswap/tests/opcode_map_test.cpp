@@ -110,7 +110,7 @@ TEST(OpcodeMap, Gfx1250MadI32I24RealOpcodeMapsToSemOp) {
             transpiler::CanonicalOp::V_MAD_I32_I24);
 }
 
-TEST(OpcodeMap, Gfx1250CvtScalef32Pk8Fp8F32RealOpcodeMapsToSemOp) {
+TEST(OpcodeMap, Gfx1250CvtScalef32Pk8Fp8F32RealOpcodeMapsToCanonicalOp) {
   ensureAMDGPURegistered();
 
   transpiler::MCState state;

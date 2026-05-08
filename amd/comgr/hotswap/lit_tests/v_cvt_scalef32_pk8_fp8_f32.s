@@ -18,9 +18,10 @@
 ; Two dispatch arms:
 ;   - hasTensorOps (gfx1250 same-target): emit
 ;     `int_amdgcn_cvt_scalef32_pk8_fp8_f32` directly.
-;   - hasMFMA (gfx950, gfx942): software-emulate via splat-multiply
-;     then four chained `int_amdgcn_cvt_pk_fp8_f32` calls assembling
-;     the 2-dword result with appropriate dword/word-select bits.
+;   - hasFP8ConversionInsts (e.g. gfx942/gfx950): software-emulate via
+;     splat-multiply then four chained `int_amdgcn_cvt_pk_fp8_f32`
+;     calls assembling the 2-dword result with appropriate
+;     dword/word-select bits.
 
 ; ── Same-target arm: native gfx1250 intrinsic ───────────────────────
 
