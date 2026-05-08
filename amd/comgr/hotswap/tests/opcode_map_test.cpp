@@ -109,3 +109,19 @@ TEST(OpcodeMap, Gfx1250MadI32I24RealOpcodeMapsToSemOp) {
   EXPECT_EQ(map.lookup(llvm::AMDGPU::V_MAD_I32_I24_e64_gfx12),
             transpiler::CanonicalOp::V_MAD_I32_I24);
 }
+
+TEST(OpcodeMap, Gfx1250CvtScalef32Pk8Fp8F32RealOpcodeMapsToSemOp) {
+  ensureAMDGPURegistered();
+
+  transpiler::MCState state;
+  ASSERT_TRUE(transpiler::initMCState(state, "gfx1250"));
+
+  transpiler::OpcodeMap map;
+  map.build(*state.instrInfo);
+
+  // V_CVT_SCALEF32_PK8_FP8_F32: gfx1250-only packed-8 scaled FP8
+  // conversion (VOP3 opcode 0x2c3, profile VOP_V2I32_V8F32_F32 in
+  // VOP3Instructions.td:1883).
+  EXPECT_EQ(map.lookup(llvm::AMDGPU::V_CVT_SCALEF32_PK8_FP8_F32_e64_gfx1250),
+            transpiler::CanonicalOp::V_CVT_SCALEF32_PK8_FP8_F32);
+}

@@ -551,6 +551,11 @@ static const Entry kCanonTable[] = {
     E(V_CVT_PKRTZ_F16_F32_e64, V_CVT_PKRTZ_F16_F32),
     E(V_CVT_PK_F16_F32_e64, V_CVT_PK_F16_F32),
     E(V_CVT_SCALEF32_PK_FP4_F32_e64, V_CVT_SCALEF32_PK_FP4_F32),
+    // gfx1250-only packed-8 scaled FP8 conversion (VOP3, opcode 0x2c3,
+    // VOP3Instructions.td:2384).  Same-target maps to native intrinsic
+    // `int_amdgcn_cvt_scalef32_pk8_fp8_f32`; cross-target gfx950 path
+    // uses the software emulation in handle_valu.cpp.
+    E(V_CVT_SCALEF32_PK8_FP8_F32_e64, V_CVT_SCALEF32_PK8_FP8_F32),
     E(V_BFM_B32_e64, V_BFM_B32),
 
     // ---------------------------------------------------------------------

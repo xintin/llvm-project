@@ -1927,6 +1927,86 @@ HandlerResult handleVALU(RaiseContext &ctx, const DecodedInst &di,
     hr.handled = true;
     return hr;
   }
+  // gfx1250 v_cvt_scalef32_pk8_fp8_f32 vdst:64, src0:256 (<8 x f32>), src1:32 (scale)
+  // Profile VOP_V2I32_V8F32_F32 (VOP3Instructions.td:1883):
+  //   dst  = <2 x i32>           (8 packed FP8 bytes)
+  //   src0 = <8 x f32>            (8 consecutive VGPRs holding the f32 inputs)
+  //   src1 = f32                  (broadcast scale multiplier)
+  // The intrinsic semantics: each output FP8[i] = cvt_fp8(src0[i] * src1).
+  //
+  // Same-target gfx1250: emit `int_amdgcn_cvt_scalef32_pk8_fp8_f32` directly.
+  // Cross-target gfx950: software-emulate via:
+  //    scaled = src0 * splat(src1)
+  //    dword0 = pk_fp8(scaled[0..1]) | (pk_fp8(scaled[2..3]) << 16)
+  //    dword1 = pk_fp8(scaled[4..5]) | (pk_fp8(scaled[6..7]) << 16)
+  // using `int_amdgcn_cvt_pk_fp8_f32`, which gfx950 has natively.  The
+  // numeric differences vs the gfx1250 hardware path: pk_fp8 uses the same
+  // round-to-nearest-even mantissa rounding and same exponent saturation,
+  // so the only structural delta is the scale-fmt path (the gfx1250 hw
+  // accepts a non-default scale_fmt; here we always treat src1 as a plain
+  // f32 multiplier, which matches the default scale_fmt used by every
+  // MXFP attention kernel in our corpus).
+  if (sop == CanonicalOp::V_CVT_SCALEF32_PK8_FP8_F32) {
+    ParsedReg srcReg0 = op.srcReg(0);
+    Value *scale = op.srcF(1);
+    if (scale->getType() != ctx.f32Ty)
+      scale = ctx.B.CreateBitCast(scale, ctx.f32Ty);
+
+    auto *v8f32Ty = FixedVectorType::get(ctx.f32Ty, 8);
+    Value *src8 = ctx.regs.readRegVec(ctx.B, srcReg0, v8f32Ty);
+
+    Value *result = nullptr;
+    if (ctx.targetIsa.hasTensorOps) {
+      Function *cvtFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_cvt_scalef32_pk8_fp8_f32);
+      result = ctx.B.CreateCall(cvtFn, {src8, scale}, "cvt_scalef32_pk8_fp8");
+    } else if (ctx.targetIsa.hasMFMA) {
+      // gfx950 emulation.
+      Value *scaleSplat = ctx.B.CreateVectorSplat(8, scale, "scale_splat");
+      Value *scaled = ctx.B.CreateFMul(src8, scaleSplat, "scaled");
+      Value *zeroI32 = ConstantInt::get(ctx.i32Ty, 0);
+      Function *pkFn = Intrinsic::getOrInsertDeclaration(
+          &ctx.M, Intrinsic::amdgcn_cvt_pk_fp8_f32);
+      auto extractF = [&](unsigned i) {
+        return ctx.B.CreateExtractElement(scaled, i);
+      };
+      Value *dw0_lo = ctx.B.CreateCall(
+          pkFn,
+          {extractF(0), extractF(1), zeroI32,
+           ConstantInt::get(ctx.i1Ty, 0)},
+          "pk_fp8_01");
+      Value *dw0 = ctx.B.CreateCall(
+          pkFn,
+          {extractF(2), extractF(3), dw0_lo,
+           ConstantInt::get(ctx.i1Ty, 1)},
+          "pk_fp8_23");
+      Value *dw1_lo = ctx.B.CreateCall(
+          pkFn,
+          {extractF(4), extractF(5), zeroI32,
+           ConstantInt::get(ctx.i1Ty, 0)},
+          "pk_fp8_45");
+      Value *dw1 = ctx.B.CreateCall(
+          pkFn,
+          {extractF(6), extractF(7), dw1_lo,
+           ConstantInt::get(ctx.i1Ty, 1)},
+          "pk_fp8_67");
+      auto *v2i32Ty = FixedVectorType::get(ctx.i32Ty, 2);
+      Value *packed = PoisonValue::get(v2i32Ty);
+      packed = ctx.B.CreateInsertElement(packed, dw0, (uint64_t)0);
+      packed = ctx.B.CreateInsertElement(packed, dw1, (uint64_t)1);
+      result = packed;
+    } else {
+      hr.failure = RaiseFailure::unsupportedShape(
+          di, "VOP3",
+          "v_cvt_scalef32_pk8_fp8_f32 requires either hasTensorOps "
+          "(gfx1250 native) or hasMFMA (gfx9 family with FP8 conversion "
+          "intrinsic int_amdgcn_cvt_pk_fp8_f32); this target has neither.");
+      return hr;
+    }
+    ctx.writeRegVec(op.dst(), result);
+    hr.handled = true;
+    return hr;
+  }
   if (sop == CanonicalOp::V_CVT_PK_FP8_F32) {
     Value *s0 = op.srcF(0), *s1 = op.srcF(1);
     if (s0->getType() != ctx.f32Ty) s0 = ctx.B.CreateBitCast(s0, ctx.f32Ty);
