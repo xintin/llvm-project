@@ -830,7 +830,9 @@ Value *emitWMMAtoMFMA_F32_16x16x4(RaiseContext &ctx, Value *a, Value *b,
 //   the lowering is structurally simpler than emitWMMAtoMFMA's K=32 -> 2 x
 //   K=16 chain.  We emit ONE MFMA call per virtual-W32-group pass.
 //
-// Lane redistribution (LINEAR-K extrapolation; pending hardware validation):
+// Lane redistribution (LINEAR-K model, validated on gfx950 silicon across
+// 20 mxfp_attn_fwd_kernel shapes in rocm-hotswap-testing; matrix-class
+// prediction median 0.1% error, 769 mfma_scale sites per kernel):
 //   Per virtual Wave32 group at groupBase in {0, 32}, the A/B fragments live
 //   in W64 lanes [groupBase .. groupBase+31].  The MFMA per-LG K-quarter
 //   mapping is:
@@ -1011,14 +1013,31 @@ llvm::Value *emitWMMAScaleF8F6F4toMFMA(
     if (cModVal & 1)
       acc = B.CreateFNeg(acc, "c_neg");
 
+    // Redistribute scale_src per pass.  Pinned by the position-sweep
+    // bisection in compare_correctness/kernels/wmma_scale_f32_16x16x128_*
+    // against salmon-raised gfx950 .co: passing scaleSrc0 / scaleSrc1
+    // through unchanged worked for pass 0 but produced D[odd-M][:] =
+    // 64*16 + 64*1 for ODD source-lane scales in pass 1, indicating
+    // that the MFMA's per-lane scale read does not see the source-lane
+    // value at the right wave64 position for pass 1's group.  We
+    // bpermute scale_src0 / scale_src1 from `addrLo` so that, for both
+    // passes, wave64 lane L (L in 0..15) reads the scale value the
+    // source kernel wrote at source-wave32 lane L of this pass's
+    // virtual W32 group.  Pass 0 redistributes from source lanes 0..15
+    // (no-op effectively); pass 1 redistributes from source lanes
+    // 32..47, which under MODREP carry source lanes 0..15's
+    // replicated values.
+    Value *scaleSrc0Pass = emitDSBpermute(B, M, addrLo, scaleSrc0);
+    Value *scaleSrc1Pass = emitDSBpermute(B, M, addrLo, scaleSrc1);
+
     Function *mfmaFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::amdgcn_mfma_scale_f32_16x16x128_f8f6f4,
         {mfmaABTy, mfmaABTy});
     Value *mfmaResult = ctx.projection.wrapAsWWMValue(
         B,
         B.CreateCall(mfmaFn,
-                     {aPacked, bPacked, acc, cbsz, blgp, opSelA, scaleSrc0,
-                      opSelB, scaleSrc1},
+                     {aPacked, bPacked, acc, cbsz, blgp, opSelA, scaleSrc0Pass,
+                      opSelB, scaleSrc1Pass},
                      "mfma_scale"),
         "mfma_scale_wwm");
 
